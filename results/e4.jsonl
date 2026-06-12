@@ -13,3 +13,8 @@
 {"ts":"2026-06-12T13:09:21.946Z","probe":"P2b-crash-loss-bounded","baseline":2,"after":1}
 {"ts":"2026-06-12T13:14:27.841Z","probe":"P3-revision-switch-loop","cycles":5,"finalCount":6}
 {"ts":"2026-06-12T13:15:31.066Z","probe":"P4-zombie-fencing","rivalToken":10,"zombieStatus":423}
+{"ts":"2026-06-12T13:25:19.754Z","probe":"P1-idle-lease-self-heal","before":7,"after":9,"status":302}
+{"ts":"2026-06-12T13:26:26.112Z","probe":"P2-sigterm-flush","before":9,"after":10,"rollMs":66237}
+{"ts":"2026-06-12T13:27:23.414Z","probe":"P2b-crash-loss-bounded","baseline":11,"after":10}
+{"ts":"2026-06-12T13:32:30.462Z","probe":"P3-revision-switch-loop","cycles":5,"finalCount":15}
+{"ts":"2026-06-12T13:33:35.437Z","probe":"P4-zombie-fencing","rivalToken":20,"zombieStatus":423}

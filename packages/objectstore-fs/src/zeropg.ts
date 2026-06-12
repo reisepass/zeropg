@@ -400,6 +400,31 @@ export class ZeroPG {
     // No walFlushLsn (pre-v2 manifest) -> nowhere to resume shipping from.
     // One compaction records it and the database ships incrementally forever.
     this.forceCompactNext = m.version !== 2 || !m.walFlushLsn
+    // Continuity check: recovery must have replayed through the resume point.
+    // If the cluster sits behind it, incremental shipping from here would
+    // emit ranges from a diverged stream — re-snapshot reality instead.
+    if (!this.forceCompactNext && this.incrementalCapable && this.lastShippedLsn > 0n) {
+      try {
+        const r = await this.pg.query<{ lsn: string }>(
+          'SELECT pg_current_wal_flush_lsn()::text lsn',
+        )
+        const at = parseLsn(r.rows[0]!.lsn)
+        if (at < this.lastShippedLsn) {
+          console.error(
+            JSON.stringify({
+              event: 'zeropg-wal-continuity-violation',
+              at: 'boot',
+              clusterFlushLsn: formatLsn(at),
+              resumeLsn: formatLsn(this.lastShippedLsn),
+              action: 'force-compact-next-commit',
+            }),
+          )
+          this.forceCompactNext = true
+        }
+      } catch {
+        this.forceCompactNext = true
+      }
+    }
   }
 
   /** Overlay shipped WAL ranges onto the restored datadir: fetch concurrently
@@ -762,7 +787,24 @@ export class ZeroPG {
     const r = await this.pg.query<{ lsn: string }>('SELECT pg_current_wal_flush_lsn()::text lsn')
     const end = parseLsn(r.rows[0]!.lsn)
     const start = this.lastShippedLsn
-    if (end <= start) return 'empty' // dirty flag without WAL growth: no-op
+    if (end === start) return 'empty' // dirty flag without WAL growth: no-op
+    if (end < start) {
+      // Continuity violation: the cluster is BEHIND the manifest's resume
+      // point — recovery ended short of what the bucket claims was shipped
+      // (observed live in E4: every subsequent write then computes a negative
+      // delta and would be silently swallowed, losing acked-durable writes).
+      // DESIGN 4.6: any continuity doubt -> full snapshot of actual state.
+      console.error(
+        JSON.stringify({
+          event: 'zeropg-wal-continuity-violation',
+          clusterFlushLsn: formatLsn(end),
+          resumeLsn: formatLsn(start),
+          action: 'compacting',
+        }),
+      )
+      this.forceCompactNext = true
+      return null
+    }
     const dumpMs = performance.now() - t0
 
     const tUp = performance.now()
