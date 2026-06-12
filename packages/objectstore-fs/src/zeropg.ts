@@ -576,6 +576,9 @@ export class ZeroPG {
     } catch {
       // CHECKPOINT may be unavailable in some PGlite builds; snapshot anyway.
     }
+    // The tar reads these files from the host FS — make sure the engine's
+    // write-back has fully landed first (same race as the WAL-range read).
+    await this.pg.syncToFs().catch(() => {})
     return { ms: performance.now() - t0, flushLsn }
   }
 
@@ -763,6 +766,11 @@ export class ZeroPG {
     }
     const dumpMs = performance.now() - t0
 
+    // Force the engine's FS write-back BEFORE reading the files: PGlite
+    // accounts WAL as flushed ahead of physically writing it to the host FS,
+    // and large commits lose that race (observed: a 5MB commit's mid-page
+    // bytes read back stale while the page header was already in place).
+    await this.pg.syncToFs()
     const tUp = performance.now()
     let buf: Buffer
     try {
