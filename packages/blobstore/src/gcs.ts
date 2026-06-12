@@ -220,6 +220,35 @@ export class GcsBlobStore implements BlobStore {
     } while (pageToken)
   }
 
+  /**
+   * Server-side copy within the bucket (GCS rewrite API) — no bytes flow
+   * through the client, so copying a 500MB snapshot takes ~a second. Loops on
+   * rewriteToken as the API requires for large objects.
+   */
+  async copy(srcKey: string, destKey: string): Promise<PutResult> {
+    const src = encodeURIComponent(this.fullKey(srcKey))
+    const dst = encodeURIComponent(this.fullKey(destKey))
+    let token: string | undefined
+    for (;;) {
+      const url =
+        `${BASE}/storage/v1/b/${this.bucket}/o/${src}/rewriteTo/b/${this.bucket}/o/${dst}` +
+        (token ? `?rewriteToken=${encodeURIComponent(token)}` : '')
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { ...(await this.authHeaders()), 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      if (!res.ok) throw await gcsError(res, 'copy', srcKey)
+      const body = (await res.json()) as {
+        done: boolean
+        rewriteToken?: string
+        resource?: { generation: string }
+      }
+      if (body.done) return { etag: body.resource?.generation ?? '' }
+      token = body.rewriteToken
+    }
+  }
+
   async delete(key: string): Promise<void> {
     const name = encodeURIComponent(this.fullKey(key))
     const url = `${BASE}/storage/v1/b/${this.bucket}/o/${name}`

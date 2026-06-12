@@ -1,0 +1,2 @@
+{"ts":"2026-06-12T10:41:58.359Z","probe":"P1-idle-lease-self-heal","before":0,"after":2,"status":302}
+{"ts":"2026-06-12T10:43:01.076Z","probe":"P2-sigterm-flush","before":2,"after":2,"rollMs":62602}
