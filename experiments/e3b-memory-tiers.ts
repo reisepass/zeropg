@@ -31,11 +31,12 @@ async function setMemory(tier: string): Promise<void> {
 
 async function coldStart(): Promise<{ ms: number; metrics: any } | { error: string }> {
   try {
-    await fetch(`${URL}/_fault/abort`, { signal: AbortSignal.timeout(5000) })
+    // Clean exit: /_fault/abort would trip Cloud Run's crash-restart backoff.
+    await fetch(`${URL}/_restart`, { signal: AbortSignal.timeout(10000) })
   } catch {
-    /* expected */
+    /* connection reset possible */
   }
-  await sleep(3000)
+  await sleep(4000)
   const t0 = performance.now()
   const deadline = t0 + 120_000
   let lastErr: unknown

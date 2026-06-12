@@ -1,10 +1,14 @@
 // E3: cold-start-vs-size statistics against the live Cloud Run services.
 //
-// Forces a real cold start each iteration by aborting the running instance
-// (/_fault/abort exits the process), waiting for Cloud Run to tear it down,
-// then timing the next request end-to-end. The server reports its internal
-// boot breakdown via /metrics, so we capture both the user-perceived latency
-// and where the time goes.
+// Forces a real cold start each iteration by cleanly restarting the running
+// instance (/_restart exits 0 after flushing), waiting for Cloud Run to tear
+// it down, then timing the next request end-to-end. The server reports its
+// internal boot breakdown via /metrics, so we capture both the user-perceived
+// latency and where the time goes.
+//
+// NOTE: /_fault/abort (exit 137) is the wrong tool here — repeated crash
+// exits trigger Cloud Run's crash-restart backoff and the service answers
+// 429 for tens of seconds (observed live). Clean exits do not.
 //
 //   tsx experiments/e3-coldstart.ts [iterations]
 
@@ -24,22 +28,22 @@ async function getJson(url: string, timeoutMs = 30000): Promise<any> {
   return res.json()
 }
 
-async function abort(url: string): Promise<void> {
+async function restart(url: string): Promise<void> {
   try {
-    await fetch(`${url}/_fault/abort`, { signal: AbortSignal.timeout(5000) })
+    await fetch(`${url}/_restart`, { signal: AbortSignal.timeout(10000) })
   } catch {
-    // connection reset is expected — the process exits mid-response.
+    // connection reset possible if the process exits quickly.
   }
 }
 
-/** Hit /metrics, retrying through the brief 503/connection window after abort. */
+/** Hit /metrics, retrying through the 503/429/connection window after restart. */
 async function coldRequest(url: string): Promise<{ ms: number; metrics: any }> {
   const t0 = performance.now()
-  const deadline = t0 + 40000
+  const deadline = t0 + 120000
   let lastErr: unknown
   while (performance.now() < deadline) {
     try {
-      const metrics = await getJson(`${url}/metrics`, 35000)
+      const metrics = await getJson(`${url}/metrics`, 110000)
       return { ms: performance.now() - t0, metrics }
     } catch (e) {
       lastErr = e
@@ -69,8 +73,8 @@ async function probeService(svc: { label: string; url: string }) {
   let coldConfirmed = 0
 
   for (let i = 0; i < ITER; i++) {
-    await abort(svc.url) // kill the current instance
-    await new Promise((r) => setTimeout(r, 3000)) // let Cloud Run notice it died
+    await restart(svc.url) // cleanly exit the current instance
+    await new Promise((r) => setTimeout(r, 4000)) // let Cloud Run notice it exited
     const { ms, metrics } = await coldRequest(svc.url)
     if (metrics.coldRequest) coldConfirmed++
     endToEnd.push(ms)

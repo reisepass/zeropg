@@ -140,12 +140,12 @@ Transports: R2 binding, GCS JSON API, S3 API. Conditional `put` is the only stro
 
 ### 4.3 Read path (cold start)
 
-1. GET `manifest.json`. If absent: fresh database, run initdb into MemoryFS, take snapshot, write manifest with create-if-absent.
-2. Download snapshot, decompress into the in-memory FS.
-3. Download and append the listed WAL segments into `pg_wal/`.
-4. Boot PGlite. Postgres's own crash recovery replays the WAL. We never reimplement WAL replay; Postgres does it, exactly as a `litestream restore` lets SQLite do it.
+1. GET `manifest.json`. If absent: fresh database, seed from the prebuilt empty-datadir snapshot (or initdb), take snapshot, write manifest with create-if-absent.
+2. Restore the snapshot as a stream: parallel ranged GETs (pinned to one object generation) → gunzip if the key says `.tar.gz` → untar straight to a scratch directory (`/tmp`, i.e. tmpfs on serverless). **Nothing is buffered**: peak JS heap is one chunk (~23MB observed for a 500MB database), so restore memory is O(1) and a large DB fits a small container.
+3. Download and append the listed WAL segments into `pg_wal/` (v1).
+4. Boot PGlite on the scratch dir via its NodeFS backend — it faults pages lazily instead of loading the datadir up front, so this step is ~0.9s regardless of database size. Postgres's own crash recovery replays the WAL. We never reimplement WAL replay; Postgres does it, exactly as a `litestream restore` lets SQLite do it.
 
-Cold start cost is dominated by snapshot size. For the target use case (databases in the MB to low hundreds of MB), this is one ranged/streamed GET. v2 can do lazy page fetch (turbolite-style page groups) if cold start ever matters more.
+Cold start cost is dominated by moving snapshot bytes (measured: ~11s end-to-end for a 500MB database on Cloud Run, ~3s for 50MB). v2 can do lazy page fetch (turbolite-style page groups) if cold start ever matters more.
 
 ### 4.4 The lease (the part Litestream never built)
 
@@ -156,6 +156,7 @@ Goal: at most one committing writer, zombie-proof, with no coordination service.
 - **If expired**: take over with a conditional PUT against the lease's current etag/generation (so two takeover attempts cannot both win), incrementing the fencing token.
 - **Heartbeat**: renew before `expiresAt` (conditional on own etag). Failure to renew means: stop committing, become a zombie by definition.
 - **Fencing**: every WAL segment object name embeds the fencing token, and every `manifest.json` write is a conditional PUT against the manifest etag the writer last saw AND records the writer's token. A zombie holding token 16 cannot overwrite a manifest advanced by token 17: its conditional PUT fails on the etag, and even its orphaned `16-*.seg.zst` uploads are ignorable garbage because no manifest references them. **A stale writer physically cannot commit.** This upgrades Litestream's "detect divergence via generations" to "prevent divergence."
+- **Fence-stamp on takeover**: taking over a lease does not by itself touch the manifest, which would leave a window where the previous holder could still win one last commit CAS (and the new writer would be serving state about to be replaced). So a writer that acquires by takeover immediately CAS-writes the manifest with its new fencing token — one tiny PUT — after which the zombie's next commit fails instantly. Verified live with a two-writer test.
 - Clock skew only affects how aggressively expired leases are taken over, never correctness; correctness comes from the conditional writes, not the clock.
 
 ### 4.5 Write path (commit)
@@ -167,10 +168,16 @@ On `syncToFs()`:
 3. Conditional PUT of `manifest.json` appending the new segment(s). This single operation IS the commit. Precondition failure means lease lost: surface a fatal "writer fenced" error, never retry blindly.
 4. A crash at any point before step 3 leaves the old manifest intact. Torn states are impossible by construction. No fsync semantics required from the object store, ever.
 
-Durability modes, mapped onto the existing `relaxedDurability` flag:
+Durability modes (`durability` option):
 
-- **Strict** (`relaxedDurability: false`): the query promise resolves only after the manifest PUT. An acknowledged transaction is durable in the bucket. Cost: ~10-50ms added write latency. Litestream cannot offer this; we can because we sit inside the commit path.
-- **Relaxed** (`true`): segments and manifest updates are batched and flushed every N ms / N bytes, plus on `waitUntil`/shutdown. Litestream-equivalent semantics (bounded loss window on crash), much lower latency.
+- **`strict`**: the query promise resolves only after the manifest PUT. An acknowledged transaction is durable in the bucket. In v0 (whole-snapshot commits) this costs seconds on a large DB; with v1 WAL shipping it is ~100-150ms regardless of size. Litestream cannot offer this; we can because we sit inside the commit path.
+- **`interval`**: commits are batched and flushed every N ms, plus on `waitUntil`/shutdown. Litestream-equivalent semantics (bounded loss window on crash), memory-speed writes.
+- **`sleep`**: writes return at memory speed and **nothing uploads until the instance is told to sleep** (SIGTERM on scale-to-zero, `close()`, explicit `flush()`). The natural pairing for serverless: the database is hot in memory while traffic flows, and pays one snapshot upload when the platform reaps the instance. Loss window = since last flush if the instance dies without grace; an idle-flush backstop (flush after N s without requests) keeps that window small in practice, since Cloud Run only grants ~10s after SIGTERM.
+
+Snapshot hygiene and codec (v0 specifics, measured the hard way):
+
+- Postgres keeps up to `max_wal_size` (default **1GB**) of recycled WAL segments in `pg_wal/`; a naive datadir tar ships them forever — a 500MB database once produced a 969MB snapshot. Writers persist `max_wal_size=64MB, min_wal_size=32MB, wal_recycle=off` via `ALTER SYSTEM` (the settings travel inside the snapshot) and double-`CHECKPOINT` before dumping.
+- The snapshot codec is adaptive: probe the largest heap file (skipping `pg_wal`); if gzip -1 removes <35% of the bytes, ship raw `.tar`. A serverless vCPU deflates at ~12MB/s while the NIC moves 100MB/s+ — compressing incompressible data multiplies both commit and restore latency. The restore side picks its decompressor by key suffix.
 
 ### 4.6 Snapshots, generations, GC
 
@@ -185,7 +192,7 @@ Durability modes, mapped onto the existing `relaxedDurability` flag:
 - *v1, recommended*: a **Durable Object per database** owns the PGlite instance and the `ObjectStoreFS`, persisting to R2. The platform guarantees single-threaded, globally unique execution, so the lease is belt-and-suspenders rather than load-bearing. Workers anywhere RPC the DO. Use `waitUntil` + DO alarms for relaxed-mode flushes and snapshot timers. This ships soonest and is the safest.
 - *Generic tier*: plain Workers talking straight to R2 with the lease doing the real work. Needed anyway for the S3/GCS story, so the DO path is an optimization, not a dependency.
 
-**Google Cloud Run**: do NOT use the GCS FUSE volume mount for the live data dir (see section 2). Run MemoryFS + `ObjectStoreFS` over the GCS JSON API with `ifGenerationMatch`. With `min-instances=0..1` and `max-instances=1` the platform already approximates single-writer; the lease makes it actually safe across deploys, rollouts, and the brief double-instance windows Cloud Run creates during revision switches.
+**Google Cloud Run**: do NOT use the GCS FUSE volume mount for the live data dir (see section 2). The datadir lives on `/tmp` (tmpfs — counts toward container memory but stays out of the JS heap), restored/committed over the GCS JSON API with `ifGenerationMatch`. With `min-instances=0..1` and `max-instances=1` the platform already approximates single-writer; the lease (+ boot-time `acquireTimeoutMs` to ride out the double-instance window during revision switches, observed live) makes it actually safe across deploys and rollouts. Two operational facts measured on the platform: repeated crash exits (non-zero) trigger crash-restart backoff (429s for tens of seconds — exit 0 on intentional restarts), and SIGTERM grace is ~10s, which a large flush can exceed (hence the idle-flush backstop in sleep mode).
 
 **Anything with a real disk** (Fly, VPS, laptop): NodeFS as the working dir instead of MemoryFS, same replication layer on top. That is the literal Litestream deployment model and gives fast restarts.
 
