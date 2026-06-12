@@ -16,7 +16,7 @@ Think: **Litestream, but for Postgres** — and durability semantics you can pic
 
 Each page tells you whether it was served cold (instance woke from zero and restored Postgres from the bucket) or warm, with the full boot breakdown. Leave a note — it persists in the bucket across scale-to-zero. The instances are reaped after ~15 idle minutes; come back later and you'll catch a cold start.
 
-Numbers from 20 forced cold starts per size on Cloud Run (1 vCPU + startup boost, europe-west1, same-region GCS), end-to-end from the client. The split: ~2s container start (the platform's floor — it dominates for small DBs), restore pipeline scaling with size (1.3s @ 10MB → 9.1s @ 500MB), and ~0.7s PGlite open regardless of size.
+Numbers from 20 forced cold starts per size on Cloud Run (1 vCPU + startup boost, europe-west1, same-region GCS), end-to-end from the client. The split: ~2s container start (the platform's floor — it dominates for small DBs), restore pipeline scaling with size (1.3s @ 10MB → 9.1s @ 500MB), and ~0.7s PGlite open regardless of size. Memory floor: the 500MB database runs even in a 1GiB container (datadir on tmpfs ~535MB + ~430MB RSS — tight but 5/5 stable); 2GiB is the comfortable tier, and 4GiB changes nothing because restore is bandwidth-bound, not memory-bound.
 
 ## How a database with no server works
 
@@ -62,7 +62,7 @@ Working v0 on real infrastructure (GCS + Cloud Run). Experiment-driven; every cl
 | E2 round-trip | reopen is byte-identical at 1/10/100 MB | ✅ |
 | E2b crash matrix | SIGKILL at every commit fault point → never torn | ✅ |
 | E3 cold start | distributions above, boot-path split | ✅ |
-| E3b memory tiers | smallest container per DB size | ✅ see results |
+| E3b memory tiers | smallest container per DB size | ✅ 500MB DB runs in **1GiB** (5/5, tight); 2GiB comfortable; 4GiB buys nothing |
 | E4 lifecycle | revision switches, SIGTERM flush, zombie fencing — live | ✅ |
 | E5 soak + cost | 72h realistic traffic, billed cost | pending |
 
