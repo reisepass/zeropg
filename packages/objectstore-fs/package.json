@@ -1,6 +1,6 @@
 {
   "name": "@zeropg/objectstore-fs",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "src/index.ts",
   "exports": {
@@ -12,5 +12,23 @@
   },
   "peerDependencies": {
     "@electric-sql/pglite": "*"
+  },
+  "description": "ZeroPG core: Postgres (PGlite) with an object-storage bucket as its durable home. Incremental WAL shipping, manifest-swap commits, durability modes, streaming snapshot restore, branching, GC.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reisepass/zeropg.git",
+    "directory": "packages/objectstore-fs"
+  },
+  "keywords": [
+    "postgres",
+    "pglite",
+    "serverless",
+    "litestream",
+    "wal",
+    "scale-to-zero"
+  ],
+  "engines": {
+    "node": ">=22"
   }
 }
