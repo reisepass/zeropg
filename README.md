@@ -43,13 +43,15 @@ Numbers from 20 forced cold starts per size on Cloud Run (1 vCPU + startup boost
 
 | mode | write latency (measured, 50 MB DB) | loss window on crash |
 |---|---|---|
-| `strict` | ~7.8s (v0 ships a full snapshot per commit) | zero — ack ⇒ in the bucket |
+| `strict` | **~0.2s** — ships only the WAL bytes the commit appended | zero — ack ⇒ in the bucket |
 | `interval` | ~0.15s | ≤ flush interval (Litestream-style) |
-| `sleep` *(demo default)* | **~0.15s** | since last flush; flushes on SIGTERM + after 60s idle |
+| `sleep` *(demo default)* | **~0.15s** | since last flush; flushes on SIGTERM + after 25s idle |
 
-`sleep` is the serverless-native mode: writes run at memory speed while traffic flows, and the snapshot uploads once, when the platform puts the instance to sleep. The demo pages show the per-step timing of the last write (SQL exec / lease check / checkpoint / upload / manifest CAS) — and a "durable now" checkbox to feel the difference per write.
+Commits are **incremental WAL shipping** (Litestream's trick, Postgres edition): each commit uploads one immutable object holding the LSN range it appended — a few hundred bytes for a one-row insert, measured live at scan 1.3ms + upload 79ms + manifest CAS 97ms on the 50MB demo. The full snapshot is now a *compaction* artifact: when accumulated WAL passes 16MB, the next commit rolls a fresh snapshot and keeps the previous one as a backup pointer in the manifest. Flat cost at any database size — v0's full-snapshot-per-commit was 7.8s on the same database.
 
-v1 ships WAL segments instead of snapshots: strict writes become ~100–150ms at any database size (the commit is a few KB of WAL + the manifest CAS). The architecture, layout, and API don't change — see [DESIGN.md](DESIGN.md) §4.5 and the roadmap.
+Two provider realities are engineered around (see [COST-MODEL.md](COST-MODEL.md)): GCS caps sustained writes per object name at ~1/s (measured: 2.4/s with 52% rejections), so back-to-back strict commits **group-commit** — concurrent writes coalesce into one manifest CAS (measured: 10 concurrent writes → 1 commit) and sustained writers pace at the cap; and clean 429/5xx rejections retry with backoff in the driver.
+
+`sleep` is the serverless-native mode: writes run at memory speed while traffic flows, and one flush happens when the platform puts the instance to sleep. The demo pages show the per-step timing of the last write (SQL exec / lease check / WAL scan / upload / manifest CAS) — and a "durable now" checkbox to feel the difference per write.
 
 ## Status
 
@@ -60,13 +62,14 @@ Working v0 on real infrastructure (GCS + Cloud Run). Experiment-driven; every cl
 | E0 primitives | GCS conditional writes are a correct CAS | ✅ 0 double-winners in 2,000 races |
 | E1 lease | acquire/renew/takeover/fencing correct under contention | ✅ |
 | E2 round-trip | reopen is byte-identical at 1/10/100 MB | ✅ |
-| E2b crash matrix | SIGKILL at every commit fault point → never torn | ✅ |
+| E2b crash matrix | SIGKILL at every commit fault point → never torn | ✅ (re-passed on incremental commits) |
+| E2c incremental | WAL shipping: byte-identical reopens, compaction, group commit | ✅ strict commit p50 134ms |
 | E3 cold start | distributions above, boot-path split | ✅ |
 | E3b memory tiers | smallest container per DB size | ✅ 500MB DB runs in **1GiB** (5/5, tight); 2GiB comfortable; 4GiB buys nothing |
 | E4 lifecycle | revision switches, SIGTERM flush, zombie fencing — live | ✅ |
 | E5 soak + cost | 72h realistic traffic, billed cost | pending |
 
-Hard-won platform facts: Postgres silently keeps up to 1 GB of recycled WAL in the datadir (`max_wal_size` default) — a 500 MB DB once shipped 969 MB snapshots until we pinned the WAL GUCs; Cloud Run rate-limits crash-looping containers (exit 0 on purpose-restarts); revision switches run two instances against one lease (boot must wait it out, not fail).
+Hard-won platform facts: Postgres silently keeps up to 1 GB of recycled WAL in the datadir (`max_wal_size` default) — a 500 MB DB once shipped 969 MB snapshots until we pinned the WAL GUCs; Postgres preallocates WAL segment files at full size and fills them by overwrite, so incremental capture must be LSN-based, never file-size-based; GCS rate-caps writes to a single object name at ~1/s — fast commits must group-commit; Cloud Run rate-limits crash-looping containers (exit 0 on purpose-restarts); revision switches run two instances against one lease (boot must wait it out, not fail).
 
 ## Layout
 
