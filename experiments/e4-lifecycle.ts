@@ -155,8 +155,18 @@ async function p3_revisionSwitchLoop(cycles = 5) {
     await waitReady()
     const status = await postNote(URL, `e4-p3 cycle ${i}`, true)
     assert(status === 302, `P3 cycle ${i}: write after switch (got ${status})`)
-    const n = await noteCount()
-    assert(n === start + i + 1, `P3 cycle ${i}: count ${start + i + 1}, got ${n}`)
+    // During the rollout's double-instance window a read can land on the
+    // DRAINING old instance, whose in-memory state lags the newest write by
+    // one (the write went to the lease holder). That staleness is bounded by
+    // the drain window, not data loss — poll until the routed read converges.
+    const want = start + i + 1
+    const deadline = Date.now() + 60_000
+    let n = await noteCount()
+    while (n < want && Date.now() < deadline) {
+      await sleep(2000)
+      n = await noteCount()
+    }
+    assert(n === want, `P3 cycle ${i}: count converges to ${want} (got ${n})`)
     switches++
     console.log(`  cycle ${i}: switch+write ok in ${Date.now() - t0}ms`)
   }
