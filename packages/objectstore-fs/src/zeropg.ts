@@ -36,6 +36,13 @@ import {
   decodeManifest,
 } from './manifest.js'
 import { createTarStream, extractTarStream, largestFile } from './tar.js'
+import {
+  restoreSnapshotInto,
+  applyWalSegments,
+  parseLsn,
+  formatLsn,
+  walFileName,
+} from './restore.js'
 import { createGunzip, createGzip, gzipSync, crc32 } from 'node:zlib'
 import { Readable } from 'node:stream'
 import * as nodeStream from 'node:stream'
@@ -147,25 +154,6 @@ const COMPACT_AT_WAL_BYTES = 16 * 1024 * 1024
 const COMPACT_AT_SEGMENTS = 64
 
 // ---- WAL LSN arithmetic ----
-// Postgres preallocates pg_wal segment files at their full size (16MB) and
-// fills them by overwrite, so file sizes say nothing about where WAL ends.
-// The only truth is the flush LSN; these helpers map LSNs onto file names and
-// offsets, mirroring XLogFileName()/XLByteToSeg() in xlog_internal.h.
-
-function parseLsn(s: string): bigint {
-  const [hi, lo] = s.split('/')
-  return (BigInt(parseInt(hi, 16)) << 32n) | BigInt(parseInt(lo, 16))
-}
-function formatLsn(l: bigint): string {
-  return `${(l >> 32n).toString(16).toUpperCase()}/${(l & 0xffffffffn).toString(16).toUpperCase()}`
-}
-function walFileName(tli: number, lsn: bigint, segBytes: number): string {
-  const segno = lsn / BigInt(segBytes)
-  const perId = 0x1_0000_0000n / BigInt(segBytes)
-  const hex = (n: bigint) => n.toString(16).toUpperCase().padStart(8, '0')
-  return hex(BigInt(tli)) + hex(segno / perId) + hex(segno % perId)
-}
-
 function randomGeneration(): string {
   const b = new Uint8Array(8)
   crypto.getRandomValues(b)
@@ -379,8 +367,8 @@ export class ZeroPG {
       await mkdir(this.dataDir, { recursive: true, mode: 0o700 })
     }
     const tRestore = performance.now()
-    this.bootTimings.snapshotBytes = await this.restoreInto(this.dataDir, m.snapshot)
-    await this.applyWalSegments(this.dataDir, m)
+    this.bootTimings.snapshotBytes = await restoreSnapshotInto(this.store, this.dataDir, m.snapshot)
+    await applyWalSegments(this.store, this.dataDir, m)
     // Resume point BEFORE Postgres boots: everything the bucket holds ends at
     // the last shipped LSN. Anything Postgres writes past it from here on
     // (including its end-of-recovery checkpoint record) ships with the next
@@ -423,63 +411,26 @@ export class ZeroPG {
     }
   }
 
-  /** Overlay shipped WAL ranges onto the restored datadir: fetch concurrently
-   * (small objects), verify CRC + LSN continuity, write each range into the
-   * pg_wal segment file(s) it spans at the LSN-derived offsets. */
-  private async applyWalSegments(dir: string, m: Manifest): Promise<void> {
-    const segments = m.walSegments
-    if (segments.length === 0) return
-    if (!m.walFlushLsn || !m.walSegmentBytes) {
-      throw new Error('manifest has WAL segments but no walFlushLsn/walSegmentBytes')
+  /**
+   * Every 8KB WAL page carries its own address (xlp_pageaddr). Verify each
+   * full page in [start, end) claims the LSN it sits at — zeros or stale
+   * bytes fail immediately. This is the guard against shipping WAL the
+   * engine has ACCOUNTED as flushed but not yet physically written back to
+   * the host FS (observed live: a 5MB commit's tail read back as garbage and
+   * the restorer dropped it — acked-write loss).
+   */
+  private validateWalRange(buf: Buffer, start: bigint): bigint | null {
+    const PAGE = 8192n
+    let page = ((start + PAGE - 1n) / PAGE) * PAGE // first full page in range
+    const end = start + BigInt(buf.length)
+    while (page + 12n <= end) {
+      const off = Number(page - start)
+      const pageaddr = buf.readBigUInt64LE(off + 8)
+      const magic = buf.readUInt16LE(off)
+      if (pageaddr !== page || magic === 0) return page // first bad page
+      page += PAGE
     }
-    const segBytes = m.walSegmentBytes
-    const tli = m.walTimeline ?? 1
-    // Continuity: first range starts at the snapshot's flush LSN, each next
-    // range starts where the previous ended. A gap would mean a hole in the
-    // replay stream — refuse loudly rather than boot a half-restored DB.
-    let expect = parseLsn(m.walFlushLsn)
-    for (const seg of segments) {
-      if (parseLsn(seg.startLsn) !== expect) {
-        throw new Error(`WAL range gap: expected ${formatLsn(expect)}, got ${seg.startLsn} (${seg.key})`)
-      }
-      expect = parseLsn(seg.endLsn)
-    }
-    const bodies = await Promise.all(
-      segments.map(async (seg) => {
-        const obj = await this.store.get(seg.key)
-        if (!obj) throw new Error(`manifest references missing WAL segment ${seg.key}`)
-        const want = Number(parseLsn(seg.endLsn) - parseLsn(seg.startLsn))
-        if (obj.bytes.byteLength !== want) {
-          throw new Error(`WAL segment ${seg.key}: size ${obj.bytes.byteLength} != ${want}`)
-        }
-        if ((crc32(obj.bytes) >>> 0) !== seg.crc32) {
-          throw new Error(`WAL segment ${seg.key}: CRC mismatch`)
-        }
-        return obj.bytes
-      }),
-    )
-    for (let i = 0; i < segments.length; i++) {
-      const body = bodies[i]
-      let pos = parseLsn(segments[i].startLsn)
-      let bodyOff = 0
-      while (bodyOff < body.byteLength) {
-        const offInFile = Number(pos % BigInt(segBytes))
-        const take = Math.min(body.byteLength - bodyOff, segBytes - offInFile)
-        const path = join(dir, 'pg_wal', walFileName(tli, pos, segBytes))
-        // Create-if-missing without truncating, then write at the offset.
-        const fh = await open(path, 'a').then(async (h) => {
-          await h.close()
-          return open(path, 'r+')
-        })
-        try {
-          await fh.write(body, bodyOff, take, offInFile)
-        } finally {
-          await fh.close()
-        }
-        pos += BigInt(take)
-        bodyOff += take
-      }
-    }
+    return null
   }
 
   /** Read WAL bytes [start, end) out of the local pg_wal segment files. */
@@ -529,17 +480,6 @@ export class ZeroPG {
     throw new Error('fence-stamp failed after repeated manifest races')
   }
 
-  /** Stream a snapshot object into dir; returns its stored size. The key
-   * suffix says whether it is gzipped (.tar.gz) or raw tar (.tar). */
-  private async restoreInto(dir: string, snapshotKey: string): Promise<number> {
-    const src = await this.store.getStream(snapshotKey)
-    if (!src) throw new Error(`manifest references missing snapshot ${snapshotKey}`)
-    const tarStream = snapshotKey.endsWith('.gz')
-      ? compose(Readable.from(src.stream), createGunzip())
-      : Readable.from(src.stream)
-    await extractTarStream(tarStream as AsyncIterable<Uint8Array>, dir)
-    return src.size
-  }
 
   /**
    * Decide the snapshot codec by test-compressing a slice of the largest heap
@@ -827,6 +767,27 @@ export class ZeroPG {
     let buf: Buffer
     try {
       buf = await this.readWalRange(start, end)
+      // The engine can account WAL as flushed before the bytes physically
+      // land in the host FS (large commits lose the race; observed live).
+      // Validate every page's self-address and give write-back a moment to
+      // catch up; if it never does, compact — never ship garbage.
+      for (let attempt = 0; ; attempt++) {
+        const badPage = this.validateWalRange(buf, start)
+        if (badPage === null) break
+        if (attempt >= 20) {
+          console.error(
+            JSON.stringify({
+              event: 'zeropg-wal-writeback-stall',
+              badPageLsn: formatLsn(badPage),
+              range: `${formatLsn(start)}..${formatLsn(end)}`,
+              action: 'compacting',
+            }),
+          )
+          return null
+        }
+        await new Promise((r) => setTimeout(r, 25 * (attempt + 1)))
+        buf = await this.readWalRange(start, end)
+      }
     } catch {
       // The range fell off the local pg_wal (an automatic checkpoint removed
       // segments past our resume point — possible after a huge unflushed

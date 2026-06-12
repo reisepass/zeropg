@@ -1,9 +1,27 @@
 {
   "name": "@zeropg/blobstore",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "description": "Object-store transports for zeropg: GCS with atomic conditional writes (CAS), parallel-range streaming GET, chunked streaming PUT, server-side copy, and a per-provider cost/limit model.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reisepass/zeropg.git",
+    "directory": "packages/blobstore"
+  },
+  "keywords": [
+    "gcs",
+    "object-storage",
+    "conditional-write",
+    "cas",
+    "s3",
+    "r2"
+  ],
+  "engines": {
+    "node": ">=22"
   }
 }

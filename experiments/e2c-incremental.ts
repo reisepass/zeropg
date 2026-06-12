@@ -39,7 +39,7 @@ async function main() {
 
   // ---------------------------------------------------------------- 1+2
   section('Incremental roundtrip: 60 strict commits across 3 reopens')
-  let db = await ZeroPG.open({ store, holder: 'w0', seedSnapshot: seed, commitIntervalMs: 0 })
+  let db = await ZeroPG.open({ store, holder: 'w0', seedSnapshot: seed, commitIntervalMs: 450 })
   await db.exec('CREATE TABLE kv (id int primary key, v text)')
   const m0 = await currentManifest()
   assert(m0.version === 2, `fresh DB writes a v2 manifest (got v${m0.version})`)
@@ -61,7 +61,7 @@ async function main() {
     }
     const sum = await tableChecksum(db)
     await db.close()
-    db = await ZeroPG.open({ store, holder: `w${reopen + 1}`, commitIntervalMs: 0 })
+    db = await ZeroPG.open({ store, holder: `w${reopen + 1}`, commitIntervalMs: 450 })
     const sum2 = await tableChecksum(db)
     assert(sum === sum2, `reopen ${reopen + 1}: state survives (${sum} == ${sum2})`)
   }
@@ -114,7 +114,7 @@ async function main() {
   assert(r2.commit?.mode === 'incremental', `post-compaction write ships a segment (got ${r2.commit?.mode})`)
   const sumPre = await tableChecksum(db)
   await db.close()
-  db = await ZeroPG.open({ store, holder: 'w-postcompact', commitIntervalMs: 0 })
+  db = await ZeroPG.open({ store, holder: 'w-postcompact', commitIntervalMs: 450 })
   assert((await tableChecksum(db)) === sumPre, 'reopen after compaction is byte-identical')
   logResult('e2c.jsonl', { probe: 'compaction', commitSeq: m2.commitSeq })
 
@@ -131,7 +131,7 @@ async function main() {
   const sumSwitch = await tableChecksum(db)
   const blobCount = (await db.query<{ n: string }>('SELECT count(*)::text n FROM blob')).rows[0].n
   await db.close()
-  db = await ZeroPG.open({ store, holder: 'w-switch', commitIntervalMs: 0 })
+  db = await ZeroPG.open({ store, holder: 'w-switch', commitIntervalMs: 450 })
   assert((await tableChecksum(db)) === sumSwitch, 'kv intact across WAL-file switches')
   assert(
     (await db.query<{ n: string }>('SELECT count(*)::text n FROM blob')).rows[0].n === blobCount,
