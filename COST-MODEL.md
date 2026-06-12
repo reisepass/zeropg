@@ -121,3 +121,21 @@ Colder classes (Nearline $0.010, Coldline $0.004, Archive $0.0012 /GB-month) car
 
 - E5 (soak + cost) must validate this table against the actual bill: predicted vs billed, line by line.
 - Add E5b: GCS manifest CAS at >1/s sustained - confirm the 429 behavior and that batching holds the rate under the cap.
+
+## Status (2026-06-12): measured + what is implemented
+
+**E5b ran.** Sequential CAS against one object name: **2.43/s achieved, 52% of requests answered 429** (`results/e5b.jsonl`). The ~1/s documented cap is real and soft - burstable, but anything sustained above it grinds through rejections. The first v1-WAL-shipping E2c run then hit this organically: incremental commits are ~150ms, so 60 sequential strict writes exceeded the manifest cap and failed with the exact `gcs429` error. v0 could never reach this limit (9s snapshot commits); fixing it became mandatory the moment writes got fast.
+
+Implemented now (the "tweak settings + driver behavior" tier):
+- `CostModel` on the `BlobStore` interface; `GcsBlobStore.cost` pins the GCS table with a review date. `maxWritesPerObjectPerSec: 1`.
+- **Group-commit pacing in ZeroPG**, derived from the cost model: commits are spaced >=1s apart on GCS; writes arriving inside the window coalesce into the next commit's WAL range (E2c probe 5: 10 concurrent writes -> few CASes). Idle databases pay zero latency - pacing only bites under sustained write load.
+- **429/5xx retry with jittered backoff** in the GCS driver. Only clean rejections retry; ambiguous network failures do NOT (a retried-but-already-landed conditional PUT would read as a false FencedError).
+- Bucket hygiene verified on our bucket: soft delete OFF, no versioning, no Autoclass, single region. (Soft delete is the headline trap: 7-day retention billed on every deleted byte, and we delete superseded snapshots constantly.)
+- Idle = zero ops already holds: no heartbeat at rest, interval-mode flush no-ops when clean, sleep mode uploads only on SIGTERM/idle-backstop.
+
+The v2 worth building (GCS-structural, in order):
+1. **`compose`-based segment compaction.** Our WAL segments are stored raw, so GCS server-side compose (32:1, one Class A op, `ifGenerationMatch` support) can fold many small segments into one object with **zero instance CPU/bandwidth, and no instance even awake**. Restore GET-count drops 32x; full-snapshot compaction then triggers on replay-time budget only. This is the cheap middle tier between "many segments" and "full snapshot" - Litestream's compaction levels, GCS edition.
+2. **Restore-budget-driven compaction** replacing the fixed 16MB/64-segment thresholds: `estimatedRestoreMs = snapshotBytes/throughput + segments*perGetMs + walBytes/replayRate`, snapshot when it exceeds ~1.5x the bare-snapshot restore. All three constants are now measured (E0, E2c, E3).
+3. **Appendable objects (zonal Rapid Storage)**: would collapse segment-per-commit into appends to one open object. Zonal durability caveat; watch, don't build.
+
+Not worth building: manifest sharding to dodge the 1/s cap (group commit is sufficient - single-writer caps useful commit rate anyway), cold storage classes for live generations (minimum-duration + retrieval fees exceed savings at our sizes), op-count micro-optimization (ops are cents/month at target scale; the binding constraints are the per-object write cap, restore latency, and instance CPU-seconds).

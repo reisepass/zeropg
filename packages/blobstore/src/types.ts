@@ -72,7 +72,30 @@ export class PreconditionFailedError extends Error {
   }
 }
 
+/**
+ * Per-provider cost/limit table (COST-MODEL.md). Policy above the store —
+ * commit pacing, snapshot cadence, retention — is computed from this instead
+ * of being hardcoded per cloud. Prices drift: pin with a date, re-verify.
+ */
+export interface CostModel {
+  /** Date the numbers were last checked against the provider's price page. */
+  asOf: string
+  writeOpUsd: number
+  readOpUsd: number
+  storageGbMonthUsd: number
+  /** 0 where egress to the internet is free (R2). */
+  internetEgressGbUsd: number
+  /**
+   * Sustained write cap per object NAME (GCS: ~1/s, soft, 429s beyond).
+   * The manifest is one object name, so this caps strict-mode commit rate and
+   * forces group-commit batching above it. Omit when no such limit exists.
+   */
+  maxWritesPerObjectPerSec?: number
+}
+
 export interface BlobStore {
+  /** Provider cost/limit table, when the transport knows it. */
+  readonly cost?: CostModel
   /** GET an object. Returns null if it does not exist. */
   get(key: string, opts?: GetOptions): Promise<GetResult | null>
   /**

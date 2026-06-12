@@ -38,7 +38,11 @@ export async function collectGarbage(store: BlobStore, opts: GcOptions = {}): Pr
     return { kept: [], deleted: [], bytesFreed: 0 }
   }
   const manifest = decodeManifest(manifestObj.bytes)
-  const referenced = new Set<string>([manifest.snapshot, ...manifest.walSegments])
+  const referenced = new Set<string>([
+    manifest.snapshot,
+    ...manifest.walSegments.map((s) => s.key),
+    ...(manifest.previousSnapshot ? [manifest.previousSnapshot] : []),
+  ])
 
   const kept: string[] = []
   const deleted: string[] = []

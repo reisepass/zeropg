@@ -27,10 +27,15 @@ const DURABILITY: Durability = (['strict', 'interval', 'sleep'].includes(
 )
   ? process.env.ZEROPG_DURABILITY
   : 'sleep') as Durability
-// Sleep-mode backstop: Cloud Run only grants ~10s after SIGTERM, which a large
-// snapshot upload can blow through. Flush after this much request idleness so
-// the upload normally happens while we are still alive and unhurried. 0 = off.
-const IDLE_FLUSH_MS = Number(process.env.ZEROPG_IDLE_FLUSH_MS ?? 60_000)
+// Sleep-mode backstop, sized by two hazards measured in E4:
+//  1. Cloud Run only grants ~10s after SIGTERM — a large snapshot upload can
+//     blow through it.
+//  2. During a revision switch the NEW instance becomes ready by taking over
+//     the lease at TTL expiry (60s after our last renew) and fence-stamps the
+//     manifest; from that instant our flush is correctly rejected. So pending
+//     writes must be flushed strictly before idle reaches the lease TTL:
+//     idle-flush (25s) + worst-case upload (~10s) < TTL (60s).
+const IDLE_FLUSH_MS = Number(process.env.ZEROPG_IDLE_FLUSH_MS ?? 25_000)
 const PORT = Number(process.env.PORT ?? 8080)
 const INSTANCE_ID = `${process.env.K_REVISION ?? 'local'}-${process.pid}`
 
@@ -352,9 +357,14 @@ function renderLastWrite(): string {
   if (!lastWrite) return ''
   const w = lastWrite
   const f = (n: number) => (n < 10 ? n.toFixed(2) : String(Math.round(n)))
+  const fmtBytes = (n: number) => (n < 1e6 ? `${(n / 1e3).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`)
   const commitRows = w.commit
-    ? `<tr><td>· checkpoint</td><td>${f(w.commit.dumpMs)} ms</td></tr>
- <tr><td>· snapshot upload (${(w.commit.snapshotBytes / 1e6).toFixed(1)} MB)</td><td>${f(w.commit.uploadMs)} ms</td></tr>
+    ? w.commit.mode === 'incremental'
+      ? `<tr><td>· WAL delta scan</td><td>${f(w.commit.dumpMs)} ms</td></tr>
+ <tr><td>· WAL segment upload (${w.commit.segments} × ${fmtBytes(w.commit.snapshotBytes)})</td><td>${f(w.commit.uploadMs)} ms</td></tr>
+ <tr><td>· manifest CAS (the actual commit)</td><td>${f(w.commit.manifestMs)} ms</td></tr>`
+      : `<tr><td>· checkpoint + WAL switch</td><td>${f(w.commit.dumpMs)} ms</td></tr>
+ <tr><td>· snapshot upload — compaction (${fmtBytes(w.commit.snapshotBytes)})</td><td>${f(w.commit.uploadMs)} ms</td></tr>
  <tr><td>· manifest CAS (the actual commit)</td><td>${f(w.commit.manifestMs)} ms</td></tr>`
     : `<tr><td>· bucket upload</td><td><i>deferred — happens on ${db.durabilityMode === 'interval' ? 'the next interval flush' : 'sleep/flush'}</i></td></tr>`
   return `<details class="write" open><summary>last write: <b>${f(w.totalMs)} ms</b> ${w.durable ? '(durable in bucket)' : '(memory; not yet in bucket)'}</summary>
@@ -379,6 +389,17 @@ async function shutdown(signal: string) {
     if (db) await db.close() // sleep-mode flush happens here + releases lease
     console.log(
       JSON.stringify({ event: 'shutdown-done', flushed: pending, ms: Math.round(performance.now() - t0) }),
+    )
+  } catch (e) {
+    // A fenced shutdown flush means a successor already took over: the writes
+    // pending here are lost (bounded by the idle-flush backstop). Loud log —
+    // if this ever fires with IDLE_FLUSH_MS correctly < lease TTL, it's a bug.
+    console.error(
+      JSON.stringify({
+        event: 'shutdown-flush-failed',
+        lostPendingWrites: pending,
+        error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+      }),
     )
   } finally {
     process.exit(0)
