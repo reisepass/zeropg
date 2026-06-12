@@ -66,11 +66,56 @@ Policy decisions computed from it:
 - whether the client-hydration/CDN story is on by default (R2: yes; GCS/S3: behind a "this costs egress" flag)
 - free-tier awareness for the README cost calculator ("your app: $0.00/month on R2")
 
-## Per-provider strategy notes
+## Google Cloud Storage - the first driver we optimize
 
-- **R2**: the cost-optimal home. Free egress makes bucket-served read replicas / CDN seeding free; free tier covers the entire target use case (10GB, 1M writes/mo ≈ 23 commits/min sustained). Pair with the Durable Object tier from DESIGN.md 4.7.
-- **GCS**: the 1 write/s/object manifest cap is the binding constraint - the driver must enforce commit batching at sustained load. Otherwise cheap; always-free tier covers small DBs.
-- **S3**: no free tier, highest egress; fine intra-AWS (Lambda). S3 Express One Zone is a separate, latency-oriented driver decision later - different pricing (per-GB request fees), single-AZ durability tradeoff.
+All figures Standard storage class, single region, as last reviewed 2026-06; pin and re-verify in the driver.
+
+### Price sheet
+
+| item | price | notes |
+|---|---|---|
+| Storage, Standard | ~$0.020/GB-month | region-dependent ($0.020 us-east1/europe-west1 ballpark) |
+| Class A ops (PUT, LIST, **compose**, rewrite, patch) | $0.05 / 10k = $0.005/1k | every segment PUT, manifest CAS, list = Class A |
+| Class B ops (GET, getMetadata) | $0.004 / 10k = $0.0004/1k | restore reads, manifest polls |
+| DELETE | free | GC costs nothing in ops |
+| Egress to same-region Google compute (Cloud Run/GCE/Functions) | free | the whole replication loop is op-cost only |
+| Egress to internet | ~$0.12/GB (premium tier) | matters only for client/CDN hydration |
+| Always-free tier | 5GB Standard + 5k Class A + 50k Class B /month | **US regions only** (us-east1/us-west1/us-central1) - europe-west1 gets nothing |
+
+Colder classes (Nearline $0.010, Coldline $0.004, Archive $0.0012 /GB-month) carry 30/90/365-day minimums, per-GB retrieval fees, and ~2x Class A prices. Verdict for us: **never** for live generations or short-lived garbage; only for a long-term backup branch (e.g. "keep a monthly snapshot for a year" feature, later).
+
+### Bucket configuration the driver should demand (or set itself)
+
+1. **Disable soft delete.** GCS buckets default to a 7-day soft-delete retention, billed at the storage rate for deleted bytes. Our workload deletes superseded snapshots constantly - with v0 shipping a 50MB snapshot per commit, soft delete would bill ~7 days x every snapshot ever GC'd. This may be the single biggest hidden cost on GCS; turn it off at bucket creation (`softDeletePolicy.retentionDurationSeconds: 0`).
+2. **No object versioning** (same reasoning - the manifest IS our versioning).
+3. **No Autoclass** (per-object monitoring fee buys nothing; our objects are either hot or garbage).
+4. **Single region, same region as the compute.** Dual-region doubles storage cost for an HA property the single-writer design can't use.
+5. Region choice: if the user has no latency constraint, default recommendation `us-east1`/`us-central1` to capture the always-free tier; otherwise same-region-as-compute wins (egress-free and lowest latency dominate).
+
+### Limits that bind
+
+- **~1 sustained write/second per object name.** The manifest is one object name → strict-mode sustained commit rate caps at ~1/s before 429/`rateLimitExceeded`. Driver rule: `minCommitBatchMs ≈ 1000`; under burst load, group commits into one manifest CAS (group commit). Retries with backoff on 429 are mandatory anyway (GCS documents this as a soft, burstable limit).
+- Per-bucket write ramp: ~1000 writes/s initial, auto-scales. Irrelevant at our scale.
+- Conditional writes (`ifGenerationMatch`) carry no surcharge and no special quota - the CAS loop is free beyond the op itself.
+
+### GCS-specific opportunities
+
+- **Server-side `compose`**: GCS can concatenate up to 32 objects into one without downloading them (Class A op, supports `ifGenerationMatch`). This is segment compaction WITHOUT instance CPU or bandwidth: periodically compose N small WAL segment objects into one larger object and swap the manifest's segment list. Restore GET-count drops 32x for one op's price, and no Cloud Run instance needs to be awake to do it. (Compose concatenates raw bytes - works for our segments if compression is per-segment-framed, e.g. concatenated gzip members, which gunzip handles natively.) This softens the snapshot-cadence pressure: compose is the cheap middle tier between "many segments" and "full snapshot," GCS edition of Litestream's compaction levels.
+- **Appendable objects / Rapid Storage (zonal)**: Google has been rolling out appendable objects on zonal buckets. If/when generally available in our regions, WAL shipping could append to one open segment object instead of minting many - fewer objects, fewer ops, simpler manifests. Different durability scope (zonal) - investigate before relying on it; flagged as a v2 driver variant, not v1.
+- **Manifest polling for read replicas is Class B** ($0.0004/1k): clients polling the manifest every 5s cost ~$0.21/month each on ops - fine; internet egress for the segments they then fetch is the real cost (front with a CDN or Cloudflare in front of GCS, or steer the client-hydration story to R2).
+
+### Worked example: target app on GCS (europe-west1)
+
+100MB DB, 500 writes/day batched into ~200 commits, snapshot/compaction 4x/day, 2 generations retained:
+- Ops: 200x2 + 4x2 ≈ 13k Class A/month ≈ $0.065
+- Storage: ~0.3GB average ≈ $0.006
+- Egress: $0 (Cloud Run same region)
+- **Total ≈ $0.07/month** (or ≈ $0.00 in a US free-tier region). Soft delete left on could multiply this several-fold - hence rule 1.
+
+## Other providers (briefer; each gets this treatment when its driver lands)
+
+- **R2**: the cost-optimal home overall. Free egress makes bucket-served read replicas / CDN seeding free; free tier (10GB, 1M writes/mo ≈ 23 commits/min sustained) covers the entire target use case. Pair with the Durable Object tier from DESIGN.md 4.7.
+- **S3**: no free tier, highest internet egress; fine intra-AWS (Lambda). No per-object write cap documented (manifest CAS serializes us anyway). S3 also supports multi-object concatenation only via multipart-copy (clunkier than GCS compose). S3 Express One Zone is a separate latency-oriented driver decision later - different pricing (per-GB request fees), single-AZ durability tradeoff.
 
 ## Experiment hooks
 
