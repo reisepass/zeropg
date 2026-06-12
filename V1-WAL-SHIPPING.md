@@ -17,6 +17,22 @@ The correct capture, as actually implemented (and what Litestream does for SQLit
 
 No Emscripten hooks, no shadow WAL — one SQL function call per commit.
 
+## Restored WAL files must be full segment size (third correction)
+
+Postgres reads WAL in full 8KB pages and treats a short read at EOF as end of
+WAL. Overlay-created segment files that end at the last shipped byte
+therefore silently truncate replay at the previous page boundary — measured:
+a restore dropped the final 5KB of a 5MB commit (its commit record included),
+while the writer's own preallocated 16MB files masked the bug on the writer
+side. Restore now extends every touched WAL file (sparse) to the full
+segment size, exactly the invariant Postgres maintains for itself. The zero
+tail reads as an invalid record, ending replay at precisely the last shipped
+byte. This was also the mechanism behind the production continuity
+violations (recovery-stop at a page boundary + ~192-byte end-of-recovery
+checkpoint = the recurring `...0C0` flush LSNs). With this fix, cross-life
+chaining may be sound again — re-promoting it over the per-life rule is a v2
+change gated on E4-grade lifecycle testing.
+
 ## Generation per writer life (second correction, from E4)
 
 WAL ranges must NEVER span writer lives. Live lifecycle testing (E4 P3, 5x
