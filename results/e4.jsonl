@@ -24,3 +24,8 @@
 {"ts":"2026-06-12T17:46:06.752Z","probe":"P3-revision-switch-loop","cycles":5,"finalCount":20}
 {"ts":"2026-06-12T17:47:14.099Z","probe":"P4-zombie-fencing","rivalToken":29,"zombieStatus":423}
 {"ts":"2026-06-12T17:53:56.810Z","probe":"P3-revision-switch-loop","cycles":5,"finalCount":24}
+{"ts":"2026-06-12T19:56:00.754Z","probe":"P1-idle-lease-self-heal","before":23,"after":25,"status":302}
+{"ts":"2026-06-12T19:57:12.913Z","probe":"P2-sigterm-flush","before":25,"after":26,"rollMs":72015}
+{"ts":"2026-06-12T19:58:06.093Z","probe":"P2b-crash-loss-bounded","baseline":27,"after":27}
+{"ts":"2026-06-12T20:03:15.977Z","probe":"P3-revision-switch-loop","cycles":5,"finalCount":32}
+{"ts":"2026-06-12T20:04:19.967Z","probe":"P4-zombie-fencing","rivalToken":44,"zombieStatus":423}
