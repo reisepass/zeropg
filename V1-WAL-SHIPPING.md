@@ -1,16 +1,21 @@
 # v1: incremental WAL shipping - implementation plan
 
-Status: NOT BUILT. v0 ships a full datadir snapshot per commit (9.2s writes on the 50MB demo). This is the plan to make writes O(transaction size) instead of O(database size). This is now the top development priority.
+Status: **BUILT** (2026-06-12), with one major correction to the capture design (below). Writes are O(transaction size): strict-commit wall p50 measured at **139ms** vs 7,800ms for v0 full snapshots on the same 50MB-class database (E2c). Manifest v2, compaction-as-backup, group-commit pacing and GCS 429 retry all landed with it.
 
-## Why we don't need per-write VFS interception (v1 shortcut)
+## Capture design: LSN ranges, NOT file-size diffing (plan corrected)
 
-With `wal_recycle=off` (already set in zeropg.ts), files under `pg_wal/` are append-only from creation to unlink - Postgres never rewrites shipped bytes. So incremental capture is just commit-time diffing:
+The original plan here ("any pg_wal file larger than its high-water mark has new bytes") was **wrong**, twice over, and failed immediately when built:
 
-- Keep an in-memory map `highWater: { walFileName -> byteOffsetShipped }`.
-- At commit, scan `pg_wal/` in MemoryFS: any file larger than its high-water mark (or not in the map) has new bytes to ship.
-- Unlinked files drop out of the map; their shipped bytes live on in the bucket until GC.
+1. Postgres preallocates every WAL segment file at its full `wal_segment_size` (16MB) the moment it is created — with `wal_init_zero=on` by zero-filling, with it off by writing the final byte. Either way `stat.size` is 16MB from birth and records fill the file by OVERWRITE. File size never moves; size-diffing sees nothing.
+2. Even if sizes moved, the end-of-recovery checkpoint record each boot writes would leave holes between shipped ranges.
 
-No Emscripten hooks, no shadow WAL. (v2 can move to true write interception if commit-time scanning ever shows up in profiles.)
+The correct capture, as actually implemented (and what Litestream does for SQLite):
+
+- Track `lastShippedLsn`. At commit, ask Postgres `pg_current_wal_flush_lsn()` (record-aligned for commit flushes, `synchronous_commit=on` enforced) and ship the byte range `[lastShippedLsn, flushLsn)` as ONE immutable object, reading it out of the segment files via LSN→(file, offset) arithmetic (`XLogFileName` math, validated against `pg_walfile_name()` at boot).
+- The manifest records `walFlushLsn` at snapshot time — where the snapshot's own pg_wal content ends and shipping resumes. Restore overlays each range at its LSN-derived offsets and lets Postgres recovery replay; LSN continuity (each range starts where the previous ended, the first at `walFlushLsn`) is verified before boot.
+- Stale bytes past the last shipped range are rejected by Postgres's own page-address validation, exactly as with recycled segments. Advancing `lastShippedLsn` only after the manifest CAS makes fenced commits leave only orphaned garbage.
+
+No Emscripten hooks, no shadow WAL — one SQL function call per commit.
 
 ## Manifest v2
 

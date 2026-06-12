@@ -30,12 +30,13 @@ import { type BlobStore, PreconditionFailedError } from '@zeropg/blobstore'
 import { Lease, FencedError, LockedError } from '@zeropg/lease'
 import {
   type Manifest,
+  type WalSegment,
   MANIFEST_KEY,
   encodeManifest,
   decodeManifest,
 } from './manifest.js'
 import { createTarStream, extractTarStream, largestFile } from './tar.js'
-import { createGunzip, createGzip, gzipSync } from 'node:zlib'
+import { createGunzip, createGzip, gzipSync, crc32 } from 'node:zlib'
 import { Readable } from 'node:stream'
 import * as nodeStream from 'node:stream'
 // stream.compose() exists at runtime since Node 16.9 but @types/node omits it.
@@ -43,7 +44,7 @@ import * as nodeStream from 'node:stream'
 const compose = (nodeStream as unknown as {
   compose: (...streams: unknown[]) => Readable
 }).compose
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, rm, readdir, stat, open } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -80,6 +81,13 @@ export interface ZeroPGOptions {
   /** Interval-mode flush cadence ms. Default 1000. */
   flushIntervalMs?: number
   /**
+   * Minimum spacing between manifest CASes (group-commit window). Defaults
+   * from the store's cost model: GCS caps sustained writes per object name at
+   * ~1/s, so back-to-back strict commits must batch. Writes arriving inside
+   * the window coalesce into the next commit. 0 disables pacing.
+   */
+  commitIntervalMs?: number
+  /**
    * Prebuilt empty-datadir snapshot (gzipped tar bytes) used to create a fresh
    * database without running initdb (~6.5s). Strongly recommended on
    * serverless. If absent, a fresh DB runs initdb once.
@@ -97,11 +105,19 @@ export interface ZeroPGOptions {
 export interface CommitInfo {
   commitSeq: number
   generation: string
+  /** 'incremental': shipped only the WAL bytes this commit appended.
+   *  'snapshot': full-datadir compaction (initial commit, threshold, or
+   *  migration from a v1 manifest). */
+  mode: 'incremental' | 'snapshot'
+  /** Snapshot key ('snapshot' mode) or the last segment key ('incremental'). */
   snapshotKey: string
+  /** Bytes uploaded by this commit (segment bytes or whole snapshot). */
   snapshotBytes: number
-  /** Time spent in CHECKPOINT before the snapshot. */
+  /** Segments shipped by this commit (0 in 'snapshot' mode). */
+  segments: number
+  /** CHECKPOINT (+ pg_switch_wal at compaction) time before upload. */
   dumpMs: number
-  /** Time in the tar -> gzip -> chunked-PUT pipeline (overlapped). */
+  /** Upload time (segment PUTs, or the tar->gzip->PUT pipeline). */
   uploadMs: number
   manifestMs: number
 }
@@ -110,11 +126,45 @@ const SQL_WRITE = /^\s*(insert|update|delete|create|alter|drop|truncate|comment|
 
 // Persisted via ALTER SYSTEM into postgresql.auto.conf, which travels inside
 // the snapshot — every future boot of this database inherits them.
+//
+// wal_recycle=off + wal_init_zero=off make pg_wal files strictly append-only
+// (created small, grown by appends, never rewritten, never zero-padded).
+// Incremental WAL shipping is built on that invariant: "new bytes" is just
+// "file grew past its high-water mark".
 const WAL_GUCS = [
   ["max_wal_size", "'64MB'"],
   ["min_wal_size", "'32MB'"],
   ["wal_recycle", 'off'],
+  ["wal_init_zero", 'off'],
+  // Incremental shipping reads committed WAL straight off the filesystem; a
+  // commit must have write()n its WAL before it returns or the scan misses it.
+  ["synchronous_commit", 'on'],
 ] as const
+
+// Compaction thresholds: when the segment tail outgrows these, the next commit
+// rolls a fresh full snapshot instead of appending more segments.
+const COMPACT_AT_WAL_BYTES = 16 * 1024 * 1024
+const COMPACT_AT_SEGMENTS = 64
+
+// ---- WAL LSN arithmetic ----
+// Postgres preallocates pg_wal segment files at their full size (16MB) and
+// fills them by overwrite, so file sizes say nothing about where WAL ends.
+// The only truth is the flush LSN; these helpers map LSNs onto file names and
+// offsets, mirroring XLogFileName()/XLByteToSeg() in xlog_internal.h.
+
+function parseLsn(s: string): bigint {
+  const [hi, lo] = s.split('/')
+  return (BigInt(parseInt(hi, 16)) << 32n) | BigInt(parseInt(lo, 16))
+}
+function formatLsn(l: bigint): string {
+  return `${(l >> 32n).toString(16).toUpperCase()}/${(l & 0xffffffffn).toString(16).toUpperCase()}`
+}
+function walFileName(tli: number, lsn: bigint, segBytes: number): string {
+  const segno = lsn / BigInt(segBytes)
+  const perId = 0x1_0000_0000n / BigInt(segBytes)
+  const hex = (n: bigint) => n.toString(16).toUpperCase().padStart(8, '0')
+  return hex(BigInt(tli)) + hex(segno / perId) + hex(segno % perId)
+}
 
 function randomGeneration(): string {
   const b = new Uint8Array(8)
@@ -142,15 +192,36 @@ export class ZeroPG {
   private closed = false
   private commitInFlight: Promise<CommitInfo | null> | null = null
 
+  // ---- incremental WAL shipping state ----
+  /** Everything below this LSN is durable in the bucket (snapshot + shipped
+   * ranges). The next incremental commit ships [lastShippedLsn, flushLsn). */
+  private lastShippedLsn = 0n
+  /** Segment bytes shipped since the last compaction (threshold input). */
+  private walBytesSinceSnapshot = 0
+  /** WAL segment file size + timeline, validated against the live cluster. */
+  private walSegBytes = 0
+  private walTli = 1
+  /** False when this session can't do LSN-mapped shipping (function missing,
+   * or our file-name math disagrees with pg_walfile_name). */
+  private incrementalCapable = false
+  /** Force the next commit to compact (e.g. the manifest predates v2 and has
+   * no walFlushLsn to resume shipping from). */
+  private forceCompactNext = false
+
   private constructor(opts: ZeroPGOptions) {
     this.store = opts.store
     this.noLease = opts.noLease ?? false
     this.durability = opts.durability ?? (opts.relaxedDurability ? 'interval' : 'strict')
     this.leaseTtlMs = opts.leaseTtlMs ?? 30_000
     this.flushIntervalMs = opts.flushIntervalMs ?? 1000
+    const capPerSec = opts.store.cost?.maxWritesPerObjectPerSec
+    this.commitIntervalMs = opts.commitIntervalMs ?? (capPerSec ? Math.ceil(1000 / capPerSec) : 0)
     this.now = opts.now ?? Date.now
     this.scratchBase = opts.scratchDir ?? join(tmpdir(), 'zeropg')
   }
+
+  private commitIntervalMs: number
+  private lastCasAt = 0
 
   /** The underlying PGlite instance (escape hatch / ORM adapters). */
   get raw(): PGlite {
@@ -284,8 +355,9 @@ export class ZeroPG {
     }
   }
 
-  /** Make `m` our state: restore its snapshot into the scratch dir and start
-   * PGlite on it. Used at boot and when the manifest moves underneath us. */
+  /** Make `m` our state: restore its snapshot into the scratch dir, overlay
+   * its WAL segments, and start PGlite on it (Postgres recovery replays the
+   * overlaid WAL). Used at boot and when the manifest moves underneath us. */
   private async adoptManifest(m: Manifest, etag: string): Promise<void> {
     this.manifest = m
     this.manifestEtag = etag
@@ -297,12 +369,113 @@ export class ZeroPG {
     }
     const tRestore = performance.now()
     this.bootTimings.snapshotBytes = await this.restoreInto(this.dataDir, m.snapshot)
+    await this.applyWalSegments(this.dataDir, m)
+    // Resume point BEFORE Postgres boots: everything the bucket holds ends at
+    // the last shipped LSN. Anything Postgres writes past it from here on
+    // (including its end-of-recovery checkpoint record) ships with the next
+    // commit, so a future restore replays the identical byte stream.
+    const resumeAt = m.walSegments.length
+      ? m.walSegments[m.walSegments.length - 1].endLsn
+      : m.walFlushLsn
+    this.lastShippedLsn = resumeAt ? parseLsn(resumeAt) : 0n
+    this.walSegBytes = m.walSegmentBytes ?? 0
+    this.walTli = m.walTimeline ?? 1
+    this.walBytesSinceSnapshot = m.walSegments.reduce(
+      (n, s) => n + Number(parseLsn(s.endLsn) - parseLsn(s.startLsn)),
+      0,
+    )
     this.bootTimings.restoreMs = performance.now() - tRestore
     const tPg = performance.now()
     this.pg = await PGlite.create({ dataDir: this.dataDir })
     await this.pg.waitReady
     this.bootTimings.pgliteCreateMs = performance.now() - tPg
     await this.ensureWalConfig()
+    // No walFlushLsn (pre-v2 manifest) -> nowhere to resume shipping from.
+    // One compaction records it and the database ships incrementally forever.
+    this.forceCompactNext = m.version !== 2 || !m.walFlushLsn
+  }
+
+  /** Overlay shipped WAL ranges onto the restored datadir: fetch concurrently
+   * (small objects), verify CRC + LSN continuity, write each range into the
+   * pg_wal segment file(s) it spans at the LSN-derived offsets. */
+  private async applyWalSegments(dir: string, m: Manifest): Promise<void> {
+    const segments = m.walSegments
+    if (segments.length === 0) return
+    if (!m.walFlushLsn || !m.walSegmentBytes) {
+      throw new Error('manifest has WAL segments but no walFlushLsn/walSegmentBytes')
+    }
+    const segBytes = m.walSegmentBytes
+    const tli = m.walTimeline ?? 1
+    // Continuity: first range starts at the snapshot's flush LSN, each next
+    // range starts where the previous ended. A gap would mean a hole in the
+    // replay stream — refuse loudly rather than boot a half-restored DB.
+    let expect = parseLsn(m.walFlushLsn)
+    for (const seg of segments) {
+      if (parseLsn(seg.startLsn) !== expect) {
+        throw new Error(`WAL range gap: expected ${formatLsn(expect)}, got ${seg.startLsn} (${seg.key})`)
+      }
+      expect = parseLsn(seg.endLsn)
+    }
+    const bodies = await Promise.all(
+      segments.map(async (seg) => {
+        const obj = await this.store.get(seg.key)
+        if (!obj) throw new Error(`manifest references missing WAL segment ${seg.key}`)
+        const want = Number(parseLsn(seg.endLsn) - parseLsn(seg.startLsn))
+        if (obj.bytes.byteLength !== want) {
+          throw new Error(`WAL segment ${seg.key}: size ${obj.bytes.byteLength} != ${want}`)
+        }
+        if ((crc32(obj.bytes) >>> 0) !== seg.crc32) {
+          throw new Error(`WAL segment ${seg.key}: CRC mismatch`)
+        }
+        return obj.bytes
+      }),
+    )
+    for (let i = 0; i < segments.length; i++) {
+      const body = bodies[i]
+      let pos = parseLsn(segments[i].startLsn)
+      let bodyOff = 0
+      while (bodyOff < body.byteLength) {
+        const offInFile = Number(pos % BigInt(segBytes))
+        const take = Math.min(body.byteLength - bodyOff, segBytes - offInFile)
+        const path = join(dir, 'pg_wal', walFileName(tli, pos, segBytes))
+        // Create-if-missing without truncating, then write at the offset.
+        const fh = await open(path, 'a').then(async (h) => {
+          await h.close()
+          return open(path, 'r+')
+        })
+        try {
+          await fh.write(body, bodyOff, take, offInFile)
+        } finally {
+          await fh.close()
+        }
+        pos += BigInt(take)
+        bodyOff += take
+      }
+    }
+  }
+
+  /** Read WAL bytes [start, end) out of the local pg_wal segment files. */
+  private async readWalRange(start: bigint, end: bigint): Promise<Buffer> {
+    const out = Buffer.alloc(Number(end - start))
+    let pos = start
+    let outOff = 0
+    while (pos < end) {
+      const offInFile = Number(pos % BigInt(this.walSegBytes))
+      const take = Math.min(Number(end - pos), this.walSegBytes - offInFile)
+      const path = join(this.dataDir, 'pg_wal', walFileName(this.walTli, pos, this.walSegBytes))
+      const fh = await open(path, 'r')
+      try {
+        const { bytesRead } = await fh.read(out, outOff, take, offInFile)
+        if (bytesRead !== take) {
+          throw new Error(`short WAL read in ${path}: ${bytesRead} < ${take} at ${offInFile}`)
+        }
+      } finally {
+        await fh.close()
+      }
+      pos += BigInt(take)
+      outOff += take
+    }
+    return out
   }
 
   /** Advance manifest.fencingToken to ours (no data change). On conflict the
@@ -368,40 +541,74 @@ export class ZeroPG {
     }
   }
 
-  /** Persist WAL-shrinking GUCs into the datadir (travels with snapshots). */
+  /** Persist WAL GUCs into the datadir (travels with snapshots), and probe
+   * whether this session can ship WAL incrementally: the flush-LSN function
+   * must exist and our LSN->filename math must agree with the server's. */
   private async ensureWalConfig(): Promise<void> {
     try {
-      const cur = await this.pg.query<{ setting: string }>(
-        "SELECT setting FROM pg_settings WHERE name = 'max_wal_size'",
+      const cur = await this.pg.query<{ name: string; setting: string }>(
+        "SELECT name, setting FROM pg_settings WHERE name = 'max_wal_size'",
       )
-      if (cur.rows[0]?.setting === '64') return // already configured (MB units)
-      for (const [k, v] of WAL_GUCS) {
-        await this.pg.exec(`ALTER SYSTEM SET ${k} = ${v}`)
+      // Immediate (session) — ALTER SYSTEM below persists it for future boots.
+      await this.pg.exec('SET synchronous_commit = on')
+      if (cur.rows[0]?.setting !== '64') {
+        for (const [k, v] of WAL_GUCS) {
+          await this.pg.exec(`ALTER SYSTEM SET ${k} = ${v}`)
+        }
+        await this.pg.query('SELECT pg_reload_conf()')
       }
-      await this.pg.query('SELECT pg_reload_conf()')
     } catch {
       // Non-fatal: snapshots are just bigger than they need to be.
     }
+    try {
+      const probe = await this.pg.query<{ lsn: string; fname: string; segsz: string }>(
+        `SELECT pg_current_wal_flush_lsn()::text lsn,
+                pg_walfile_name(pg_current_wal_flush_lsn())::text fname,
+                current_setting('wal_segment_size') segsz`,
+      )
+      const { lsn, fname, segsz } = probe.rows[0]!
+      const m = /^(\d+)\s*(MB|kB|GB)$/.exec(segsz)
+      if (!m) throw new Error(`unparseable wal_segment_size: ${segsz}`)
+      const mult = { kB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 }[m[2] as 'kB' | 'MB' | 'GB']
+      this.walSegBytes = Number(m[1]) * mult
+      this.walTli = parseInt(fname.slice(0, 8), 16)
+      // Validate our XLogFileName math against the server. pg_walfile_name
+      // maps exact-boundary LSNs to the PREVIOUS segment, so accept either.
+      const at = parseLsn(lsn)
+      const ours = walFileName(this.walTli, at, this.walSegBytes)
+      const oursPrev = walFileName(this.walTli, at > 0n ? at - 1n : 0n, this.walSegBytes)
+      this.incrementalCapable = fname === ours || fname === oursPrev
+    } catch {
+      this.incrementalCapable = false // this session commits via snapshots
+    }
   }
 
-  /**
-   * CHECKPOINT, then stream tar(datadir) -> gzip -> chunked PUT. The datadir is
-   * quiescent during the tar: we hold the single PGlite connection and commits
-   * are serialized behind commitInFlight.
-   */
   /** Flush dirty pages + trim pg_wal so the tar reflects the data, not the
-   * write burst. Must run BEFORE chooseCodec so the probe sees heap files. */
-  private async checkpointForSnapshot(): Promise<number> {
+   * write burst. Must run BEFORE chooseCodec so the probe sees heap files.
+   * In an incremental-capable session, also switch onto a fresh WAL segment:
+   * the post-snapshot tail then grows organically from byte 0, which is what
+   * makes size-diff shipping safe forever after. */
+  private async checkpointForSnapshot(): Promise<{ ms: number; flushLsn: string | null }> {
     const t0 = performance.now()
+    let flushLsn: string | null = null
     try {
       // Twice: the first moves the redo point past the write burst, the second
       // lets Postgres unlink (wal_recycle=off) segments behind it.
       await this.pg.exec('CHECKPOINT')
       await this.pg.exec('CHECKPOINT')
+      if (this.incrementalCapable) {
+        // The post-checkpoint flush LSN: where the snapshot's pg_wal content
+        // ends and incremental shipping will resume. Read AFTER the
+        // checkpoints (they write WAL) and before the tar (we are quiescent).
+        const r = await this.pg.query<{ lsn: string }>(
+          'SELECT pg_current_wal_flush_lsn()::text lsn',
+        )
+        flushLsn = r.rows[0]?.lsn ?? null
+      }
     } catch {
       // CHECKPOINT may be unavailable in some PGlite builds; snapshot anyway.
     }
-    return performance.now() - t0
+    return { ms: performance.now() - t0, flushLsn }
   }
 
   private async uploadSnapshot(
@@ -430,16 +637,23 @@ export class ZeroPG {
   }
 
   private async commitInitial(): Promise<void> {
-    const dumpMs = await this.checkpointForSnapshot()
+    const cp = await this.checkpointForSnapshot()
     const codec = await this.chooseCodec()
     const snapshotKey = this.snapshotKeyFor(0, codec)
-    await this.uploadSnapshot(snapshotKey, codec, dumpMs)
+    await this.uploadSnapshot(snapshotKey, codec, cp.ms)
+    if (cp.flushLsn) this.lastShippedLsn = parseLsn(cp.flushLsn)
+    this.walBytesSinceSnapshot = 0
     const m: Manifest = {
-      version: 1,
+      // version 2 means "walFlushLsn is recorded": incremental shipping can
+      // resume from it. Without it the next writer compacts first.
+      version: cp.flushLsn ? 2 : 1,
       generation: this.generation,
       fencingToken: this.lease?.held ? this.lease.fencingToken : 1,
       snapshot: snapshotKey,
       walSegments: [],
+      ...(cp.flushLsn
+        ? { walFlushLsn: cp.flushLsn, walSegmentBytes: this.walSegBytes, walTimeline: this.walTli }
+        : {}),
       commitSeq: 0,
       committedAt: new Date(this.now()).toISOString(),
     }
@@ -470,64 +684,183 @@ export class ZeroPG {
     if (!this.dirty) return null
     // Serialize commits; coalesce concurrent callers onto the in-flight one.
     if (this.commitInFlight) return this.commitInFlight
-    this.commitInFlight = this.doCommit().finally(() => {
-      this.commitInFlight = null
-    })
+    this.commitInFlight = (async () => {
+      // Group-commit pacing: stay under the store's per-object write cap on
+      // the manifest. Writes that land during the wait are already in PGlite's
+      // WAL, so they ride along in this commit's LSN range — exactly Postgres
+      // group commit, bucket edition. Idle databases pay nothing (lastCasAt
+      // is long past, wait <= 0).
+      const wait = this.commitIntervalMs - (this.now() - this.lastCasAt)
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+      try {
+        return await this.doCommit()
+      } finally {
+        this.lastCasAt = this.now()
+        this.commitInFlight = null
+      }
+    })()
     return this.commitInFlight
   }
 
   private async doCommit(): Promise<CommitInfo> {
+    // Incremental unless: the session can't guarantee append-only pg_wal, the
+    // booted snapshot predates that guarantee (forceCompactNext), or the
+    // segment tail has outgrown the compaction thresholds.
+    if (
+      this.incrementalCapable &&
+      !this.forceCompactNext &&
+      this.manifest.version === 2 &&
+      this.manifest.walSegments.length < COMPACT_AT_SEGMENTS &&
+      this.walBytesSinceSnapshot < COMPACT_AT_WAL_BYTES
+    ) {
+      const r = await this.commitIncremental()
+      if (r) return r
+      // Zero WAL delta with dirty set, or an invariant anomaly: compact.
+    }
+    return this.commitSnapshot()
+  }
+
+  /**
+   * v1 commit: ship only the WAL bytes appended since the last commit — the
+   * LSN range [lastShippedLsn, flushLsn) — as one immutable segment object,
+   * then CAS the manifest with the new entry. O(transaction size), not
+   * O(database size). Returns null if there is nothing shippable or the local
+   * WAL no longer holds the range (caller falls back to compaction).
+   */
+  private async commitIncremental(): Promise<CommitInfo | null> {
     const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken
     const nextSeq = this.manifest.commitSeq + 1
-    const checkpointMs = await this.checkpointForSnapshot()
-    const codec = await this.chooseCodec()
-    const snapshotKey = this.snapshotKeyFor(nextSeq, codec)
-    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey, codec, checkpointMs)
+    // No CHECKPOINT here — that would defeat the point. synchronous_commit=on
+    // (enforced in ensureWalConfig) guarantees completed transactions have
+    // write()n + flushed their WAL before this query runs, and the flush LSN
+    // is exactly the boundary of what is safe to ship.
+    const t0 = performance.now()
+    const r = await this.pg.query<{ lsn: string }>('SELECT pg_current_wal_flush_lsn()::text lsn')
+    const end = parseLsn(r.rows[0]!.lsn)
+    const start = this.lastShippedLsn
+    if (end <= start) return null // dirty flag without WAL growth: compact to be safe
+    const dumpMs = performance.now() - t0
+
+    const tUp = performance.now()
+    let buf: Buffer
+    try {
+      buf = await this.readWalRange(start, end)
+    } catch {
+      // The range fell off the local pg_wal (an automatic checkpoint removed
+      // segments past our resume point — possible after a huge unflushed
+      // burst in sleep mode). A full snapshot is the right answer anyway.
+      return null
+    }
+    const key = `generations/${this.generation}/wal/${String(nextSeq).padStart(8, '0')}.seg`
+    await this.store.put(key, buf, { contentType: 'application/octet-stream' })
+    const entry: WalSegment = {
+      key,
+      startLsn: formatLsn(start),
+      endLsn: formatLsn(end),
+      crc32: crc32(buf) >>> 0,
+    }
+    const uploadMs = performance.now() - tUp
 
     const m: Manifest = {
       ...this.manifest,
+      version: 2,
       fencingToken: token,
-      snapshot: snapshotKey,
+      walSegments: [...this.manifest.walSegments, entry],
       commitSeq: nextSeq,
       committedAt: new Date(this.now()).toISOString(),
     }
+    const manifestMs = await this.casManifest(m, token)
+    this.manifest = m
+    this.dirty = false
+    // Advance the resume point ONLY after the CAS: a fenced commit must not
+    // mark bytes as shipped (its segment object is orphaned garbage).
+    this.lastShippedLsn = end
+    this.walBytesSinceSnapshot += buf.length
+    return {
+      commitSeq: nextSeq,
+      generation: this.generation,
+      mode: 'incremental',
+      snapshotKey: key,
+      snapshotBytes: buf.length,
+      segments: 1,
+      dumpMs,
+      uploadMs,
+      manifestMs,
+    }
+  }
+
+  /** v0-style full commit, now serving as compaction + rolling backup. */
+  private async commitSnapshot(): Promise<CommitInfo> {
+    const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken
+    const nextSeq = this.manifest.commitSeq + 1
+    const cp = await this.checkpointForSnapshot()
+    const codec = await this.chooseCodec()
+    const snapshotKey = this.snapshotKeyFor(nextSeq, codec)
+    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey, codec, cp.ms)
+
+    const oldSnapshot = this.manifest.snapshot
+    const oldBackup = this.manifest.previousSnapshot
+    const oldSegments = this.manifest.walSegments
+    const m: Manifest = {
+      ...this.manifest,
+      version: cp.flushLsn ? 2 : 1,
+      fencingToken: token,
+      snapshot: snapshotKey,
+      walSegments: [],
+      walFlushLsn: cp.flushLsn ?? undefined,
+      walSegmentBytes: cp.flushLsn ? this.walSegBytes : undefined,
+      walTimeline: cp.flushLsn ? this.walTli : undefined,
+      // The compacted-away snapshot stays as a one-generation-back backup in
+      // case something corrupts the current state. GC preserves it.
+      previousSnapshot: oldSnapshot !== snapshotKey ? oldSnapshot : oldBackup,
+      commitSeq: nextSeq,
+      committedAt: new Date(this.now()).toISOString(),
+    }
+    const manifestMs = await this.casManifest(m, token)
+    this.manifest = m
+    this.dirty = false
+    this.forceCompactNext = false
+    if (cp.flushLsn) this.lastShippedLsn = parseLsn(cp.flushLsn)
+    this.walBytesSinceSnapshot = 0
+    // Best-effort cleanup: the grandparent backup and the segments folded
+    // into this snapshot are no longer referenced by anything.
+    if (oldBackup && oldBackup !== m.previousSnapshot) {
+      void this.store.delete(oldBackup).catch(() => {})
+    }
+    for (const seg of oldSegments) {
+      void this.store.delete(seg.key).catch(() => {})
+    }
+    return {
+      commitSeq: nextSeq,
+      generation: this.generation,
+      mode: 'snapshot',
+      snapshotKey,
+      snapshotBytes,
+      segments: 0,
+      dumpMs,
+      uploadMs,
+      manifestMs,
+    }
+  }
+
+  /** Conditional manifest swap — the one operation that IS a commit. */
+  private async casManifest(m: Manifest, token: number): Promise<number> {
     const tMan = performance.now()
-    let etag: string
     try {
       const r = await this.store.put(MANIFEST_KEY, encodeManifest(m), {
         ifMatch: this.manifestEtag ?? undefined,
         contentType: 'application/json',
       })
-      etag = r.etag
+      this.manifestEtag = r.etag
     } catch (e) {
       if (e instanceof PreconditionFailedError) {
-        // Manifest advanced by someone else => we are fenced. The snapshot we
+        // Manifest advanced by someone else => we are fenced. Whatever we
         // just uploaded is orphaned garbage (no manifest references it).
         throw new FencedError(token, 'manifest CAS failed at commit')
       }
       throw e
     }
-    const manifestMs = performance.now() - tMan
-
-    const prevSnapshotKey = this.manifest.snapshot
-    this.manifest = m
-    this.manifestEtag = etag
-    this.dirty = false
-    // Best-effort: delete the now-superseded previous snapshot in this
-    // generation to bound bucket growth (keep current only). The manifest
-    // never references it again, so this is safe.
-    if (prevSnapshotKey && prevSnapshotKey !== snapshotKey) {
-      void this.store.delete(prevSnapshotKey).catch(() => {})
-    }
-    return {
-      commitSeq: nextSeq,
-      generation: this.generation,
-      snapshotKey,
-      snapshotBytes,
-      dumpMs,
-      uploadMs,
-      manifestMs,
-    }
+    return performance.now() - tMan
   }
 
   /** Flush pending writes (interval/sleep mode / explicit). No-op if clean. */

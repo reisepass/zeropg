@@ -2,6 +2,7 @@ export { ZeroPG, type ZeroPGOptions, type CommitInfo, type Durability } from './
 export { collectGarbage, type GcOptions, type GcResult } from './gc.js'
 export {
   type Manifest,
+  type WalSegment,
   MANIFEST_KEY,
   encodeManifest,
   decodeManifest,

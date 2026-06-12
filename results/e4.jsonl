@@ -1,2 +1,5 @@
 {"ts":"2026-06-12T10:41:58.359Z","probe":"P1-idle-lease-self-heal","before":0,"after":2,"status":302}
 {"ts":"2026-06-12T10:43:01.076Z","probe":"P2-sigterm-flush","before":2,"after":2,"rollMs":62602}
+{"ts":"2026-06-12T10:43:59.874Z","probe":"P2b-crash-loss-bounded","baseline":3,"after":3}
+{"ts":"2026-06-12T10:49:09.332Z","probe":"P3-revision-switch-loop","cycles":5,"finalCount":8}
+{"ts":"2026-06-12T10:50:18.451Z","probe":"P4-zombie-fencing","rivalToken":13,"zombieStatus":423}

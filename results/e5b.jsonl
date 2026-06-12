@@ -1,0 +1,1 @@
+{"ts":"2026-06-12T12:11:25Z","probe":"e5b-gcs-cas-rate","durationS":30,"committed":73,"achievedRatePerS":2.43,"status429":78,"pct429":52,"casLatencyP50Ms":66,"note":"sequential CAS vs one object name; documented ~1/s soft cap confirmed; >1/s needs 429 backoff + group commit"}

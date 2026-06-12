@@ -46,9 +46,11 @@ class FaultStore implements BlobStore {
     return this.inner.get(key, opts)
   }
   private checkFault(key: string): void {
-    const isSnapshot = key.includes('/snapshot-')
+    // "snapshot" faults mean "data upload" faults: with v1 incremental
+    // commits the data being uploaded is WAL segment objects.
+    const isDataUpload = key.includes('/snapshot-') || key.includes('/wal/')
     const isManifest = key === 'manifest.json'
-    if (isSnapshot && this.fault === 'kill-before-snapshot') this.die()
+    if (isDataUpload && this.fault === 'kill-before-snapshot') this.die()
     if (isManifest && this.fault === 'kill-after-snapshot') this.die()
   }
   async put(key: string, bytes: Bytes, opts?: PutOptions): Promise<PutResult> {

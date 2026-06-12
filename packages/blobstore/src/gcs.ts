@@ -14,6 +14,7 @@ import { Readable } from 'node:stream'
 import {
   type BlobStore,
   type Bytes,
+  type CostModel,
   type GetOptions,
   type GetResult,
   type GetStreamResult,
@@ -23,6 +24,18 @@ import {
   PreconditionFailedError,
 } from './types.js'
 import { getAccessToken } from './token.js'
+
+/** GCS Standard, single region (COST-MODEL.md). E5b measured the per-object
+ * write cap live: ~2.4/s achieved with 52% of requests answered 429 — treat
+ * the documented ~1/s as the plannable rate. */
+export const GCS_COST: CostModel = {
+  asOf: '2026-06',
+  writeOpUsd: 0.005 / 1000, // Class A
+  readOpUsd: 0.0004 / 1000, // Class B
+  storageGbMonthUsd: 0.02,
+  internetEgressGbUsd: 0.12,
+  maxWritesPerObjectPerSec: 1,
+}
 
 const BASE = 'https://storage.googleapis.com'
 
@@ -41,6 +54,7 @@ function joinPrefix(prefix: string | undefined, key: string): string {
 }
 
 export class GcsBlobStore implements BlobStore {
+  readonly cost = GCS_COST
   private bucket: string
   private prefix: string | undefined
   private getToken: () => Promise<string>
@@ -180,20 +194,32 @@ export class GcsBlobStore implements BlobStore {
     if (opts?.ifNoneMatch) params.set('ifGenerationMatch', '0')
     else if (opts?.ifMatch !== undefined) params.set('ifGenerationMatch', opts.ifMatch)
     const url = `${BASE}/upload/storage/v1/b/${this.bucket}/o?${params}`
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        ...(await this.authHeaders()),
-        'Content-Type': opts?.contentType ?? 'application/octet-stream',
-      },
-      body: bytes,
-    })
-    if (res.status === 412) {
-      throw new PreconditionFailedError(key, opts?.ifNoneMatch ? 'object exists' : 'generation mismatch')
+    // Retry 429 (per-object write-rate cap) and 5xx with jittered backoff.
+    // ONLY clean rejections are retried: a network timeout on a conditional
+    // PUT is ambiguous (it may have landed), and retrying it could turn our
+    // own success into a spurious 412 -> false FencedError upstream.
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          ...(await this.authHeaders()),
+          'Content-Type': opts?.contentType ?? 'application/octet-stream',
+        },
+        body: bytes,
+      })
+      if (res.status === 412) {
+        throw new PreconditionFailedError(key, opts?.ifNoneMatch ? 'object exists' : 'generation mismatch')
+      }
+      if ((res.status === 429 || res.status >= 500) && attempt < 5) {
+        await res.text().catch(() => {})
+        const backoff = Math.min(3000, 200 * 2 ** attempt) * (0.5 + Math.random())
+        await new Promise((r) => setTimeout(r, backoff))
+        continue
+      }
+      if (!res.ok) throw await gcsError(res, 'put', key)
+      const meta = (await res.json()) as { generation: string }
+      return { etag: meta.generation }
     }
-    if (!res.ok) throw await gcsError(res, 'put', key)
-    const meta = (await res.json()) as { generation: string }
-    return { etag: meta.generation }
   }
 
   async *list(prefix: string): AsyncIterable<ListEntry> {
