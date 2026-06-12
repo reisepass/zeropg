@@ -226,5 +226,26 @@ export async function* createTarStream(rootDir: string): AsyncGenerator<Uint8Arr
   yield Buffer.alloc(BLOCK * 2, 0)
 }
 
+/** Find the largest regular file under rootDir (the heap file of the biggest
+ * table, in a Postgres datadir) — used to probe snapshot compressibility.
+ * Skips pg_wal: segments are fixed 16MB and mostly zero padding after a
+ * checkpoint, which would fool the probe toward "compressible". */
+export async function largestFile(rootDir: string): Promise<{ path: string; size: number } | null> {
+  let best: { path: string; size: number } | null = null
+  async function walk(dir: string): Promise<void> {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name)
+      if (e.isDirectory()) {
+        if (e.name !== 'pg_wal') await walk(p)
+      } else if (e.isFile()) {
+        const st = await stat(p)
+        if (!best || st.size > best.size) best = { path: p, size: st.size }
+      }
+    }
+  }
+  await walk(rootDir)
+  return best
+}
+
 /** Convenience: extract with mkdir -p semantics from a Node Readable/iterable, via pipeline-safe consumption. */
 export { pipeline }

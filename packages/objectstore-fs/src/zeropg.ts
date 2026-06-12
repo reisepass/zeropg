@@ -27,14 +27,14 @@
 
 import { PGlite } from '@electric-sql/pglite'
 import { type BlobStore, PreconditionFailedError } from '@zeropg/blobstore'
-import { Lease, FencedError } from '@zeropg/lease'
+import { Lease, FencedError, LockedError } from '@zeropg/lease'
 import {
   type Manifest,
   MANIFEST_KEY,
   encodeManifest,
   decodeManifest,
 } from './manifest.js'
-import { createTarStream, extractTarStream } from './tar.js'
+import { createTarStream, extractTarStream, largestFile } from './tar.js'
 import { createGunzip, createGzip, gzipSync } from 'node:zlib'
 import { Readable } from 'node:stream'
 import * as nodeStream from 'node:stream'
@@ -65,6 +65,14 @@ export interface ZeroPGOptions {
   holder?: string
   /** Lease TTL ms. Default 30s. */
   leaseTtlMs?: number
+  /**
+   * How long boot may wait for a held lease to expire before giving up
+   * (LockedError). Revision switches and crash-restarts routinely boot a new
+   * instance while the previous holder's lease has not yet expired; waiting
+   * here (instead of failing the boot) is what makes those windows seamless.
+   * Default 0 (fail fast).
+   */
+  acquireTimeoutMs?: number
   /** Durability mode. Default 'strict'. */
   durability?: Durability
   /** @deprecated alias for durability: 'interval'. */
@@ -215,7 +223,17 @@ export class ZeroPG {
         tokenFloor,
       })
       const tLease = performance.now()
-      await this.lease.acquire()
+      const deadline = tLease + (opts.acquireTimeoutMs ?? 0)
+      for (;;) {
+        try {
+          await this.lease.acquire()
+          break
+        } catch (e) {
+          if (!(e instanceof LockedError) || performance.now() >= deadline) throw e
+          // Holder is alive (or recently died); its lease expires within TTL.
+          await new Promise((r) => setTimeout(r, 2000))
+        }
+      }
       this.bootTimings.leaseMs = performance.now() - tLease
     }
 
@@ -269,12 +287,44 @@ export class ZeroPG {
     }
   }
 
-  /** Stream a snapshot object into dir; returns its compressed size. */
+  /** Stream a snapshot object into dir; returns its stored size. The key
+   * suffix says whether it is gzipped (.tar.gz) or raw tar (.tar). */
   private async restoreInto(dir: string, snapshotKey: string): Promise<number> {
     const src = await this.store.getStream(snapshotKey)
     if (!src) throw new Error(`manifest references missing snapshot ${snapshotKey}`)
-    await extractTarStream(compose(Readable.from(src.stream), createGunzip()), dir)
+    const tarStream = snapshotKey.endsWith('.gz')
+      ? compose(Readable.from(src.stream), createGunzip())
+      : Readable.from(src.stream)
+    await extractTarStream(tarStream as AsyncIterable<Uint8Array>, dir)
     return src.size
+  }
+
+  /**
+   * Decide the snapshot codec by test-compressing a slice of the largest heap
+   * file. Incompressible data (media blobs, encrypted values, random test
+   * data) makes gzip pure CPU waste — on a 1-vCPU Cloud Run instance, deflate
+   * caps the upload at ~12MB/s while a raw PUT runs at network speed.
+   */
+  private async chooseCodec(): Promise<'gzip' | 'none'> {
+    try {
+      const big = await largestFile(this.dataDir)
+      if (!big || big.size < 1024 * 1024) return 'gzip' // small DB: gzip is cheap
+      const fh = await import('node:fs/promises')
+      const sample = Buffer.alloc(Math.min(big.size, 4 * 1024 * 1024))
+      const f = await fh.open(big.path, 'r')
+      try {
+        await f.read(sample, 0, sample.length, 0)
+      } finally {
+        await f.close()
+      }
+      const ratio = gzipSync(sample, { level: 1 }).length / sample.length
+      // Deflate on a serverless vCPU moves ~12-30MB/s; the network moves
+      // 100MB/s+. gzip only pays off when it removes a large fraction of the
+      // bytes — otherwise ship raw tar and let the NIC do the work.
+      return ratio > 0.65 ? 'none' : 'gzip'
+    } catch {
+      return 'gzip'
+    }
   }
 
   /** Persist WAL-shrinking GUCs into the datadir (travels with snapshots). */
@@ -298,9 +348,9 @@ export class ZeroPG {
    * quiescent during the tar: we hold the single PGlite connection and commits
    * are serialized behind commitInFlight.
    */
-  private async uploadSnapshot(
-    key: string,
-  ): Promise<{ snapshotBytes: number; dumpMs: number; uploadMs: number }> {
+  /** Flush dirty pages + trim pg_wal so the tar reflects the data, not the
+   * write burst. Must run BEFORE chooseCodec so the probe sees heap files. */
+  private async checkpointForSnapshot(): Promise<number> {
     const t0 = performance.now()
     try {
       // Twice: the first moves the redo point past the write burst, the second
@@ -310,24 +360,39 @@ export class ZeroPG {
     } catch {
       // CHECKPOINT may be unavailable in some PGlite builds; snapshot anyway.
     }
-    const dumpMs = performance.now() - t0
+    return performance.now() - t0
+  }
 
+  private async uploadSnapshot(
+    key: string,
+    codec: 'gzip' | 'none',
+    dumpMs: number,
+  ): Promise<{ snapshotBytes: number; dumpMs: number; uploadMs: number }> {
     const tUp = performance.now()
     let snapshotBytes = 0
-    const gz = compose(Readable.from(createTarStream(this.dataDir)), createGzip({ level: 1 }))
+    const tar = Readable.from(createTarStream(this.dataDir))
+    const body = codec === 'gzip' ? compose(tar, createGzip({ level: 1 })) : tar
     const counted = async function* (): AsyncGenerator<Uint8Array> {
-      for await (const chunk of gz as AsyncIterable<Uint8Array>) {
+      for await (const chunk of body as AsyncIterable<Uint8Array>) {
         snapshotBytes += chunk.length
         yield chunk
       }
     }
-    await this.store.putStream(key, counted(), { contentType: 'application/gzip' })
+    await this.store.putStream(key, counted(), {
+      contentType: codec === 'gzip' ? 'application/gzip' : 'application/x-tar',
+    })
     return { snapshotBytes, dumpMs, uploadMs: performance.now() - tUp }
   }
 
+  private snapshotKeyFor(seq: number, codec: 'gzip' | 'none'): string {
+    return `generations/${this.generation}/snapshot-${seq}.tar${codec === 'gzip' ? '.gz' : ''}`
+  }
+
   private async commitInitial(): Promise<void> {
-    const snapshotKey = `generations/${this.generation}/snapshot-0.tar.gz`
-    await this.uploadSnapshot(snapshotKey)
+    const dumpMs = await this.checkpointForSnapshot()
+    const codec = await this.chooseCodec()
+    const snapshotKey = this.snapshotKeyFor(0, codec)
+    await this.uploadSnapshot(snapshotKey, codec, dumpMs)
     const m: Manifest = {
       version: 1,
       generation: this.generation,
@@ -382,8 +447,10 @@ export class ZeroPG {
   private async doCommit(): Promise<CommitInfo> {
     const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken
     const nextSeq = this.manifest.commitSeq + 1
-    const snapshotKey = `generations/${this.generation}/snapshot-${nextSeq}.tar.gz`
-    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey)
+    const checkpointMs = await this.checkpointForSnapshot()
+    const codec = await this.chooseCodec()
+    const snapshotKey = this.snapshotKeyFor(nextSeq, codec)
+    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey, codec, checkpointMs)
 
     const m: Manifest = {
       ...this.manifest,
@@ -410,16 +477,15 @@ export class ZeroPG {
     }
     const manifestMs = performance.now() - tMan
 
-    const prevSeq = this.manifest.commitSeq
+    const prevSnapshotKey = this.manifest.snapshot
     this.manifest = m
     this.manifestEtag = etag
     this.dirty = false
     // Best-effort: delete the now-superseded previous snapshot in this
     // generation to bound bucket growth (keep current only). The manifest
     // never references it again, so this is safe.
-    if (prevSeq >= 0) {
-      const prevKey = `generations/${this.generation}/snapshot-${prevSeq}.tar.gz`
-      void this.store.delete(prevKey).catch(() => {})
+    if (prevSnapshotKey && prevSnapshotKey !== snapshotKey) {
+      void this.store.delete(prevSnapshotKey).catch(() => {})
     }
     return {
       commitSeq: nextSeq,
