@@ -17,6 +17,27 @@ The correct capture, as actually implemented (and what Litestream does for SQLit
 
 No Emscripten hooks, no shadow WAL — one SQL function call per commit.
 
+## Generation per writer life (second correction, from E4)
+
+WAL ranges must NEVER span writer lives. Live lifecycle testing (E4 P3, 5x
+revision switches) lost an acked durable write and the forensics were
+unambiguous: across every `zeropg-wal-continuity-violation` event, the
+restored cluster recovers to an LSN exactly **24 bytes — one XLogRecord
+header — short of the dead writer's final flush LSN**. `pg_current_wal_flush_lsn()`
+at end of life overshoots the last replayable record by a header-sized tail;
+a successor that resumes shipping from the dead writer's number emits ranges
+from a misaligned stream, and the next restorer silently drops the tail.
+
+This is precisely why Litestream begins a new generation on every process
+restart. zeropg now does the equivalent: the FIRST commit of each writer
+life is a compaction (one snapshot — in sleep mode it rides the idle flush,
+invisible to requests), and every incremental range thereafter starts from
+an LSN the same process measured itself. `lifeBaseLsn` keeps idempotent boot
+DDL from uploading anything, so a cold start that only serves reads still
+does zero writes. The boot/commit continuity guards stay as defense in depth.
+Cross-life chaining (record-boundary parsing of the WAL tail) is a v2
+investigation, not a v1 need.
+
 ## Manifest v2
 
 ```json
