@@ -4,7 +4,7 @@ import { createRequire } from 'module'; const require = createRequire(import.met
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join as join3 } from "node:path";
 
 // packages/blobstore/src/types.ts
 var PreconditionFailedError = class extends Error {
@@ -15,6 +15,9 @@ var PreconditionFailedError = class extends Error {
     this.key = key;
   }
 };
+
+// packages/blobstore/src/gcs.ts
+import { Readable } from "node:stream";
 
 // packages/blobstore/src/token.ts
 import { execFile } from "node:child_process";
@@ -76,7 +79,7 @@ function joinPrefix(prefix, key) {
   const p = prefix.replace(/\/+$/, "");
   return `${p}/${key}`;
 }
-var GcsBlobStore = class {
+var GcsBlobStore = class _GcsBlobStore {
   bucket;
   prefix;
   getToken;
@@ -105,6 +108,91 @@ var GcsBlobStore = class {
     const buf = new Uint8Array(await res.arrayBuffer());
     const etag = res.headers.get("x-goog-generation") ?? "";
     return { bytes: buf, etag, size: buf.byteLength };
+  }
+  /** Tuning for getStream's parallel-range download. */
+  static STREAM_CHUNK_BYTES = 32 * 1024 * 1024;
+  static STREAM_CONCURRENCY = 4;
+  async getStream(key) {
+    const meta = await this.head(key);
+    if (!meta) return null;
+    const name = encodeURIComponent(this.fullKey(key));
+    const base = `${BASE}/storage/v1/b/${this.bucket}/o/${name}?alt=media&generation=${meta.etag}`;
+    const auth = await this.authHeaders();
+    const CHUNK = _GcsBlobStore.STREAM_CHUNK_BYTES;
+    const CONC = _GcsBlobStore.STREAM_CONCURRENCY;
+    async function fetchRange(start, endIncl) {
+      const res = await fetch(base, {
+        headers: { ...auth, Range: `bytes=${start}-${endIncl}` }
+      });
+      if (!(res.status === 206 || res.status === 200)) {
+        throw await gcsError(res, "getStream", key);
+      }
+      return res;
+    }
+    const size = meta.size;
+    async function* ordered() {
+      if (size === 0) return;
+      const starts = [];
+      for (let s = 0; s < size; s += CHUNK) starts.push(s);
+      const inflight = [];
+      let next = 0;
+      const fill = () => {
+        while (next < starts.length && inflight.length < CONC) {
+          const s = starts[next++];
+          inflight.push(fetchRange(s, Math.min(s + CHUNK, size) - 1));
+        }
+      };
+      fill();
+      while (inflight.length > 0) {
+        const res = inflight.shift();
+        const r = await res;
+        fill();
+        if (!r.body) throw new Error(`GCS getStream "${key}": empty response body`);
+        for await (const part of r.body) {
+          yield part;
+        }
+      }
+    }
+    return { stream: ordered(), etag: meta.etag, size };
+  }
+  async putStream(key, source2, opts) {
+    async function* coalesced() {
+      const TARGET = 1024 * 1024;
+      let buf = [];
+      let n = 0;
+      for await (const c of source2) {
+        buf.push(c);
+        n += c.length;
+        if (n >= TARGET) {
+          yield Buffer.concat(buf, n);
+          buf = [];
+          n = 0;
+        }
+      }
+      if (n > 0) yield Buffer.concat(buf, n);
+    }
+    const name = this.fullKey(key);
+    const params = new URLSearchParams({ uploadType: "media", name });
+    if (opts?.ifNoneMatch) params.set("ifGenerationMatch", "0");
+    else if (opts?.ifMatch !== void 0) params.set("ifGenerationMatch", opts.ifMatch);
+    const url = `${BASE}/upload/storage/v1/b/${this.bucket}/o?${params}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        ...await this.authHeaders(),
+        "Content-Type": opts?.contentType ?? "application/octet-stream"
+      },
+      // Chunked transfer — GCS media upload accepts bodies with no length.
+      body: Readable.toWeb(Readable.from(coalesced())),
+      // Node fetch requires explicit half-duplex for streamed request bodies.
+      ...{ duplex: "half" }
+    });
+    if (res.status === 412) {
+      throw new PreconditionFailedError(key, opts?.ifNoneMatch ? "object exists" : "generation mismatch");
+    }
+    if (!res.ok) throw await gcsError(res, "putStream", key);
+    const meta = await res.json();
+    return { etag: meta.generation };
   }
   async put(key, bytes, opts) {
     const name = this.fullKey(key);
@@ -220,6 +308,11 @@ var Lease = class {
   }
   get held() {
     return this.body !== null;
+  }
+  /** Milliseconds until the held lease expires (negative if already past). */
+  expiresInMs(now = this.now()) {
+    if (!this.body) return -1;
+    return Date.parse(this.body.expiresAt) - now;
   }
   encode(body) {
     return new TextEncoder().encode(JSON.stringify(body));
@@ -359,9 +452,201 @@ function decodeManifest(bytes) {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
+// packages/objectstore-fs/src/tar.ts
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, readdir, readFile, stat } from "node:fs/promises";
+import { join, posix } from "node:path";
+var BLOCK = 512;
+function parseOctal(buf, off, len) {
+  const s = Buffer.from(buf.subarray(off, off + len)).toString("ascii").replace(/\0.*$/, "").trim();
+  return s ? parseInt(s, 8) : 0;
+}
+function isZeroBlock(b) {
+  for (let i = 0; i < BLOCK; i++) if (b[i] !== 0) return false;
+  return true;
+}
+function sanitizeEntryName(raw) {
+  const name = raw.replace(/^\/+/, "").replace(/^\.\//, "").replace(/\/+$/, "");
+  if (!name || name === ".") return null;
+  const parts = name.split("/");
+  if (parts.some((p) => p === ".." || p === "")) {
+    throw new Error(`tar entry with unsafe path: ${JSON.stringify(raw)}`);
+  }
+  return parts.join("/");
+}
+async function extractTarStream(source2, destDir) {
+  await mkdir(destDir, { recursive: true });
+  let files = 0;
+  let bytes = 0;
+  const it = source2[Symbol.asyncIterator]();
+  let chunk = null;
+  let off = 0;
+  async function read(n) {
+    const out = new Uint8Array(n);
+    let filled = 0;
+    while (filled < n) {
+      if (!chunk || off >= chunk.length) {
+        const r = await it.next();
+        if (r.done) return filled === 0 ? null : (() => {
+          throw new Error("truncated tar stream");
+        })();
+        chunk = r.value;
+        off = 0;
+        continue;
+      }
+      const take = Math.min(n - filled, chunk.length - off);
+      out.set(chunk.subarray(off, off + take), filled);
+      off += take;
+      filled += take;
+    }
+    return out;
+  }
+  async function readBody2(n, sink) {
+    let remaining = n;
+    while (remaining > 0) {
+      if (!chunk || off >= chunk.length) {
+        const r = await it.next();
+        if (r.done) throw new Error("truncated tar entry body");
+        chunk = r.value;
+        off = 0;
+        continue;
+      }
+      const take = Math.min(remaining, chunk.length - off);
+      if (sink) await sink(chunk.subarray(off, off + take));
+      off += take;
+      remaining -= take;
+    }
+    const pad = (BLOCK - n % BLOCK) % BLOCK;
+    if (pad > 0) await read(pad);
+  }
+  let pendingLongName = null;
+  for (; ; ) {
+    const header = await read(BLOCK);
+    if (header === null || isZeroBlock(header)) break;
+    const rawName = Buffer.from(header.subarray(0, 100)).toString("utf8").replace(/\0.*$/, "");
+    const prefix = Buffer.from(header.subarray(345, 500)).toString("utf8").replace(/\0.*$/, "");
+    const size = parseOctal(header, 124, 12);
+    const typeflag = String.fromCharCode(header[156] === 0 ? 48 : header[156]);
+    let name = pendingLongName ?? (prefix ? `${prefix}/${rawName}` : rawName);
+    pendingLongName = null;
+    if (typeflag === "L") {
+      const parts = [];
+      await readBody2(size, async (b) => void parts.push(Buffer.from(b)));
+      pendingLongName = Buffer.concat(parts).toString("utf8").replace(/\0.*$/, "");
+      continue;
+    }
+    if (typeflag === "x" || typeflag === "g") {
+      await readBody2(size, null);
+      continue;
+    }
+    const safe = sanitizeEntryName(name);
+    if (safe === null) {
+      await readBody2(size, null);
+      continue;
+    }
+    const dest = join(destDir, safe);
+    if (typeflag === "5") {
+      await mkdir(dest, { recursive: true });
+      await readBody2(size, null);
+      continue;
+    }
+    if (typeflag !== "0") {
+      await readBody2(size, null);
+      continue;
+    }
+    await mkdir(join(destDir, posix.dirname(safe)), { recursive: true });
+    const ws = createWriteStream(dest, { mode: 384 });
+    await readBody2(size, (b) => {
+      const copy = Buffer.from(b);
+      return new Promise((resolve, reject) => {
+        ws.write(copy, (err) => err ? reject(err) : resolve());
+      });
+    });
+    await new Promise((resolve, reject) => ws.end((err) => err ? reject(err) : resolve()));
+    files++;
+    bytes += size;
+  }
+  return { files, bytes };
+}
+function octal(n, len) {
+  const b = Buffer.alloc(len, 0);
+  b.write(n.toString(8).padStart(len - 1, "0"), 0, "ascii");
+  return b;
+}
+function tarHeader(name, size, type, mtimeSec) {
+  const h = Buffer.alloc(BLOCK, 0);
+  if (Buffer.byteLength(name) > 100) {
+    throw new Error(`tar entry name too long: ${name}`);
+  }
+  h.write(name, 0, "utf8");
+  octal(type === "5" ? 448 : 384, 8).copy(h, 100);
+  octal(0, 8).copy(h, 108);
+  octal(0, 8).copy(h, 116);
+  octal(size, 12).copy(h, 124);
+  octal(mtimeSec, 12).copy(h, 136);
+  h.write("        ", 148, "ascii");
+  h.write(type, 156, "ascii");
+  h.write("ustar", 257, "ascii");
+  h.write("00", 263, "ascii");
+  let sum = 0;
+  for (let i = 0; i < BLOCK; i++) sum += h[i];
+  Buffer.from(sum.toString(8).padStart(6, "0") + "\0 ", "ascii").copy(h, 148);
+  return h;
+}
+async function* createTarStream(rootDir) {
+  const mtimeSec = Math.floor(Date.now() / 1e3);
+  async function* walk(rel) {
+    const abs = rel ? join(rootDir, rel) : rootDir;
+    const entries = (await readdir(abs, { withFileTypes: true })).sort(
+      (a, b) => a.name.localeCompare(b.name)
+    );
+    for (const e of entries) {
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        yield tarHeader(childRel + "/", 0, "5", mtimeSec);
+        yield* walk(childRel);
+      } else if (e.isFile()) {
+        const st = await stat(join(rootDir, childRel));
+        yield tarHeader(childRel, st.size, "0", mtimeSec);
+        let written = 0;
+        if (st.size <= 4 * 1024 * 1024) {
+          const buf = await readFile(join(rootDir, childRel));
+          written = buf.length;
+          yield buf;
+        } else {
+          for await (const chunk of createReadStream(join(rootDir, childRel), {
+            highWaterMark: 4 * 1024 * 1024
+          })) {
+            written += chunk.length;
+            yield chunk;
+          }
+        }
+        if (written !== st.size) {
+          throw new Error(`file ${childRel} changed size during snapshot (${st.size} -> ${written})`);
+        }
+        const pad = (BLOCK - st.size % BLOCK) % BLOCK;
+        if (pad > 0) yield Buffer.alloc(pad, 0);
+      }
+    }
+  }
+  yield* walk("");
+  yield Buffer.alloc(BLOCK * 2, 0);
+}
+
 // packages/objectstore-fs/src/zeropg.ts
-import { gzipSync, gunzipSync } from "node:zlib";
+import { createGunzip, createGzip, gzipSync } from "node:zlib";
+import { Readable as Readable2 } from "node:stream";
+import * as nodeStream from "node:stream";
+import { mkdir as mkdir2, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as join2 } from "node:path";
+var compose2 = nodeStream.compose;
 var SQL_WRITE = /^\s*(insert|update|delete|create|alter|drop|truncate|comment|grant|revoke|with[\s\S]*\b(insert|update|delete)\b|copy)/i;
+var WAL_GUCS = [
+  ["max_wal_size", "'64MB'"],
+  ["min_wal_size", "'32MB'"],
+  ["wal_recycle", "off"]
+];
 function randomGeneration() {
   const b = new Uint8Array(8);
   crypto.getRandomValues(b);
@@ -372,9 +657,12 @@ var ZeroPG = class _ZeroPG {
   pg;
   lease = null;
   noLease;
-  relaxed;
+  durability;
+  leaseTtlMs;
   flushIntervalMs;
   now;
+  scratchBase;
+  dataDir;
   manifest;
   manifestEtag = null;
   generation;
@@ -385,9 +673,11 @@ var ZeroPG = class _ZeroPG {
   constructor(opts) {
     this.store = opts.store;
     this.noLease = opts.noLease ?? false;
-    this.relaxed = opts.relaxedDurability ?? false;
+    this.durability = opts.durability ?? (opts.relaxedDurability ? "interval" : "strict");
+    this.leaseTtlMs = opts.leaseTtlMs ?? 3e4;
     this.flushIntervalMs = opts.flushIntervalMs ?? 1e3;
     this.now = opts.now ?? Date.now;
+    this.scratchBase = opts.scratchDir ?? join2(tmpdir(), "zeropg");
   }
   /** The underlying PGlite instance (escape hatch / ORM adapters). */
   get raw() {
@@ -399,25 +689,39 @@ var ZeroPG = class _ZeroPG {
   get currentManifest() {
     return this.manifest;
   }
+  get durabilityMode() {
+    return this.durability;
+  }
+  /** True when there are committed-in-memory writes not yet in the bucket. */
+  get pendingFlush() {
+    return this.dirty;
+  }
   /** Cold-start phase breakdown (ms), populated during open(). */
   bootTimings = {
     manifestGetMs: 0,
     leaseMs: 0,
-    snapshotGetMs: 0,
+    restoreMs: 0,
     snapshotBytes: 0,
-    gunzipMs: 0,
     pgliteCreateMs: 0,
     totalMs: 0,
     fresh: false
   };
   static async open(opts) {
     const db2 = new _ZeroPG(opts);
-    await db2.boot(opts);
+    try {
+      await db2.boot(opts);
+    } catch (e) {
+      await db2.cleanupScratch().catch(() => {
+      });
+      throw e;
+    }
     return db2;
   }
   async boot(opts) {
     const bootStart = performance.now();
     const holder = opts.holder ?? `${process.env.HOSTNAME ?? "host"}:${process.pid}`;
+    this.dataDir = join2(this.scratchBase, `data-${process.pid}-${randomGeneration()}`);
+    await mkdir2(this.dataDir, { recursive: true, mode: 448 });
     const tMan = performance.now();
     const existing = await this.store.get(MANIFEST_KEY);
     this.bootTimings.manifestGetMs = performance.now() - tMan;
@@ -425,12 +729,21 @@ var ZeroPG = class _ZeroPG {
     if (!this.noLease) {
       this.lease = new Lease(this.store, {
         holder,
-        ttlMs: opts.leaseTtlMs ?? 3e4,
+        ttlMs: this.leaseTtlMs,
         now: this.now,
         tokenFloor
       });
       const tLease = performance.now();
-      await this.lease.acquire();
+      const deadline = tLease + (opts.acquireTimeoutMs ?? 0);
+      for (; ; ) {
+        try {
+          await this.lease.acquire();
+          break;
+        } catch (e) {
+          if (!(e instanceof LockedError) || performance.now() >= deadline) throw e;
+          await new Promise((r) => setTimeout(r, 2e3));
+        }
+      }
       this.bootTimings.leaseMs = performance.now() - tLease;
     }
     if (existing) {
@@ -443,34 +756,32 @@ var ZeroPG = class _ZeroPG {
       this.manifest = m;
       this.manifestEtag = existing.etag;
       this.generation = m.generation;
-      const tSnap = performance.now();
-      const snap = await this.store.get(m.snapshot);
-      this.bootTimings.snapshotGetMs = performance.now() - tSnap;
-      if (!snap) throw new Error(`manifest references missing snapshot ${m.snapshot}`);
-      this.bootTimings.snapshotBytes = snap.bytes.byteLength;
-      const tGz = performance.now();
-      const tar = gunzipSync(snap.bytes);
-      this.bootTimings.gunzipMs = performance.now() - tGz;
+      const tRestore = performance.now();
+      this.bootTimings.snapshotBytes = await this.restoreInto(this.dataDir, m.snapshot);
+      this.bootTimings.restoreMs = performance.now() - tRestore;
       const tPg = performance.now();
-      this.pg = await PGlite.create({ loadDataDir: new Blob([tar]) });
+      this.pg = await PGlite.create({ dataDir: this.dataDir });
       await this.pg.waitReady;
       this.bootTimings.pgliteCreateMs = performance.now() - tPg;
+      await this.ensureWalConfig();
     } else {
       this.bootTimings.fresh = true;
       this.generation = randomGeneration();
       const tPg = performance.now();
       if (opts.seedSnapshot) {
-        const tar = gunzipSync(opts.seedSnapshot);
-        this.pg = await PGlite.create({ loadDataDir: new Blob([tar]) });
-      } else {
-        this.pg = new PGlite();
+        await extractTarStream(
+          compose2(Readable2.from([Buffer.from(opts.seedSnapshot)]), createGunzip()),
+          this.dataDir
+        );
       }
+      this.pg = await PGlite.create({ dataDir: this.dataDir });
       await this.pg.waitReady;
       this.bootTimings.pgliteCreateMs = performance.now() - tPg;
+      await this.ensureWalConfig();
       await this.commitInitial();
     }
     this.bootTimings.totalMs = performance.now() - bootStart;
-    if (this.relaxed) {
+    if (this.durability === "interval") {
       this.flushTimer = setInterval(() => {
         void this.flush().catch(() => {
         });
@@ -478,17 +789,55 @@ var ZeroPG = class _ZeroPG {
       this.flushTimer.unref?.();
     }
   }
-  async snapshotBytes() {
+  /** Stream a snapshot object into dir; returns its compressed size. */
+  async restoreInto(dir, snapshotKey) {
+    const src = await this.store.getStream(snapshotKey);
+    if (!src) throw new Error(`manifest references missing snapshot ${snapshotKey}`);
+    await extractTarStream(compose2(Readable2.from(src.stream), createGunzip()), dir);
+    return src.size;
+  }
+  /** Persist WAL-shrinking GUCs into the datadir (travels with snapshots). */
+  async ensureWalConfig() {
+    try {
+      const cur = await this.pg.query(
+        "SELECT setting FROM pg_settings WHERE name = 'max_wal_size'"
+      );
+      if (cur.rows[0]?.setting === "64") return;
+      for (const [k, v] of WAL_GUCS) {
+        await this.pg.exec(`ALTER SYSTEM SET ${k} = ${v}`);
+      }
+      await this.pg.query("SELECT pg_reload_conf()");
+    } catch {
+    }
+  }
+  /**
+   * CHECKPOINT, then stream tar(datadir) -> gzip -> chunked PUT. The datadir is
+   * quiescent during the tar: we hold the single PGlite connection and commits
+   * are serialized behind commitInFlight.
+   */
+  async uploadSnapshot(key) {
     const t0 = performance.now();
-    const file = await this.pg.dumpDataDir("none");
-    const raw = new Uint8Array(await file.arrayBuffer());
-    const bytes = gzipSync(raw, { level: 1 });
-    return { bytes, dumpMs: performance.now() - t0 };
+    try {
+      await this.pg.exec("CHECKPOINT");
+      await this.pg.exec("CHECKPOINT");
+    } catch {
+    }
+    const dumpMs = performance.now() - t0;
+    const tUp = performance.now();
+    let snapshotBytes = 0;
+    const gz = compose2(Readable2.from(createTarStream(this.dataDir)), createGzip({ level: 1 }));
+    const counted = async function* () {
+      for await (const chunk of gz) {
+        snapshotBytes += chunk.length;
+        yield chunk;
+      }
+    };
+    await this.store.putStream(key, counted(), { contentType: "application/gzip" });
+    return { snapshotBytes, dumpMs, uploadMs: performance.now() - tUp };
   }
   async commitInitial() {
-    const { bytes } = await this.snapshotBytes();
     const snapshotKey = `generations/${this.generation}/snapshot-0.tar.gz`;
-    await this.store.put(snapshotKey, bytes, { contentType: "application/gzip" });
+    await this.uploadSnapshot(snapshotKey);
     const m = {
       version: 1,
       generation: this.generation,
@@ -513,12 +862,12 @@ var ZeroPG = class _ZeroPG {
         this.manifest = cm;
         this.manifestEtag = cur.etag;
         this.generation = cm.generation;
-        const snap = await this.store.get(cm.snapshot);
-        if (snap) {
-          await this.pg.close();
-          this.pg = await PGlite.create({ loadDataDir: new Blob([gunzipSync(snap.bytes)]) });
-          await this.pg.waitReady;
-        }
+        await this.pg.close();
+        await rm(this.dataDir, { recursive: true, force: true });
+        await mkdir2(this.dataDir, { recursive: true, mode: 448 });
+        await this.restoreInto(this.dataDir, cm.snapshot);
+        this.pg = await PGlite.create({ dataDir: this.dataDir });
+        await this.pg.waitReady;
       } else throw e;
     }
   }
@@ -538,12 +887,9 @@ var ZeroPG = class _ZeroPG {
   }
   async doCommit() {
     const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken;
-    const { bytes, dumpMs } = await this.snapshotBytes();
     const nextSeq = this.manifest.commitSeq + 1;
     const snapshotKey = `generations/${this.generation}/snapshot-${nextSeq}.tar.gz`;
-    const tUp = performance.now();
-    await this.store.put(snapshotKey, bytes, { contentType: "application/gzip" });
-    const uploadMs = performance.now() - tUp;
+    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey);
     const m = {
       ...this.manifest,
       fencingToken: token,
@@ -566,11 +912,12 @@ var ZeroPG = class _ZeroPG {
       throw e;
     }
     const manifestMs = performance.now() - tMan;
+    const prevSeq = this.manifest.commitSeq;
     this.manifest = m;
     this.manifestEtag = etag;
     this.dirty = false;
-    const prevKey = `generations/${this.generation}/snapshot-${this.manifest.commitSeq - 1}.tar.gz`;
-    if (this.manifest.commitSeq - 1 >= 0) {
+    if (prevSeq >= 0) {
+      const prevKey = `generations/${this.generation}/snapshot-${prevSeq}.tar.gz`;
       void this.store.delete(prevKey).catch(() => {
       });
     }
@@ -578,15 +925,19 @@ var ZeroPG = class _ZeroPG {
       commitSeq: nextSeq,
       generation: this.generation,
       snapshotKey,
-      snapshotBytes: bytes.byteLength,
+      snapshotBytes,
       dumpMs,
       uploadMs,
       manifestMs
     };
   }
-  /** Flush pending writes (relaxed mode / explicit). No-op if not dirty. */
+  /** Flush pending writes (interval/sleep mode / explicit). No-op if clean. */
   async flush() {
     return this.commit();
+  }
+  /** Mark the database dirty after writes made via `raw` (bypassing exec/query). */
+  markDirty() {
+    this.dirty = true;
   }
   // ---- Query surface (delegates to PGlite, commits on writes in strict mode) ----
   async exec(sql) {
@@ -594,44 +945,66 @@ var ZeroPG = class _ZeroPG {
     await this.afterWrite(SQL_WRITE.test(sql));
   }
   async query(sql, params) {
+    const t0 = performance.now();
     const r = await this.pg.query(sql, params);
-    await this.afterWrite(SQL_WRITE.test(sql));
-    return { rows: r.rows, affectedRows: r.affectedRows };
+    const execMs = performance.now() - t0;
+    const commit = await this.afterWrite(SQL_WRITE.test(sql));
+    return { rows: r.rows, affectedRows: r.affectedRows, execMs, commit };
   }
   /** Run a function inside a Postgres transaction, then commit durably. */
   async transaction(fn) {
     const out = await this.pg.transaction(fn);
-    this.dirty = true;
-    if (!this.relaxed) await this.commit();
+    await this.afterWrite(true);
     return out;
   }
+  /** @returns the CommitInfo when this write triggered a durable commit. */
   async afterWrite(isWrite) {
-    if (!isWrite) return;
+    if (!isWrite) return null;
     this.dirty = true;
-    if (!this.relaxed) await this.commit();
+    if (this.durability === "strict") return this.commit();
+    return null;
   }
-  /** Re-validate the lease on the request path (E4 bet b: no background work). */
+  /**
+   * Re-validate the lease on the request path (E4 bet b: no background work),
+   * and renew it once it is past half-life so a warm instance under traffic
+   * keeps writership indefinitely. Throws FencedError if taken over.
+   */
   async validateLease() {
     if (!this.lease) return true;
-    return this.lease.validate();
+    const ok = await this.lease.validate();
+    if (ok && this.lease.expiresInMs(this.now()) < this.leaseTtlMs / 2) {
+      await this.lease.renew();
+    }
+    return ok;
   }
   async close() {
     if (this.closed) return;
     this.closed = true;
     if (this.flushTimer) clearInterval(this.flushTimer);
     try {
-      if (this.dirty) await this.commit();
+      if (this.dirty) {
+        await (this.commitInFlight ?? this.doCommit());
+      }
     } finally {
       if (this.lease) await this.lease.release().catch(() => {
       });
       await this.pg.close();
+      await this.cleanupScratch().catch(() => {
+      });
     }
   }
+  async cleanupScratch() {
+    if (this.dataDir) await rm(this.dataDir, { recursive: true, force: true });
+  }
   // ---- Helpers ----
-  /** Build a reusable empty-datadir snapshot (gzipped) to seed fresh DBs fast. */
+  /** Build a reusable empty-datadir snapshot (gzipped) to seed fresh DBs fast.
+   * The WAL GUCs are baked in so databases born from it never bloat. */
   static async buildEmptySnapshot() {
     const pg = new PGlite();
     await pg.waitReady;
+    for (const [k, v] of WAL_GUCS) {
+      await pg.exec(`ALTER SYSTEM SET ${k} = ${v}`);
+    }
     const file = await pg.dumpDataDir("none");
     const raw = new Uint8Array(await file.arrayBuffer());
     await pg.close();
@@ -645,11 +1018,14 @@ var __dirname = dirname(fileURLToPath(import.meta.url));
 var BUCKET = process.env.ZEROPG_BUCKET ?? "zeropg-experiments-euw1";
 var DB_PREFIX = process.env.ZEROPG_PREFIX ?? "demo/default";
 var APP_LABEL = process.env.APP_LABEL ?? "zeropg demo";
-var RELAXED = process.env.ZEROPG_RELAXED === "1";
+var DURABILITY = ["strict", "interval", "sleep"].includes(
+  process.env.ZEROPG_DURABILITY ?? ""
+) ? process.env.ZEROPG_DURABILITY : "sleep";
+var IDLE_FLUSH_MS = Number(process.env.ZEROPG_IDLE_FLUSH_MS ?? 6e4);
 var PORT = Number(process.env.PORT ?? 8080);
 var INSTANCE_ID = `${process.env.K_REVISION ?? "local"}-${process.pid}`;
 function loadSeed() {
-  const p = join(__dirname, "seed.tar.gz");
+  const p = join3(__dirname, "seed.tar.gz");
   return existsSync(p) ? new Uint8Array(readFileSync(p)) : void 0;
 }
 var db;
@@ -657,15 +1033,32 @@ var readyMs = 0;
 var bootError = null;
 var requestsServed = 0;
 var paused = false;
+var lastWrite = null;
+var idleTimer = null;
+function armIdleFlush() {
+  if (IDLE_FLUSH_MS <= 0 || DURABILITY !== "sleep") return;
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (db?.pendingFlush) {
+      const t0 = performance.now();
+      db.flush().then(
+        (c) => console.log(JSON.stringify({ event: "idle-flush", ms: Math.round(performance.now() - t0), commit: c }))
+      ).catch((e) => console.error(JSON.stringify({ event: "idle-flush-error", error: String(e) })));
+    }
+  }, IDLE_FLUSH_MS);
+  idleTimer.unref?.();
+}
 async function boot() {
   const store = new GcsBlobStore({ bucket: BUCKET, prefix: DB_PREFIX });
   try {
     db = await ZeroPG.open({
       store,
       holder: INSTANCE_ID,
-      relaxedDurability: RELAXED,
+      durability: DURABILITY,
       leaseTtlMs: 6e4,
       // > Cloud Run idle windows; revalidated on the request path
+      acquireTimeoutMs: 9e4,
+      // ride out revision-switch / crash-restart lease overlap
       seedSnapshot: loadSeed()
     });
     await db.raw.exec(
@@ -710,12 +1103,18 @@ async function dbSizeInfo() {
 }
 async function handle(req, res) {
   const url = new URL(req.url ?? "/", `http://localhost`);
-  if (url.pathname === "/healthz") {
+  if (url.pathname === "/up" || url.pathname === "/healthz") {
     if (bootError) return json(res, 503, { ok: false, error: bootError });
     return json(res, db ? 200 : 503, { ok: !!db });
   }
+  if (url.pathname === "/_restart") {
+    res.end(JSON.stringify({ restarting: true }));
+    setTimeout(() => process.exit(0), 50);
+    return;
+  }
   const isColdRequest = requestsServed === 0;
   requestsServed++;
+  armIdleFlush();
   if (!db) return json(res, 503, { error: bootError ?? "still booting" });
   if (url.pathname === "/_fault/pause-lease") {
     paused = true;
@@ -740,7 +1139,9 @@ async function handle(req, res) {
       bootTimings: db.bootTimings,
       requestsServed,
       fencingToken: db.fencingToken,
-      relaxed: RELAXED,
+      durability: db.durabilityMode,
+      pendingFlush: db.pendingFlush,
+      lastWrite,
       rssMB: Math.round(mem.rss / 1e6),
       ...await dbSizeInfo()
     });
@@ -751,18 +1152,52 @@ async function handle(req, res) {
       const { sql } = JSON.parse(body);
       const t0 = performance.now();
       const r = await db.query(sql);
-      return json(res, 200, { rows: r.rows, ms: Math.round((performance.now() - t0) * 100) / 100 });
+      return json(res, 200, {
+        rows: r.rows,
+        ms: Math.round((performance.now() - t0) * 100) / 100,
+        execMs: Math.round(r.execMs * 100) / 100,
+        commit: r.commit,
+        durability: db.durabilityMode
+      });
     } catch (e) {
       return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  if (url.pathname === "/flush" && req.method === "POST") {
+    try {
+      const t0 = performance.now();
+      const commit = await db.flush();
+      return json(res, 200, { flushed: !!commit, ms: Math.round(performance.now() - t0), commit });
+    } catch (e) {
+      const status = e instanceof FencedError ? 423 : 500;
+      return json(res, status, { error: e instanceof Error ? e.message : String(e) });
     }
   }
   if (url.pathname === "/notes" && req.method === "POST") {
     const body = await readBody(req);
     const params = new URLSearchParams(body);
     const text = (params.get("body") ?? "").slice(0, 500);
+    const durableNow = params.get("durable") === "on";
     try {
-      if (!paused) await db.validateLease();
-      await db.query("INSERT INTO notes (body) VALUES ($1)", [text || "(empty)"]);
+      const t0 = performance.now();
+      let leaseMs = 0;
+      if (!paused) {
+        const tl = performance.now();
+        await db.validateLease();
+        leaseMs = performance.now() - tl;
+      }
+      const r = await db.query("INSERT INTO notes (body) VALUES ($1)", [text || "(empty)"]);
+      let commit = r.commit;
+      if (durableNow && !commit) commit = await db.flush();
+      lastWrite = {
+        at: (/* @__PURE__ */ new Date()).toISOString(),
+        sql: "INSERT INTO notes (body) VALUES ($1)",
+        execMs: r.execMs,
+        leaseMs,
+        commit,
+        totalMs: performance.now() - t0,
+        durable: commit !== null
+      };
       res.writeHead(302, { location: "/" });
       res.end();
     } catch (e) {
@@ -806,6 +1241,9 @@ function renderPage(info, notes, cold) {
  button{padding:.5rem 1rem;border:0;background:#1a73e8;color:#fff;border-radius:6px;cursor:pointer}
  ul{list-style:none;padding:0}li{padding:.35rem 0;border-bottom:1px solid #eee}.when{color:#999;font-size:.8rem;margin-right:.5rem}
  code{background:#f3f3f3;padding:.1rem .3rem;border-radius:4px}
+ .hint{color:#888;font-size:.85rem}.durable{display:flex;align-items:center;gap:.3rem;font-size:.85rem;color:#555;white-space:nowrap}
+ details.write{background:#f6fef6;border:1px solid #bce3bc;border-radius:8px;padding:.5rem .8rem;margin:1rem 0;font-size:.9rem}
+ details.write table{margin:.3rem 0}
 </style></head><body>
 <h1>${escapeHtml(APP_LABEL)}</h1>
 <div class="sub">A real Postgres, living in a GCS bucket. No database server. Scales to zero.</div>
@@ -815,27 +1253,60 @@ ${banner}
  <tr><td>notes</td><td>${info.notes}</td></tr>
  <tr><td>filler rows</td><td>${info.fillerRows}</td></tr>
  <tr><td>cold-start total</td><td><b>${Math.round(readyMs)} ms</b></td></tr>
- <tr><td>\xB7 snapshot download</td><td>${Math.round(b.snapshotGetMs)} ms (${(b.snapshotBytes / 1e6).toFixed(1)} MB)</td></tr>
- <tr><td>\xB7 gunzip</td><td>${Math.round(b.gunzipMs)} ms</td></tr>
- <tr><td>\xB7 PGlite init + restore</td><td>${Math.round(b.pgliteCreateMs)} ms</td></tr>
+ <tr><td>\xB7 snapshot restore (download+gunzip+untar, ${(b.snapshotBytes / 1e6).toFixed(1)} MB)</td><td>${Math.round(b.restoreMs)} ms</td></tr>
+ <tr><td>\xB7 PGlite open</td><td>${Math.round(b.pgliteCreateMs)} ms</td></tr>
  <tr><td>\xB7 lease acquire</td><td>${Math.round(b.leaseMs)} ms</td></tr>
+ <tr><td>durability mode</td><td><b>${db.durabilityMode}</b>${durabilityHint()}</td></tr>
+ <tr><td>unflushed writes</td><td>${db.pendingFlush ? "\u23F3 in memory, upload on sleep" : "\u2713 none \u2014 bucket is current"}</td></tr>
  <tr><td>fencing token</td><td>${db.fencingToken ?? "\u2014"}</td></tr>
 </table>
+${renderLastWrite()}
 <form method="post" action="/notes">
  <input type="text" name="body" placeholder="leave a note (it persists in the bucket)" maxlength="500" autofocus>
+ <label class="durable"><input type="checkbox" name="durable"> durable&nbsp;now</label>
  <button>add note</button>
 </form>
 <ul>${rows || "<li><i>no notes yet \u2014 add one, then watch it survive a scale-to-zero</i></li>"}</ul>
 <p class="sub">Powered by <code>zeropg</code>: PGlite + object storage + a conditional-write lease.</p>
 </body></html>`;
 }
+function durabilityHint() {
+  switch (db.durabilityMode) {
+    case "sleep":
+      return ' <span class="hint">\u2014 writes are memory-speed; the snapshot uploads when the instance is put to sleep</span>';
+    case "interval":
+      return ' <span class="hint">\u2014 background flush every second (bounded loss window)</span>';
+    default:
+      return ' <span class="hint">\u2014 every write is durable in the bucket before it returns</span>';
+  }
+}
+function renderLastWrite() {
+  if (!lastWrite) return "";
+  const w = lastWrite;
+  const f = (n) => n < 10 ? n.toFixed(2) : String(Math.round(n));
+  const commitRows = w.commit ? `<tr><td>\xB7 checkpoint</td><td>${f(w.commit.dumpMs)} ms</td></tr>
+ <tr><td>\xB7 snapshot upload (${(w.commit.snapshotBytes / 1e6).toFixed(1)} MB)</td><td>${f(w.commit.uploadMs)} ms</td></tr>
+ <tr><td>\xB7 manifest CAS (the actual commit)</td><td>${f(w.commit.manifestMs)} ms</td></tr>` : `<tr><td>\xB7 bucket upload</td><td><i>deferred \u2014 happens on ${db.durabilityMode === "interval" ? "the next interval flush" : "sleep/flush"}</i></td></tr>`;
+  return `<details class="write" open><summary>last write: <b>${f(w.totalMs)} ms</b> ${w.durable ? "(durable in bucket)" : "(memory; not yet in bucket)"}</summary>
+<table>
+ <tr><td>SQL execute (PGlite, in memory)</td><td>${f(w.execMs)} ms</td></tr>
+ <tr><td>lease validate/renew</td><td>${f(w.leaseMs)} ms</td></tr>
+ ${commitRows}
+ <tr><td>total request</td><td><b>${f(w.totalMs)} ms</b></td></tr>
+</table></details>`;
+}
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 async function shutdown(signal) {
-  console.log(JSON.stringify({ event: "shutdown", signal }));
+  const pending = db?.pendingFlush ?? false;
+  console.log(JSON.stringify({ event: "shutdown", signal, pendingFlush: pending }));
+  const t0 = performance.now();
   try {
     if (db) await db.close();
+    console.log(
+      JSON.stringify({ event: "shutdown-done", flushed: pending, ms: Math.round(performance.now() - t0) })
+    );
   } finally {
     process.exit(0);
   }

@@ -83,6 +83,7 @@ async function boot() {
       holder: INSTANCE_ID,
       durability: DURABILITY,
       leaseTtlMs: 60_000, // > Cloud Run idle windows; revalidated on the request path
+      acquireTimeoutMs: 90_000, // ride out revision-switch / crash-restart lease overlap
       seedSnapshot: loadSeed(),
     })
     // App schema (idempotent). Don't commit if nothing changed.
