@@ -8,3 +8,8 @@
 {"ts":"2026-06-12T12:51:21.582Z","probe":"P2b-crash-loss-bounded","baseline":21,"after":21}
 {"ts":"2026-06-12T12:56:30.988Z","probe":"P3-revision-switch-loop","cycles":5,"finalCount":26}
 {"ts":"2026-06-12T12:57:35.899Z","probe":"P4-zombie-fencing","rivalToken":23,"zombieStatus":423}
+{"ts":"2026-06-12T13:07:16.935Z","probe":"P1-idle-lease-self-heal","before":0,"after":2,"status":302}
+{"ts":"2026-06-12T13:08:29.585Z","probe":"P2-sigterm-flush","before":2,"after":1,"rollMs":72525}
+{"ts":"2026-06-12T13:09:21.946Z","probe":"P2b-crash-loss-bounded","baseline":2,"after":1}
+{"ts":"2026-06-12T13:14:27.841Z","probe":"P3-revision-switch-loop","cycles":5,"finalCount":6}
+{"ts":"2026-06-12T13:15:31.066Z","probe":"P4-zombie-fencing","rivalToken":10,"zombieStatus":423}
