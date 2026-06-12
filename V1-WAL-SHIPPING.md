@@ -54,6 +54,12 @@ Expected strict-mode write latency: one small PUT (~40-60ms p50, E0 data) + mani
 3. Boot PGlite. Postgres crash recovery reads pg_control's checkpoint (from the snapshot), replays WAL forward through the applied segments, stops at the last valid record (CRC-guarded against a torn tail - can't happen anyway since the manifest only references fully-PUT segments).
 4. CRITICAL ordering (E4 probe 5): acquire the lease BEFORE adopting the manifest, or re-GET the manifest etag after acquisition and re-restore if it moved. Fixes the stale-restore race on instance handoff.
 
+## No snapshot at startup (deliberate divergence from Litestream)
+
+Litestream snapshots on every process start because, as an external observer with no lease and no manifest, it cannot prove bucket-vs-local continuity after downtime - so it starts a new generation defensively. We can always prove continuity: local state is derived FROM the manifest under the lease. Wake-up is downloads only; the first write appends to the existing generation. Fresh snapshots happen only on continuity doubt (fenced/unclean predecessor, missing segment, failed precondition) or threshold compaction.
+
+**Trap - high-water initialization after restore:** Postgres writes WAL during recovery itself (end-of-recovery checkpoint record), so local pg_wal extends past what the manifest's segments cover. Initialize `highWater` from the manifest's recorded segment end-offsets, NOT from local file sizes at boot - otherwise the recovery bytes never ship, leaving a silent gap that truncates the NEXT restore at that LSN. Test: wake → commit → wake again → verify both commits present (E2c roundtrip already covers this if it reopens twice).
+
 ## Open items to verify while building
 
 - `wal_segment_size` in the WASM build (likely 16MB default): only matters for the scan granularity, but confirm.
