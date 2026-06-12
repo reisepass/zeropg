@@ -852,13 +852,14 @@ var ZeroPG = class _ZeroPG {
       this.bootTimings.leaseMs = performance.now() - tLease;
     }
     if (existing) {
-      const m = decodeManifest(existing.bytes);
+      const fresh = await this.store.get(MANIFEST_KEY) ?? existing;
+      const m = decodeManifest(fresh.bytes);
       if (m.movedTo) {
         throw new Error(
           `this database was migrated out to ${m.movedTo}; refusing to boot stale data`
         );
       }
-      await this.adoptManifest(m, existing.etag);
+      await this.adoptManifest(m, fresh.etag);
       if (this.lease?.held && this.lease.tookOver) {
         await this.fenceStamp();
       }
@@ -1192,6 +1193,10 @@ var ZeroPG = class _ZeroPG {
   async doCommit() {
     if (this.incrementalCapable && !this.forceCompactNext && this.manifest.version === 2 && this.manifest.walSegments.length < COMPACT_AT_SEGMENTS && this.walBytesSinceSnapshot < COMPACT_AT_WAL_BYTES) {
       const r = await this.commitIncremental();
+      if (r === "empty") {
+        this.dirty = false;
+        return null;
+      }
       if (r) return r;
     }
     return this.commitSnapshot();
@@ -1200,8 +1205,9 @@ var ZeroPG = class _ZeroPG {
    * v1 commit: ship only the WAL bytes appended since the last commit — the
    * LSN range [lastShippedLsn, flushLsn) — as one immutable segment object,
    * then CAS the manifest with the new entry. O(transaction size), not
-   * O(database size). Returns null if there is nothing shippable or the local
-   * WAL no longer holds the range (caller falls back to compaction).
+   * O(database size). Returns 'empty' when the WAL did not grow (a dirty
+   * flag with no real change), or null when the local WAL no longer holds
+   * the range (caller falls back to compaction).
    */
   async commitIncremental() {
     const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken;
@@ -1210,7 +1216,7 @@ var ZeroPG = class _ZeroPG {
     const r = await this.pg.query("SELECT pg_current_wal_flush_lsn()::text lsn");
     const end = parseLsn(r.rows[0].lsn);
     const start = this.lastShippedLsn;
-    if (end <= start) return null;
+    if (end <= start) return "empty";
     const dumpMs = performance.now() - t0;
     const tUp = performance.now();
     let buf;
