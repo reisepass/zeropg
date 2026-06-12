@@ -126,3 +126,21 @@ E0+E1 are pure-risk-retirement and produce the two foundational packages. E2 pro
 3. Lease liveness mode on Cloud Run: throttled CPU + request-path lease validation vs `--cpu-always-allocated` (E4.1) - this decides whether the no-orchestrator, no-background-work story holds as-is.
 4. The DB-size threshold where v0 tarball-per-commit stops being acceptable and v1 WAL shipping becomes the priority (E2.2 + E3.5 numbers).
 5. The real monthly cost figure to put in the README (E5.2).
+
+## Status addendum (2026-06-12)
+
+All planned experiments through E4 have RUN and PASSED — plus suites this plan
+didn't anticipate: **E2c** (incremental WAL shipping round-trip/compaction/
+group-commit), **E2d** (read replicas), **e4b** (writer-handover races),
+**E5b** (GCS per-object CAS rate: 2.43/s achieved, 52% 429s — the ~1/s cap is
+real), and **unit-local** (store-less CI suite). Scoreboard with numbers:
+[STATUS.md](STATUS.md). Raw data: `results/*.jsonl`.
+
+The decisions above all resolved: (1) real GCS only — the suites ARE the CI
+for the store; (2) prebuilt seed snapshot, yes; (3) bet (b) HELD — request-
+path lease validation with self-heal renew, no background work, no
+cpu-always-allocated; (4) the threshold question dissolved — v1 WAL shipping
+landed and v0 full snapshots became compaction; (5) pending E5 (72h soak),
+the modeled figure is ~$0.01–0.07/month per demo app (COST-MODEL.md).
+
+Still open: E5 soak + billed-cost validation.
