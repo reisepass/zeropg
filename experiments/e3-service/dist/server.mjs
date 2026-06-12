@@ -4,7 +4,7 @@ import { createRequire } from 'module'; const require = createRequire(import.met
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join as join3 } from "node:path";
+import { dirname, join as join4 } from "node:path";
 
 // packages/blobstore/src/types.ts
 var PreconditionFailedError = class extends Error {
@@ -700,26 +700,13 @@ async function largestFile(rootDir) {
   return best;
 }
 
-// packages/objectstore-fs/src/zeropg.ts
-import { createGunzip, createGzip, gzipSync, crc32 } from "node:zlib";
+// packages/objectstore-fs/src/restore.ts
+import { createGunzip, crc32 } from "node:zlib";
 import { Readable as Readable2 } from "node:stream";
 import * as nodeStream from "node:stream";
-import { mkdir as mkdir2, rm, open } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { open } from "node:fs/promises";
 import { join as join2 } from "node:path";
 var compose2 = nodeStream.compose;
-var SQL_WRITE = /^\s*(insert|update|delete|create|alter|drop|truncate|comment|grant|revoke|with[\s\S]*\b(insert|update|delete)\b|copy)/i;
-var WAL_GUCS = [
-  ["max_wal_size", "'64MB'"],
-  ["min_wal_size", "'32MB'"],
-  ["wal_recycle", "off"],
-  ["wal_init_zero", "off"],
-  // Incremental shipping reads committed WAL straight off the filesystem; a
-  // commit must have write()n its WAL before it returns or the scan misses it.
-  ["synchronous_commit", "on"]
-];
-var COMPACT_AT_WAL_BYTES = 16 * 1024 * 1024;
-var COMPACT_AT_SEGMENTS = 64;
 function parseLsn(s) {
   const [hi, lo] = s.split("/");
   return BigInt(parseInt(hi, 16)) << 32n | BigInt(parseInt(lo, 16));
@@ -733,6 +720,96 @@ function walFileName(tli, lsn, segBytes) {
   const hex = (n) => n.toString(16).toUpperCase().padStart(8, "0");
   return hex(BigInt(tli)) + hex(segno / perId) + hex(segno % perId);
 }
+async function restoreSnapshotInto(store, dir, snapshotKey) {
+  const src = await store.getStream(snapshotKey);
+  if (!src) throw new Error(`manifest references missing snapshot ${snapshotKey}`);
+  const tarStream = snapshotKey.endsWith(".gz") ? compose2(Readable2.from(src.stream), createGunzip()) : Readable2.from(src.stream);
+  await extractTarStream(tarStream, dir);
+  return src.size;
+}
+async function applyWalSegments(store, dir, m) {
+  const segments = m.walSegments;
+  if (segments.length === 0) return;
+  if (!m.walFlushLsn || !m.walSegmentBytes) {
+    throw new Error("manifest has WAL segments but no walFlushLsn/walSegmentBytes");
+  }
+  const segBytes = m.walSegmentBytes;
+  const tli = m.walTimeline ?? 1;
+  let expect = parseLsn(m.walFlushLsn);
+  for (const seg of segments) {
+    if (parseLsn(seg.startLsn) !== expect) {
+      throw new Error(`WAL range gap: expected ${formatLsn(expect)}, got ${seg.startLsn} (${seg.key})`);
+    }
+    expect = parseLsn(seg.endLsn);
+  }
+  const bodies = await Promise.all(
+    segments.map(async (seg) => {
+      const obj = await store.get(seg.key);
+      if (!obj) throw new Error(`manifest references missing WAL segment ${seg.key}`);
+      const want = Number(parseLsn(seg.endLsn) - parseLsn(seg.startLsn));
+      if (obj.bytes.byteLength !== want) {
+        throw new Error(`WAL segment ${seg.key}: size ${obj.bytes.byteLength} != ${want}`);
+      }
+      if (crc32(obj.bytes) >>> 0 !== seg.crc32) {
+        throw new Error(`WAL segment ${seg.key}: CRC mismatch`);
+      }
+      return obj.bytes;
+    })
+  );
+  const touched = /* @__PURE__ */ new Set();
+  for (let i = 0; i < segments.length; i++) {
+    const body = bodies[i];
+    let pos = parseLsn(segments[i].startLsn);
+    let bodyOff = 0;
+    while (bodyOff < body.byteLength) {
+      const offInFile = Number(pos % BigInt(segBytes));
+      const take = Math.min(body.byteLength - bodyOff, segBytes - offInFile);
+      const path = join2(dir, "pg_wal", walFileName(tli, pos, segBytes));
+      touched.add(path);
+      const fh = await open(path, "a").then(async (h) => {
+        await h.close();
+        return open(path, "r+");
+      });
+      try {
+        await fh.write(body, bodyOff, take, offInFile);
+      } finally {
+        await fh.close();
+      }
+      pos += BigInt(take);
+      bodyOff += take;
+    }
+  }
+  for (const path of touched) {
+    const fh = await open(path, "r+");
+    try {
+      const st = await fh.stat();
+      if (st.size < segBytes) await fh.truncate(segBytes);
+    } finally {
+      await fh.close();
+    }
+  }
+}
+
+// packages/objectstore-fs/src/zeropg.ts
+import { createGunzip as createGunzip2, createGzip, gzipSync, crc32 as crc322 } from "node:zlib";
+import { Readable as Readable3 } from "node:stream";
+import * as nodeStream2 from "node:stream";
+import { mkdir as mkdir2, rm, open as open2 } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as join3 } from "node:path";
+var compose4 = nodeStream2.compose;
+var SQL_WRITE = /^\s*(insert|update|delete|create|alter|drop|truncate|comment|grant|revoke|with[\s\S]*\b(insert|update|delete)\b|copy)/i;
+var WAL_GUCS = [
+  ["max_wal_size", "'64MB'"],
+  ["min_wal_size", "'32MB'"],
+  ["wal_recycle", "off"],
+  ["wal_init_zero", "off"],
+  // Incremental shipping reads committed WAL straight off the filesystem; a
+  // commit must have write()n its WAL before it returns or the scan misses it.
+  ["synchronous_commit", "on"]
+];
+var COMPACT_AT_WAL_BYTES = 16 * 1024 * 1024;
+var COMPACT_AT_SEGMENTS = 64;
 function randomGeneration() {
   const b = new Uint8Array(8);
   crypto.getRandomValues(b);
@@ -768,6 +845,10 @@ var ZeroPG = class _ZeroPG {
   /** False when this session can't do LSN-mapped shipping (function missing,
    * or our file-name math disagrees with pg_walfile_name). */
   incrementalCapable = false;
+  /** Cluster flush LSN right after this life's boot: WAL at or below this is
+   * recovery artifacts, not user writes — a dirty flag with no growth past it
+   * (idempotent boot DDL) must not upload anything. */
+  lifeBaseLsn = 0n;
   /** Force the next commit to compact (e.g. the manifest predates v2 and has
    * no walFlushLsn to resume shipping from). */
   forceCompactNext = false;
@@ -780,7 +861,7 @@ var ZeroPG = class _ZeroPG {
     const capPerSec = opts.store.cost?.maxWritesPerObjectPerSec;
     this.commitIntervalMs = opts.commitIntervalMs ?? (capPerSec ? Math.ceil(1e3 / capPerSec) : 0);
     this.now = opts.now ?? Date.now;
-    this.scratchBase = opts.scratchDir ?? join2(tmpdir(), "zeropg");
+    this.scratchBase = opts.scratchDir ?? join3(tmpdir(), "zeropg");
   }
   commitIntervalMs;
   lastCasAt = 0;
@@ -825,7 +906,7 @@ var ZeroPG = class _ZeroPG {
   async boot(opts) {
     const bootStart = performance.now();
     const holder = opts.holder ?? `${process.env.HOSTNAME ?? "host"}:${process.pid}`;
-    this.dataDir = join2(this.scratchBase, `data-${process.pid}-${randomGeneration()}`);
+    this.dataDir = join3(this.scratchBase, `data-${process.pid}-${randomGeneration()}`);
     await mkdir2(this.dataDir, { recursive: true, mode: 448 });
     const tMan = performance.now();
     const existing = await this.store.get(MANIFEST_KEY);
@@ -869,7 +950,7 @@ var ZeroPG = class _ZeroPG {
       const tPg = performance.now();
       if (opts.seedSnapshot) {
         await extractTarStream(
-          compose2(Readable2.from([Buffer.from(opts.seedSnapshot)]), createGunzip()),
+          compose4(Readable3.from([Buffer.from(opts.seedSnapshot)]), createGunzip2()),
           this.dataDir
         );
       }
@@ -901,8 +982,8 @@ var ZeroPG = class _ZeroPG {
       await mkdir2(this.dataDir, { recursive: true, mode: 448 });
     }
     const tRestore = performance.now();
-    this.bootTimings.snapshotBytes = await this.restoreInto(this.dataDir, m.snapshot);
-    await this.applyWalSegments(this.dataDir, m);
+    this.bootTimings.snapshotBytes = await restoreSnapshotInto(this.store, this.dataDir, m.snapshot);
+    await applyWalSegments(this.store, this.dataDir, m);
     const resumeAt = m.walSegments.length ? m.walSegments[m.walSegments.length - 1].endLsn : m.walFlushLsn;
     this.lastShippedLsn = resumeAt ? parseLsn(resumeAt) : 0n;
     this.walSegBytes = m.walSegmentBytes ?? 0;
@@ -917,83 +998,38 @@ var ZeroPG = class _ZeroPG {
     await this.pg.waitReady;
     this.bootTimings.pgliteCreateMs = performance.now() - tPg;
     await this.ensureWalConfig();
-    this.forceCompactNext = m.version !== 2 || !m.walFlushLsn;
-    if (!this.forceCompactNext && this.incrementalCapable && this.lastShippedLsn > 0n) {
+    this.forceCompactNext = true;
+    if (this.incrementalCapable) {
       try {
         const r = await this.pg.query(
           "SELECT pg_current_wal_flush_lsn()::text lsn"
         );
-        const at = parseLsn(r.rows[0].lsn);
-        if (at < this.lastShippedLsn) {
-          console.error(
-            JSON.stringify({
-              event: "zeropg-wal-continuity-violation",
-              at: "boot",
-              clusterFlushLsn: formatLsn(at),
-              resumeLsn: formatLsn(this.lastShippedLsn),
-              action: "force-compact-next-commit"
-            })
-          );
-          this.forceCompactNext = true;
-        }
+        this.lifeBaseLsn = parseLsn(r.rows[0].lsn);
       } catch {
-        this.forceCompactNext = true;
+        this.lifeBaseLsn = 0n;
       }
     }
   }
-  /** Overlay shipped WAL ranges onto the restored datadir: fetch concurrently
-   * (small objects), verify CRC + LSN continuity, write each range into the
-   * pg_wal segment file(s) it spans at the LSN-derived offsets. */
-  async applyWalSegments(dir, m) {
-    const segments = m.walSegments;
-    if (segments.length === 0) return;
-    if (!m.walFlushLsn || !m.walSegmentBytes) {
-      throw new Error("manifest has WAL segments but no walFlushLsn/walSegmentBytes");
+  /**
+   * Every 8KB WAL page carries its own address (xlp_pageaddr). Verify each
+   * full page in [start, end) claims the LSN it sits at — zeros or stale
+   * bytes fail immediately. This is the guard against shipping WAL the
+   * engine has ACCOUNTED as flushed but not yet physically written back to
+   * the host FS (observed live: a 5MB commit's tail read back as garbage and
+   * the restorer dropped it — acked-write loss).
+   */
+  validateWalRange(buf, start) {
+    const PAGE = 8192n;
+    let page = (start + PAGE - 1n) / PAGE * PAGE;
+    const end = start + BigInt(buf.length);
+    while (page + 12n <= end) {
+      const off = Number(page - start);
+      const pageaddr = buf.readBigUInt64LE(off + 8);
+      const magic = buf.readUInt16LE(off);
+      if (pageaddr !== page || magic === 0) return page;
+      page += PAGE;
     }
-    const segBytes = m.walSegmentBytes;
-    const tli = m.walTimeline ?? 1;
-    let expect = parseLsn(m.walFlushLsn);
-    for (const seg of segments) {
-      if (parseLsn(seg.startLsn) !== expect) {
-        throw new Error(`WAL range gap: expected ${formatLsn(expect)}, got ${seg.startLsn} (${seg.key})`);
-      }
-      expect = parseLsn(seg.endLsn);
-    }
-    const bodies = await Promise.all(
-      segments.map(async (seg) => {
-        const obj = await this.store.get(seg.key);
-        if (!obj) throw new Error(`manifest references missing WAL segment ${seg.key}`);
-        const want = Number(parseLsn(seg.endLsn) - parseLsn(seg.startLsn));
-        if (obj.bytes.byteLength !== want) {
-          throw new Error(`WAL segment ${seg.key}: size ${obj.bytes.byteLength} != ${want}`);
-        }
-        if (crc32(obj.bytes) >>> 0 !== seg.crc32) {
-          throw new Error(`WAL segment ${seg.key}: CRC mismatch`);
-        }
-        return obj.bytes;
-      })
-    );
-    for (let i = 0; i < segments.length; i++) {
-      const body = bodies[i];
-      let pos = parseLsn(segments[i].startLsn);
-      let bodyOff = 0;
-      while (bodyOff < body.byteLength) {
-        const offInFile = Number(pos % BigInt(segBytes));
-        const take = Math.min(body.byteLength - bodyOff, segBytes - offInFile);
-        const path = join2(dir, "pg_wal", walFileName(tli, pos, segBytes));
-        const fh = await open(path, "a").then(async (h) => {
-          await h.close();
-          return open(path, "r+");
-        });
-        try {
-          await fh.write(body, bodyOff, take, offInFile);
-        } finally {
-          await fh.close();
-        }
-        pos += BigInt(take);
-        bodyOff += take;
-      }
-    }
+    return null;
   }
   /** Read WAL bytes [start, end) out of the local pg_wal segment files. */
   async readWalRange(start, end) {
@@ -1003,8 +1039,8 @@ var ZeroPG = class _ZeroPG {
     while (pos < end) {
       const offInFile = Number(pos % BigInt(this.walSegBytes));
       const take = Math.min(Number(end - pos), this.walSegBytes - offInFile);
-      const path = join2(this.dataDir, "pg_wal", walFileName(this.walTli, pos, this.walSegBytes));
-      const fh = await open(path, "r");
+      const path = join3(this.dataDir, "pg_wal", walFileName(this.walTli, pos, this.walSegBytes));
+      const fh = await open2(path, "r");
       try {
         const { bytesRead } = await fh.read(out, outOff, take, offInFile);
         if (bytesRead !== take) {
@@ -1039,15 +1075,6 @@ var ZeroPG = class _ZeroPG {
       }
     }
     throw new Error("fence-stamp failed after repeated manifest races");
-  }
-  /** Stream a snapshot object into dir; returns its stored size. The key
-   * suffix says whether it is gzipped (.tar.gz) or raw tar (.tar). */
-  async restoreInto(dir, snapshotKey) {
-    const src = await this.store.getStream(snapshotKey);
-    if (!src) throw new Error(`manifest references missing snapshot ${snapshotKey}`);
-    const tarStream = snapshotKey.endsWith(".gz") ? compose2(Readable2.from(src.stream), createGunzip()) : Readable2.from(src.stream);
-    await extractTarStream(tarStream, dir);
-    return src.size;
   }
   /**
    * Decide the snapshot codec by test-compressing a slice of the largest heap
@@ -1129,13 +1156,15 @@ var ZeroPG = class _ZeroPG {
       }
     } catch {
     }
+    await this.pg.syncToFs().catch(() => {
+    });
     return { ms: performance.now() - t0, flushLsn };
   }
   async uploadSnapshot(key, codec, dumpMs) {
     const tUp = performance.now();
     let snapshotBytes = 0;
-    const tar = Readable2.from(createTarStream(this.dataDir));
-    const body = codec === "gzip" ? compose2(tar, createGzip({ level: 1 })) : tar;
+    const tar = Readable3.from(createTarStream(this.dataDir));
+    const body = codec === "gzip" ? compose4(tar, createGzip({ level: 1 })) : tar;
     const counted = async function* () {
       for await (const chunk of body) {
         snapshotBytes += chunk.length;
@@ -1162,7 +1191,10 @@ var ZeroPG = class _ZeroPG {
     const codec = await this.chooseCodec();
     const snapshotKey = this.snapshotKeyFor(0, this.lease?.held ? this.lease.fencingToken : 1, codec);
     await this.uploadSnapshot(snapshotKey, codec, cp.ms);
-    if (cp.flushLsn) this.lastShippedLsn = parseLsn(cp.flushLsn);
+    if (cp.flushLsn) {
+      this.lastShippedLsn = parseLsn(cp.flushLsn);
+      this.lifeBaseLsn = this.lastShippedLsn;
+    }
     this.walBytesSinceSnapshot = 0;
     const m = {
       // version 2 means "walFlushLsn is recorded": incremental shipping can
@@ -1213,6 +1245,18 @@ var ZeroPG = class _ZeroPG {
     return this.commitInFlight;
   }
   async doCommit() {
+    if (this.incrementalCapable && this.lifeBaseLsn > 0n) {
+      try {
+        const r = await this.pg.query(
+          "SELECT pg_current_wal_flush_lsn()::text lsn"
+        );
+        if (parseLsn(r.rows[0].lsn) <= this.lifeBaseLsn) {
+          this.dirty = false;
+          return null;
+        }
+      } catch {
+      }
+    }
     if (this.incrementalCapable && !this.forceCompactNext && this.manifest.version === 2 && this.manifest.walSegments.length < COMPACT_AT_SEGMENTS && this.walBytesSinceSnapshot < COMPACT_AT_WAL_BYTES) {
       const r = await this.commitIncremental();
       if (r === "empty") {
@@ -1252,10 +1296,28 @@ var ZeroPG = class _ZeroPG {
       return null;
     }
     const dumpMs = performance.now() - t0;
+    await this.pg.syncToFs();
     const tUp = performance.now();
     let buf;
     try {
       buf = await this.readWalRange(start, end);
+      for (let attempt = 0; ; attempt++) {
+        const badPage = this.validateWalRange(buf, start);
+        if (badPage === null) break;
+        if (attempt >= 20) {
+          console.error(
+            JSON.stringify({
+              event: "zeropg-wal-writeback-stall",
+              badPageLsn: formatLsn(badPage),
+              range: `${formatLsn(start)}..${formatLsn(end)}`,
+              action: "compacting"
+            })
+          );
+          return null;
+        }
+        await new Promise((r2) => setTimeout(r2, 25 * (attempt + 1)));
+        buf = await this.readWalRange(start, end);
+      }
     } catch {
       return null;
     }
@@ -1265,7 +1327,7 @@ var ZeroPG = class _ZeroPG {
       key,
       startLsn: formatLsn(start),
       endLsn: formatLsn(end),
-      crc32: crc32(buf) >>> 0
+      crc32: crc322(buf) >>> 0
     };
     const uploadMs = performance.now() - tUp;
     const m = {
@@ -1443,6 +1505,9 @@ var ZeroPG = class _ZeroPG {
   }
 };
 
+// packages/objectstore-fs/src/replica.ts
+import { PGlite as PGlite2 } from "@electric-sql/pglite";
+
 // experiments/e3-service/server.ts
 var PROCESS_START = performance.now();
 var __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1456,7 +1521,7 @@ var IDLE_FLUSH_MS = Number(process.env.ZEROPG_IDLE_FLUSH_MS ?? 25e3);
 var PORT = Number(process.env.PORT ?? 8080);
 var INSTANCE_ID = `${process.env.K_REVISION ?? "local"}-${process.pid}`;
 function loadSeed() {
-  const p = join3(__dirname, "seed.tar.gz");
+  const p = join4(__dirname, "seed.tar.gz");
   return existsSync(p) ? new Uint8Array(readFileSync(p)) : void 0;
 }
 var db;

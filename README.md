@@ -53,6 +53,30 @@ Two provider realities are engineered around (see [COST-MODEL.md](COST-MODEL.md)
 
 `sleep` is the serverless-native mode: writes run at memory speed while traffic flows, and one flush happens when the platform puts the instance to sleep. The demo pages show the per-step timing of the last write (SQL exec / lease check / WAL scan / upload / manifest CAS) — and a "durable now" checkbox to feel the difference per write.
 
+## Use it
+
+```ts
+import { GcsBlobStore } from '@zeropg/blobstore'
+import { ZeroPG, ZeroPGReplica } from '@zeropg/objectstore-fs'
+
+const store = new GcsBlobStore({ bucket: 'my-bucket', prefix: 'apps/guestbook' })
+
+// The writer: holds the lease, owns the commit path.
+const db = await ZeroPG.open({ store, durability: 'sleep' })
+await db.exec('CREATE TABLE IF NOT EXISTS notes (id serial, body text)')
+await db.query('INSERT INTO notes (body) VALUES ($1)', ['hello bucket'])
+await db.close() // flushes + releases the lease
+
+// A read replica: leaseless, polls the manifest, converges in seconds.
+const replica = await ZeroPGReplica.open({ store, pollIntervalMs: 5000 })
+const { rows } = await replica.query('SELECT * FROM notes')
+```
+
+Runnable versions in [`examples/`](examples/) (guestbook writer + replica
+reader). Operational tools: `scripts/branch.ts` (server-side database fork —
+500MB in 0.34s), `scripts/gc.ts` (delete unreferenced objects),
+`scripts/deploy.sh` (the Cloud Run recipe behind the live demos).
+
 ## Status
 
 Working v0 on real infrastructure (GCS + Cloud Run). Experiment-driven; every claim above has a JSONL of evidence in [`results/`](results/).
@@ -64,6 +88,7 @@ Working v0 on real infrastructure (GCS + Cloud Run). Experiment-driven; every cl
 | E2 round-trip | reopen is byte-identical at 1/10/100 MB | ✅ |
 | E2b crash matrix | SIGKILL at every commit fault point → never torn | ✅ (re-passed on incremental commits) |
 | E2c incremental | WAL shipping: byte-identical reopens, compaction, group commit | ✅ strict commit p50 134ms |
+| E2d replicas | leaseless followers converge across segments + compactions | ✅ |
 | E3 cold start | distributions above, boot-path split | ✅ |
 | E3b memory tiers | smallest container per DB size | ✅ 500MB DB runs in **1GiB** (5/5, tight); 2GiB comfortable; 4GiB buys nothing |
 | E4 lifecycle | revision switches, SIGTERM flush, zombie fencing — live | ✅ |
@@ -78,10 +103,15 @@ Hard-won platform facts: Postgres silently keeps up to 1 GB of recycled WAL in t
 - [`packages/objectstore-fs`](packages/objectstore-fs) — ZeroPG itself: streaming restore/commit, durability modes, manifest-swap commits, adaptive codec, fence-stamping, GC.
 - [`experiments/`](experiments/) — the E0–E5 harnesses; [`scripts/deploy.sh`](scripts/deploy.sh) builds and ships the demo service.
 
-- [DESIGN.md](DESIGN.md) — full architecture: prior art, lease/fencing protocol, manifest-swap commits, generations, platform notes, roadmap.
+- [DESIGN.md](DESIGN.md) — full architecture: prior art, lease/fencing protocol, manifest-swap commits, generations, platform notes.
+- [V1-WAL-SHIPPING.md](V1-WAL-SHIPPING.md) — incremental commits, including the three design corrections live testing forced.
+- [STATUS.md](STATUS.md) — the experiment scoreboard and the full bug ledger.
+- [COST-MODEL.md](COST-MODEL.md) — provider cost/limit tables driving commit pacing and compaction policy.
+- [docs/ROADMAP.md](docs/ROADMAP.md) + [docs/RESEARCH-NOTES.md](docs/RESEARCH-NOTES.md) — what's next, grounded in a survey of Litestream/LTX, LiteFS, SlateDB, Neon, and D1.
 - [EXPERIMENTS.md](EXPERIMENTS.md) — the ordered experiment plan and kill criteria.
 - [pglite-stream.md](pglite-stream.md) — the "Litestream for Postgres" framing memo.
+- [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) · MIT licensed.
 
 ## What this is not
 
-Not multi-writer, not low-latency-strict-durability (yet — v1), not for databases that don't fit in instance memory. It is for the enormous class of apps that are read-mostly, single-region, and idle 95% of the day: side projects, internal tools, per-tenant databases, preview environments. For those, the math is a bucket bill measured in cents.
+Not multi-writer (one writer + any number of bucket-fed read replicas), and not for databases that don't fit in instance memory. It is for the enormous class of apps that are read-mostly, single-region, and idle 95% of the day: side projects, internal tools, per-tenant databases, preview environments. For those, the math is a bucket bill measured in cents — and when an app outgrows all of it, `pg_dump | pg_restore` into any managed Postgres, because it was real Postgres the whole time.
