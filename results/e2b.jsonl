@@ -1,0 +1,6 @@
+{"ts":"2026-06-11T19:18:00.074Z","run":"2026-06-11T19-17-34-256Z-6025","fault":"kill-before-snapshot","iter":2,"consistent":2,"landed":0,"notLanded":2}
+{"ts":"2026-06-11T19:18:24.867Z","run":"2026-06-11T19-17-34-256Z-6025","fault":"kill-after-snapshot","iter":2,"consistent":2,"landed":0,"notLanded":2}
+{"ts":"2026-06-11T19:18:50.606Z","run":"2026-06-11T19-17-34-256Z-6025","fault":"kill-during-manifest","iter":2,"consistent":2,"landed":0,"notLanded":2}
+{"ts":"2026-06-11T19:23:56.979Z","run":"2026-06-11T19-19-17-374Z-6312","fault":"kill-before-snapshot","iter":20,"consistent":20,"landed":0,"notLanded":20}
+{"ts":"2026-06-11T19:28:53.416Z","run":"2026-06-11T19-19-17-374Z-6312","fault":"kill-after-snapshot","iter":20,"consistent":20,"landed":0,"notLanded":20}
+{"ts":"2026-06-11T19:33:53.624Z","run":"2026-06-11T19-19-17-374Z-6312","fault":"kill-during-manifest","iter":20,"consistent":20,"landed":20,"notLanded":0}

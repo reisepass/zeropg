@@ -1,0 +1,1 @@
+{"ts":"2026-06-11T19:36:42.966Z","size":"1MB","dbMB":9.96,"iter":0,"endToEndMs":33.34,"readyMs":1928,"bootTimings":{"manifestGetMs":141.33108600000003,"leaseMs":206.60273899999999,"snapshotGetMs":274.81108400000005,"snapshotBytes":9545257,"gunzipMs":201.38614400000006,"pgliteCreateMs":1015.361874,"totalMs":1839.739274,"fresh":false},"coldRequest":true}
