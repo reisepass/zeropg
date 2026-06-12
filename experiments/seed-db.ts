@@ -19,7 +19,7 @@ if (!prefix) {
 async function main() {
   const store = new GcsBlobStore({ bucket: BUCKET, prefix })
   const seed = await ZeroPG.buildEmptySnapshot()
-  const db = await ZeroPG.open({ store, holder: 'seeder', seedSnapshot: seed, relaxedDurability: true })
+  const db = await ZeroPG.open({ store, holder: 'seeder', seedSnapshot: seed, durability: 'sleep' })
   await db.raw.exec('CREATE TABLE IF NOT EXISTS filler (id serial primary key, blob bytea not null)')
   await db.raw.exec(
     'CREATE TABLE IF NOT EXISTS notes (id serial primary key, body text not null, created_at timestamptz default now())',
@@ -46,7 +46,7 @@ async function main() {
     }
   }
   // Force a durable commit of the whole dataset.
-  ;(db as unknown as { dirty: boolean }).dirty = true
+  db.markDirty()
   const commit = await db.commit()
   const m = db.currentManifest
   await db.close()

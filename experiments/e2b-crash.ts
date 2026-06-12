@@ -18,6 +18,7 @@ import {
   type Bytes,
   type GetOptions,
   type GetResult,
+  type GetStreamResult,
   type ListEntry,
   type PutOptions,
   type PutResult,
@@ -44,12 +45,15 @@ class FaultStore implements BlobStore {
   get(key: string, opts?: GetOptions): Promise<GetResult | null> {
     return this.inner.get(key, opts)
   }
-  async put(key: string, bytes: Bytes, opts?: PutOptions): Promise<PutResult> {
+  private checkFault(key: string): void {
     const isSnapshot = key.includes('/snapshot-')
     const isManifest = key === 'manifest.json'
     if (isSnapshot && this.fault === 'kill-before-snapshot') this.die()
     if (isManifest && this.fault === 'kill-after-snapshot') this.die()
-    if (isManifest && this.fault === 'kill-during-manifest') {
+  }
+  async put(key: string, bytes: Bytes, opts?: PutOptions): Promise<PutResult> {
+    this.checkFault(key)
+    if (key === 'manifest.json' && this.fault === 'kill-during-manifest') {
       // Let the manifest PUT fully land, then SIGKILL before ZeroPG can record
       // the new etag or do post-commit bookkeeping. This exercises the "commit
       // is durable, process died right after" branch: reopen must equal the
@@ -58,6 +62,13 @@ class FaultStore implements BlobStore {
       this.die()
     }
     return this.inner.put(key, bytes, opts)
+  }
+  async putStream(key: string, source: AsyncIterable<Uint8Array>, opts?: PutOptions): Promise<PutResult> {
+    this.checkFault(key) // snapshot uploads land here now
+    return this.inner.putStream(key, source, opts)
+  }
+  getStream(key: string): Promise<GetStreamResult | null> {
+    return this.inner.getStream(key)
   }
   list(prefix: string): AsyncIterable<ListEntry> {
     return this.inner.list(prefix)
@@ -99,7 +110,7 @@ async function childMain(prefix: string, fault: Fault) {
   const v2: string[] = []
   for (let i = BASELINE_ROWS; i < BASELINE_ROWS + DELTA_ROWS; i++) v2.push(`(${i}, '${enc(i)}')`)
   await db.raw.exec(`INSERT INTO kv VALUES ${v2.join(',')}`)
-  ;(db as unknown as { dirty: boolean }).dirty = true
+  db.markDirty()
   const after = await tableChecksum(db)
   process.stdout.write(`POSTCOMMIT ${after}\n`)
   // This commit goes through the FaultStore and (for fault != none) never returns.

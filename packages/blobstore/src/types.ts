@@ -45,6 +45,13 @@ export interface GetResult {
   size: number
 }
 
+export interface GetStreamResult {
+  /** Object bytes, in order. Consume with `for await`. */
+  stream: AsyncIterable<Uint8Array>
+  etag: string
+  size: number
+}
+
 export interface ListEntry {
   key: string
   etag: string
@@ -80,4 +87,16 @@ export interface BlobStore {
   delete(key: string): Promise<void>
   /** Just the current version token of a key, or null if absent. Cheap HEAD. */
   head(key: string): Promise<{ etag: string; size: number } | null>
+  /**
+   * GET an object as an ordered byte stream without buffering it in memory.
+   * Implementations may fetch multiple ranges concurrently under the hood
+   * (pinned to one version) — large-snapshot restores live on this path.
+   */
+  getStream(key: string): Promise<GetStreamResult | null>
+  /**
+   * PUT an object from a byte stream (chunked upload, no Content-Length).
+   * Same conditional semantics as `put`. Snapshot uploads live on this path so
+   * a commit never needs the whole archive in memory.
+   */
+  putStream(key: string, source: AsyncIterable<Uint8Array>, opts?: PutOptions): Promise<PutResult>
 }

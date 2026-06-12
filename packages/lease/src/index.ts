@@ -101,6 +101,11 @@ export class Lease {
   get held(): boolean {
     return this.body !== null
   }
+  /** Milliseconds until the held lease expires (negative if already past). */
+  expiresInMs(now: number = this.now()): number {
+    if (!this.body) return -1
+    return Date.parse(this.body.expiresAt) - now
+  }
 
   private encode(body: LeaseBody): Uint8Array {
     return new TextEncoder().encode(JSON.stringify(body))

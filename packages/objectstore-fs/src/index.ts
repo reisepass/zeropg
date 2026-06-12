@@ -1,4 +1,4 @@
-export { ZeroPG, type ZeroPGOptions, type CommitInfo } from './zeropg.js'
+export { ZeroPG, type ZeroPGOptions, type CommitInfo, type Durability } from './zeropg.js'
 export {
   type Manifest,
   MANIFEST_KEY,
