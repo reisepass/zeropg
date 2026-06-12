@@ -1,0 +1,26 @@
+{
+  "name": "zeropg-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "e0": "tsx experiments/e0-primitives.ts",
+    "e1": "tsx experiments/e1-lease.ts",
+    "e2": "tsx experiments/e2-roundtrip.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.2"
+  }
+}

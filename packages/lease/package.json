@@ -1,0 +1,12 @@
+{
+  "name": "@zeropg/lease",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@zeropg/blobstore": "*"
+  }
+}

@@ -1,0 +1,5 @@
+node_modules/
+results/*.log
+._*
+.claude-command-log.jsonl
+_waltest.mjs

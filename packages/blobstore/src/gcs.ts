@@ -1,0 +1,149 @@
+// GCS JSON API transport for the BlobStore interface.
+//
+// Plain fetch, no @google-cloud/storage SDK. The one strong primitive we need
+// is the conditional precondition `ifGenerationMatch`, which GCS implements
+// atomically server-side:
+//   ifGenerationMatch=0    -> create-if-absent (fails 412 if object exists)
+//   ifGenerationMatch=<g>  -> compare-and-swap (fails 412 if current gen != g)
+//
+// The version token we expose as `etag` is the GCS object *generation* (a
+// numeric string), NOT the HTTP ETag. Generation is what the preconditions act
+// on, so that is what callers must round-trip for a correct CAS.
+
+import {
+  type BlobStore,
+  type Bytes,
+  type GetOptions,
+  type GetResult,
+  type ListEntry,
+  type PutOptions,
+  type PutResult,
+  PreconditionFailedError,
+} from './types.js'
+import { getAccessToken } from './token.js'
+
+const BASE = 'https://storage.googleapis.com'
+
+export interface GcsOptions {
+  bucket: string
+  /** Key prefix prepended to every key (no leading/trailing slash needed). */
+  prefix?: string
+  /** Override token provider (tests). Defaults to metadata/gcloud. */
+  tokenProvider?: () => Promise<string>
+}
+
+function joinPrefix(prefix: string | undefined, key: string): string {
+  if (!prefix) return key
+  const p = prefix.replace(/\/+$/, '')
+  return `${p}/${key}`
+}
+
+export class GcsBlobStore implements BlobStore {
+  private bucket: string
+  private prefix: string | undefined
+  private getToken: () => Promise<string>
+
+  constructor(opts: GcsOptions) {
+    this.bucket = opts.bucket
+    this.prefix = opts.prefix
+    this.getToken = opts.tokenProvider ?? getAccessToken
+  }
+
+  private async authHeaders(): Promise<Record<string, string>> {
+    return { Authorization: `Bearer ${await this.getToken()}` }
+  }
+
+  private fullKey(key: string): string {
+    return joinPrefix(this.prefix, key)
+  }
+
+  async get(key: string, opts?: GetOptions): Promise<GetResult | null> {
+    const name = encodeURIComponent(this.fullKey(key))
+    const url = `${BASE}/storage/v1/b/${this.bucket}/o/${name}?alt=media`
+    const headers: Record<string, string> = { ...(await this.authHeaders()) }
+    if (opts?.range) {
+      const { start, end } = opts.range
+      headers.Range = `bytes=${start}-${end ?? ''}`
+    }
+    const res = await fetch(url, { headers })
+    if (res.status === 404) return null
+    if (!res.ok) throw await gcsError(res, 'get', key)
+    const buf = new Uint8Array(await res.arrayBuffer())
+    const etag = res.headers.get('x-goog-generation') ?? ''
+    return { bytes: buf, etag, size: buf.byteLength }
+  }
+
+  async put(key: string, bytes: Bytes, opts?: PutOptions): Promise<PutResult> {
+    const name = this.fullKey(key)
+    const params = new URLSearchParams({ uploadType: 'media', name })
+    if (opts?.ifNoneMatch) params.set('ifGenerationMatch', '0')
+    else if (opts?.ifMatch !== undefined) params.set('ifGenerationMatch', opts.ifMatch)
+    const url = `${BASE}/upload/storage/v1/b/${this.bucket}/o?${params}`
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        ...(await this.authHeaders()),
+        'Content-Type': opts?.contentType ?? 'application/octet-stream',
+      },
+      body: bytes,
+    })
+    if (res.status === 412) {
+      throw new PreconditionFailedError(key, opts?.ifNoneMatch ? 'object exists' : 'generation mismatch')
+    }
+    if (!res.ok) throw await gcsError(res, 'put', key)
+    const meta = (await res.json()) as { generation: string }
+    return { etag: meta.generation }
+  }
+
+  async *list(prefix: string): AsyncIterable<ListEntry> {
+    const fullPrefix = this.fullKey(prefix)
+    let pageToken: string | undefined
+    do {
+      const params = new URLSearchParams({ prefix: fullPrefix })
+      if (pageToken) params.set('pageToken', pageToken)
+      const url = `${BASE}/storage/v1/b/${this.bucket}/o?${params}`
+      const res = await fetch(url, { headers: await this.authHeaders() })
+      if (!res.ok) throw await gcsError(res, 'list', prefix)
+      const body = (await res.json()) as {
+        items?: Array<{ name: string; generation: string; size: string }>
+        nextPageToken?: string
+      }
+      for (const item of body.items ?? []) {
+        // Strip our prefix back off so callers see the logical key.
+        const logical = this.prefix
+          ? item.name.slice(this.prefix.replace(/\/+$/, '').length + 1)
+          : item.name
+        yield { key: logical, etag: item.generation, size: Number(item.size) }
+      }
+      pageToken = body.nextPageToken
+    } while (pageToken)
+  }
+
+  async delete(key: string): Promise<void> {
+    const name = encodeURIComponent(this.fullKey(key))
+    const url = `${BASE}/storage/v1/b/${this.bucket}/o/${name}`
+    const res = await fetch(url, { method: 'DELETE', headers: await this.authHeaders() })
+    if (res.status === 404) return // idempotent
+    if (!res.ok) throw await gcsError(res, 'delete', key)
+  }
+
+  async head(key: string): Promise<{ etag: string; size: number } | null> {
+    const name = encodeURIComponent(this.fullKey(key))
+    const url = `${BASE}/storage/v1/b/${this.bucket}/o/${name}`
+    const res = await fetch(url, { headers: await this.authHeaders() })
+    if (res.status === 404) return null
+    if (!res.ok) throw await gcsError(res, 'head', key)
+    const meta = (await res.json()) as { generation: string; size: string }
+    return { etag: meta.generation, size: Number(meta.size) }
+  }
+}
+
+async function gcsError(res: Response, op: string, key: string): Promise<Error> {
+  let detail = ''
+  try {
+    detail = await res.text()
+  } catch {
+    // ignore
+  }
+  return new Error(`GCS ${op} "${key}" failed: ${res.status} ${res.statusText} ${detail.slice(0, 400)}`)
+}
