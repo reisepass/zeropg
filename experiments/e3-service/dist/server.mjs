@@ -918,6 +918,28 @@ var ZeroPG = class _ZeroPG {
     this.bootTimings.pgliteCreateMs = performance.now() - tPg;
     await this.ensureWalConfig();
     this.forceCompactNext = m.version !== 2 || !m.walFlushLsn;
+    if (!this.forceCompactNext && this.incrementalCapable && this.lastShippedLsn > 0n) {
+      try {
+        const r = await this.pg.query(
+          "SELECT pg_current_wal_flush_lsn()::text lsn"
+        );
+        const at = parseLsn(r.rows[0].lsn);
+        if (at < this.lastShippedLsn) {
+          console.error(
+            JSON.stringify({
+              event: "zeropg-wal-continuity-violation",
+              at: "boot",
+              clusterFlushLsn: formatLsn(at),
+              resumeLsn: formatLsn(this.lastShippedLsn),
+              action: "force-compact-next-commit"
+            })
+          );
+          this.forceCompactNext = true;
+        }
+      } catch {
+        this.forceCompactNext = true;
+      }
+    }
   }
   /** Overlay shipped WAL ranges onto the restored datadir: fetch concurrently
    * (small objects), verify CRC + LSN continuity, write each range into the
@@ -1216,7 +1238,19 @@ var ZeroPG = class _ZeroPG {
     const r = await this.pg.query("SELECT pg_current_wal_flush_lsn()::text lsn");
     const end = parseLsn(r.rows[0].lsn);
     const start = this.lastShippedLsn;
-    if (end <= start) return "empty";
+    if (end === start) return "empty";
+    if (end < start) {
+      console.error(
+        JSON.stringify({
+          event: "zeropg-wal-continuity-violation",
+          clusterFlushLsn: formatLsn(end),
+          resumeLsn: formatLsn(start),
+          action: "compacting"
+        })
+      );
+      this.forceCompactNext = true;
+      return null;
+    }
     const dumpMs = performance.now() - t0;
     const tUp = performance.now();
     let buf;
