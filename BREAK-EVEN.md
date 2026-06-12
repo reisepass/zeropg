@@ -61,12 +61,24 @@ Adjustments:
 
 Baseline: RDS Postgres db.t4g.micro ≈ $11.7/mo + 20GB gp3 ≈ $2.6 → **~$14.3/month** (single-AZ, on-demand).
 
-AWS has two very different compute shapes:
+The right comparison is **S3 + Fargate (ECS) scale-to-zero** - the same shape as Cloud Run: a container that's billed while running and stopped when idle. (Lambda's freeze-between-invocations model is a different compute product with its own semantics; noted at the end only as a curiosity.)
 
-- **Lambda** (1-2GB memory, ~$0.0000167/GB-s billed per-millisecond): containers are FROZEN between invocations at no charge - there is no "idle awake" billing at all. The PGlite instance stays warm in the frozen sandbox (lease TTL must tolerate freeze gaps; re-validate on thaw - same request-path pattern as E4 P1). You pay only request-duration: at 100ms/req and 2GB, ~$0.0000033/request → break-even vs RDS at **~4.3M requests/month**. Plus S3 ops at $0.005/1k PUT. **Cost-wise, Lambda + S3 essentially never loses to RDS for low-traffic apps** - the break-even is volume so high that latency/limits (15-min max duration, freeze semantics, cold restores) push you off first.
-- **Fargate** (if you need a long-lived container; 0.5 vCPU/2GB ≈ $0.029/hr): break-even vs RDS ≈ 490 hr/mo ≈ **~16 hr/day** - much friendlier than GCP because Fargate's small slices are cheap and RDS's floor is higher. An always-on Fargate (730h) at $21/mo still loses to RDS only narrowly.
+Fargate rates: $0.04048/vCPU-hr + $0.004445/GB-hr, billable in 0.25 vCPU / 0.5GB steps - much finer floors than Cloud Run's practical tiers:
 
-**AWS rule of thumb: with Lambda the answer is "you migrate for performance/limits, never for cost"; with Fargate, zeropg wins below ~16 awake-hours/day.**
+| DB size | Fargate task | $/awake-hr | break-even vs $14.3 RDS | as hr/day |
+|---|---|---|---|---|
+| ≤50 MB | 0.25 vCPU / 1GB | ~$0.0146 | 980 hr/mo > 730 → **never** (always-on ≈ $10.7/mo, still under RDS) | - |
+| ~500 MB | 0.25 vCPU / 2GB | ~$0.0190 | 752 hr/mo ≈ **never** (always-on ≈ $13.9/mo ≈ RDS) | ~24 hr/day |
+| ~1.5 GB | 0.5 vCPU / 4GB | ~$0.0380 | ~375 hr/mo | **~12.5 hr/day** |
+
+The striking result: **the smallest Fargate task running 24/7 is still cheaper than the smallest RDS** - AWS prices tiny container slices low and its managed-Postgres floor high, so for small DBs the cost crossover effectively doesn't exist; you migrate for size/latency/throughput reasons, not price. (Caveat: 0.25 vCPU makes cold starts ~4x slower than the 1 vCPU E3 numbers; that's a latency choice, not a cost one.)
+
+Two operational caveats, stated plainly:
+
+- **ECS/Fargate has no native request-driven scale-from-zero.** Cloud Run wakes on the request; ECS needs a waker (ALB + a tiny Lambda/API Gateway trigger that sets desiredCount=1, or App Runner as the managed alternative - though App Runner charges for provisioned memory while idle, ~$0.007/GB-hr, weakening the scale-to-zero story). This is an orchestration wrinkle the GCP path doesn't have, and it slightly dilutes the "no orchestrator" pitch on AWS - the waker is dumb glue, not a coordinator, but it's a moving part. The driver docs must ship the recipe.
+- Lambda footnote: frozen containers bill nothing between invocations, so S3+Lambda is even cheaper for spiky traffic - but the 15-min duration cap, freeze semantics around the lease (re-validate on thaw), and packaging constraints make it a separate, later target, not the default AWS story.
+
+**AWS rule of thumb: below ~1GB of database, zeropg on Fargate is cheaper than RDS even running 24/7 - the migration trigger on AWS is size or sustained throughput, never the bill.**
 
 ## 5. Azure: zeropg (Blob Storage + Container Apps) vs cheapest Azure Database for PostgreSQL
 
@@ -81,7 +93,7 @@ Break-even: 16/0.10 ≈ 160 hr/mo ≈ **~5.3 hr/day** (≈ 6.9 hr/day counting t
 | cloud | always-on baseline | zeropg awake-cost | break-even (after free tiers) | practical meaning |
 |---|---|---|---|---|
 | GCP | Cloud SQL micro ~$10/mo | ~$0.10/hr | **~4-5 awake-hr/day** | internal tools, side projects, per-tenant DBs: zeropg. Steady all-day traffic: Cloud SQL |
-| AWS | RDS t4g.micro ~$14/mo | Lambda: per-request only | **cost: ~never** (≈4M req/mo); migrate on limits, not cost | Lambda freeze model is zeropg's best economic fit |
+| AWS | RDS t4g.micro ~$14/mo | Fargate ~$0.015-0.019/hr (small tasks) | **cost: ~never below ~1GB DB** (smallest task 24/7 ≈ $10.7/mo < RDS) | migrate on size/throughput, never the bill; needs a scale-from-zero waker (no native one in ECS) |
 | Azure | Flexible B1ms ~$16/mo | ~$0.10/hr | **~5-7 awake-hr/day** | same shape as GCP, higher baseline floor |
 
 Secondary ceilings that bind before cost does:
