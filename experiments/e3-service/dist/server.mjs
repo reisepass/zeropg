@@ -73,6 +73,16 @@ async function getAccessToken() {
 }
 
 // packages/blobstore/src/gcs.ts
+var GCS_COST = {
+  asOf: "2026-06",
+  writeOpUsd: 5e-3 / 1e3,
+  // Class A
+  readOpUsd: 4e-4 / 1e3,
+  // Class B
+  storageGbMonthUsd: 0.02,
+  internetEgressGbUsd: 0.12,
+  maxWritesPerObjectPerSec: 1
+};
 var BASE = "https://storage.googleapis.com";
 function joinPrefix(prefix, key) {
   if (!prefix) return key;
@@ -80,6 +90,7 @@ function joinPrefix(prefix, key) {
   return `${p}/${key}`;
 }
 var GcsBlobStore = class _GcsBlobStore {
+  cost = GCS_COST;
   bucket;
   prefix;
   getToken;
@@ -200,20 +211,29 @@ var GcsBlobStore = class _GcsBlobStore {
     if (opts?.ifNoneMatch) params.set("ifGenerationMatch", "0");
     else if (opts?.ifMatch !== void 0) params.set("ifGenerationMatch", opts.ifMatch);
     const url = `${BASE}/upload/storage/v1/b/${this.bucket}/o?${params}`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        ...await this.authHeaders(),
-        "Content-Type": opts?.contentType ?? "application/octet-stream"
-      },
-      body: bytes
-    });
-    if (res.status === 412) {
-      throw new PreconditionFailedError(key, opts?.ifNoneMatch ? "object exists" : "generation mismatch");
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          ...await this.authHeaders(),
+          "Content-Type": opts?.contentType ?? "application/octet-stream"
+        },
+        body: bytes
+      });
+      if (res.status === 412) {
+        throw new PreconditionFailedError(key, opts?.ifNoneMatch ? "object exists" : "generation mismatch");
+      }
+      if ((res.status === 429 || res.status >= 500) && attempt < 5) {
+        await res.text().catch(() => {
+        });
+        const backoff = Math.min(3e3, 200 * 2 ** attempt) * (0.5 + Math.random());
+        await new Promise((r) => setTimeout(r, backoff));
+        continue;
+      }
+      if (!res.ok) throw await gcsError(res, "put", key);
+      const meta = await res.json();
+      return { etag: meta.generation };
     }
-    if (!res.ok) throw await gcsError(res, "put", key);
-    const meta = await res.json();
-    return { etag: meta.generation };
   }
   async *list(prefix) {
     const fullPrefix = this.fullKey(prefix);
@@ -231,6 +251,28 @@ var GcsBlobStore = class _GcsBlobStore {
       }
       pageToken = body.nextPageToken;
     } while (pageToken);
+  }
+  /**
+   * Server-side copy within the bucket (GCS rewrite API) — no bytes flow
+   * through the client, so copying a 500MB snapshot takes ~a second. Loops on
+   * rewriteToken as the API requires for large objects.
+   */
+  async copy(srcKey, destKey) {
+    const src = encodeURIComponent(this.fullKey(srcKey));
+    const dst = encodeURIComponent(this.fullKey(destKey));
+    let token;
+    for (; ; ) {
+      const url = `${BASE}/storage/v1/b/${this.bucket}/o/${src}/rewriteTo/b/${this.bucket}/o/${dst}` + (token ? `?rewriteToken=${encodeURIComponent(token)}` : "");
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { ...await this.authHeaders(), "Content-Type": "application/json" },
+        body: "{}"
+      });
+      if (!res.ok) throw await gcsError(res, "copy", srcKey);
+      const body = await res.json();
+      if (body.done) return { etag: body.resource?.generation ?? "" };
+      token = body.rewriteToken;
+    }
   }
   async delete(key) {
     const name = encodeURIComponent(this.fullKey(key));
@@ -659,10 +701,10 @@ async function largestFile(rootDir) {
 }
 
 // packages/objectstore-fs/src/zeropg.ts
-import { createGunzip, createGzip, gzipSync } from "node:zlib";
+import { createGunzip, createGzip, gzipSync, crc32 } from "node:zlib";
 import { Readable as Readable2 } from "node:stream";
 import * as nodeStream from "node:stream";
-import { mkdir as mkdir2, rm } from "node:fs/promises";
+import { mkdir as mkdir2, rm, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join as join2 } from "node:path";
 var compose2 = nodeStream.compose;
@@ -670,8 +712,27 @@ var SQL_WRITE = /^\s*(insert|update|delete|create|alter|drop|truncate|comment|gr
 var WAL_GUCS = [
   ["max_wal_size", "'64MB'"],
   ["min_wal_size", "'32MB'"],
-  ["wal_recycle", "off"]
+  ["wal_recycle", "off"],
+  ["wal_init_zero", "off"],
+  // Incremental shipping reads committed WAL straight off the filesystem; a
+  // commit must have write()n its WAL before it returns or the scan misses it.
+  ["synchronous_commit", "on"]
 ];
+var COMPACT_AT_WAL_BYTES = 16 * 1024 * 1024;
+var COMPACT_AT_SEGMENTS = 64;
+function parseLsn(s) {
+  const [hi, lo] = s.split("/");
+  return BigInt(parseInt(hi, 16)) << 32n | BigInt(parseInt(lo, 16));
+}
+function formatLsn(l) {
+  return `${(l >> 32n).toString(16).toUpperCase()}/${(l & 0xffffffffn).toString(16).toUpperCase()}`;
+}
+function walFileName(tli, lsn, segBytes) {
+  const segno = lsn / BigInt(segBytes);
+  const perId = 0x100000000n / BigInt(segBytes);
+  const hex = (n) => n.toString(16).toUpperCase().padStart(8, "0");
+  return hex(BigInt(tli)) + hex(segno / perId) + hex(segno % perId);
+}
 function randomGeneration() {
   const b = new Uint8Array(8);
   crypto.getRandomValues(b);
@@ -695,15 +756,34 @@ var ZeroPG = class _ZeroPG {
   flushTimer = null;
   closed = false;
   commitInFlight = null;
+  // ---- incremental WAL shipping state ----
+  /** Everything below this LSN is durable in the bucket (snapshot + shipped
+   * ranges). The next incremental commit ships [lastShippedLsn, flushLsn). */
+  lastShippedLsn = 0n;
+  /** Segment bytes shipped since the last compaction (threshold input). */
+  walBytesSinceSnapshot = 0;
+  /** WAL segment file size + timeline, validated against the live cluster. */
+  walSegBytes = 0;
+  walTli = 1;
+  /** False when this session can't do LSN-mapped shipping (function missing,
+   * or our file-name math disagrees with pg_walfile_name). */
+  incrementalCapable = false;
+  /** Force the next commit to compact (e.g. the manifest predates v2 and has
+   * no walFlushLsn to resume shipping from). */
+  forceCompactNext = false;
   constructor(opts) {
     this.store = opts.store;
     this.noLease = opts.noLease ?? false;
     this.durability = opts.durability ?? (opts.relaxedDurability ? "interval" : "strict");
     this.leaseTtlMs = opts.leaseTtlMs ?? 3e4;
     this.flushIntervalMs = opts.flushIntervalMs ?? 1e3;
+    const capPerSec = opts.store.cost?.maxWritesPerObjectPerSec;
+    this.commitIntervalMs = opts.commitIntervalMs ?? (capPerSec ? Math.ceil(1e3 / capPerSec) : 0);
     this.now = opts.now ?? Date.now;
     this.scratchBase = opts.scratchDir ?? join2(tmpdir(), "zeropg");
   }
+  commitIntervalMs;
+  lastCasAt = 0;
   /** The underlying PGlite instance (escape hatch / ORM adapters). */
   get raw() {
     return this.pg;
@@ -807,8 +887,9 @@ var ZeroPG = class _ZeroPG {
       this.flushTimer.unref?.();
     }
   }
-  /** Make `m` our state: restore its snapshot into the scratch dir and start
-   * PGlite on it. Used at boot and when the manifest moves underneath us. */
+  /** Make `m` our state: restore its snapshot into the scratch dir, overlay
+   * its WAL segments, and start PGlite on it (Postgres recovery replays the
+   * overlaid WAL). Used at boot and when the manifest moves underneath us. */
   async adoptManifest(m, etag) {
     this.manifest = m;
     this.manifestEtag = etag;
@@ -820,12 +901,99 @@ var ZeroPG = class _ZeroPG {
     }
     const tRestore = performance.now();
     this.bootTimings.snapshotBytes = await this.restoreInto(this.dataDir, m.snapshot);
+    await this.applyWalSegments(this.dataDir, m);
+    const resumeAt = m.walSegments.length ? m.walSegments[m.walSegments.length - 1].endLsn : m.walFlushLsn;
+    this.lastShippedLsn = resumeAt ? parseLsn(resumeAt) : 0n;
+    this.walSegBytes = m.walSegmentBytes ?? 0;
+    this.walTli = m.walTimeline ?? 1;
+    this.walBytesSinceSnapshot = m.walSegments.reduce(
+      (n, s) => n + Number(parseLsn(s.endLsn) - parseLsn(s.startLsn)),
+      0
+    );
     this.bootTimings.restoreMs = performance.now() - tRestore;
     const tPg = performance.now();
     this.pg = await PGlite.create({ dataDir: this.dataDir });
     await this.pg.waitReady;
     this.bootTimings.pgliteCreateMs = performance.now() - tPg;
     await this.ensureWalConfig();
+    this.forceCompactNext = m.version !== 2 || !m.walFlushLsn;
+  }
+  /** Overlay shipped WAL ranges onto the restored datadir: fetch concurrently
+   * (small objects), verify CRC + LSN continuity, write each range into the
+   * pg_wal segment file(s) it spans at the LSN-derived offsets. */
+  async applyWalSegments(dir, m) {
+    const segments = m.walSegments;
+    if (segments.length === 0) return;
+    if (!m.walFlushLsn || !m.walSegmentBytes) {
+      throw new Error("manifest has WAL segments but no walFlushLsn/walSegmentBytes");
+    }
+    const segBytes = m.walSegmentBytes;
+    const tli = m.walTimeline ?? 1;
+    let expect = parseLsn(m.walFlushLsn);
+    for (const seg of segments) {
+      if (parseLsn(seg.startLsn) !== expect) {
+        throw new Error(`WAL range gap: expected ${formatLsn(expect)}, got ${seg.startLsn} (${seg.key})`);
+      }
+      expect = parseLsn(seg.endLsn);
+    }
+    const bodies = await Promise.all(
+      segments.map(async (seg) => {
+        const obj = await this.store.get(seg.key);
+        if (!obj) throw new Error(`manifest references missing WAL segment ${seg.key}`);
+        const want = Number(parseLsn(seg.endLsn) - parseLsn(seg.startLsn));
+        if (obj.bytes.byteLength !== want) {
+          throw new Error(`WAL segment ${seg.key}: size ${obj.bytes.byteLength} != ${want}`);
+        }
+        if (crc32(obj.bytes) >>> 0 !== seg.crc32) {
+          throw new Error(`WAL segment ${seg.key}: CRC mismatch`);
+        }
+        return obj.bytes;
+      })
+    );
+    for (let i = 0; i < segments.length; i++) {
+      const body = bodies[i];
+      let pos = parseLsn(segments[i].startLsn);
+      let bodyOff = 0;
+      while (bodyOff < body.byteLength) {
+        const offInFile = Number(pos % BigInt(segBytes));
+        const take = Math.min(body.byteLength - bodyOff, segBytes - offInFile);
+        const path = join2(dir, "pg_wal", walFileName(tli, pos, segBytes));
+        const fh = await open(path, "a").then(async (h) => {
+          await h.close();
+          return open(path, "r+");
+        });
+        try {
+          await fh.write(body, bodyOff, take, offInFile);
+        } finally {
+          await fh.close();
+        }
+        pos += BigInt(take);
+        bodyOff += take;
+      }
+    }
+  }
+  /** Read WAL bytes [start, end) out of the local pg_wal segment files. */
+  async readWalRange(start, end) {
+    const out = Buffer.alloc(Number(end - start));
+    let pos = start;
+    let outOff = 0;
+    while (pos < end) {
+      const offInFile = Number(pos % BigInt(this.walSegBytes));
+      const take = Math.min(Number(end - pos), this.walSegBytes - offInFile);
+      const path = join2(this.dataDir, "pg_wal", walFileName(this.walTli, pos, this.walSegBytes));
+      const fh = await open(path, "r");
+      try {
+        const { bytesRead } = await fh.read(out, outOff, take, offInFile);
+        if (bytesRead !== take) {
+          throw new Error(`short WAL read in ${path}: ${bytesRead} < ${take} at ${offInFile}`);
+        }
+      } finally {
+        await fh.close();
+      }
+      pos += BigInt(take);
+      outOff += take;
+    }
+    return out;
   }
   /** Advance manifest.fencingToken to ours (no data change). On conflict the
    * manifest moved while we were restoring — adopt the new state and retry. */
@@ -882,35 +1050,63 @@ var ZeroPG = class _ZeroPG {
       return "gzip";
     }
   }
-  /** Persist WAL-shrinking GUCs into the datadir (travels with snapshots). */
+  /** Persist WAL GUCs into the datadir (travels with snapshots), and probe
+   * whether this session can ship WAL incrementally: the flush-LSN function
+   * must exist and our LSN->filename math must agree with the server's. */
   async ensureWalConfig() {
     try {
       const cur = await this.pg.query(
-        "SELECT setting FROM pg_settings WHERE name = 'max_wal_size'"
+        "SELECT name, setting FROM pg_settings WHERE name = 'max_wal_size'"
       );
-      if (cur.rows[0]?.setting === "64") return;
-      for (const [k, v] of WAL_GUCS) {
-        await this.pg.exec(`ALTER SYSTEM SET ${k} = ${v}`);
+      await this.pg.exec("SET synchronous_commit = on");
+      if (cur.rows[0]?.setting !== "64") {
+        for (const [k, v] of WAL_GUCS) {
+          await this.pg.exec(`ALTER SYSTEM SET ${k} = ${v}`);
+        }
+        await this.pg.query("SELECT pg_reload_conf()");
       }
-      await this.pg.query("SELECT pg_reload_conf()");
     } catch {
     }
+    try {
+      const probe = await this.pg.query(
+        `SELECT pg_current_wal_flush_lsn()::text lsn,
+                pg_walfile_name(pg_current_wal_flush_lsn())::text fname,
+                current_setting('wal_segment_size') segsz`
+      );
+      const { lsn, fname, segsz } = probe.rows[0];
+      const m = /^(\d+)\s*(MB|kB|GB)$/.exec(segsz);
+      if (!m) throw new Error(`unparseable wal_segment_size: ${segsz}`);
+      const mult = { kB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 }[m[2]];
+      this.walSegBytes = Number(m[1]) * mult;
+      this.walTli = parseInt(fname.slice(0, 8), 16);
+      const at = parseLsn(lsn);
+      const ours = walFileName(this.walTli, at, this.walSegBytes);
+      const oursPrev = walFileName(this.walTli, at > 0n ? at - 1n : 0n, this.walSegBytes);
+      this.incrementalCapable = fname === ours || fname === oursPrev;
+    } catch {
+      this.incrementalCapable = false;
+    }
   }
-  /**
-   * CHECKPOINT, then stream tar(datadir) -> gzip -> chunked PUT. The datadir is
-   * quiescent during the tar: we hold the single PGlite connection and commits
-   * are serialized behind commitInFlight.
-   */
   /** Flush dirty pages + trim pg_wal so the tar reflects the data, not the
-   * write burst. Must run BEFORE chooseCodec so the probe sees heap files. */
+   * write burst. Must run BEFORE chooseCodec so the probe sees heap files.
+   * In an incremental-capable session, also switch onto a fresh WAL segment:
+   * the post-snapshot tail then grows organically from byte 0, which is what
+   * makes size-diff shipping safe forever after. */
   async checkpointForSnapshot() {
     const t0 = performance.now();
+    let flushLsn = null;
     try {
       await this.pg.exec("CHECKPOINT");
       await this.pg.exec("CHECKPOINT");
+      if (this.incrementalCapable) {
+        const r = await this.pg.query(
+          "SELECT pg_current_wal_flush_lsn()::text lsn"
+        );
+        flushLsn = r.rows[0]?.lsn ?? null;
+      }
     } catch {
     }
-    return performance.now() - t0;
+    return { ms: performance.now() - t0, flushLsn };
   }
   async uploadSnapshot(key, codec, dumpMs) {
     const tUp = performance.now();
@@ -932,16 +1128,21 @@ var ZeroPG = class _ZeroPG {
     return `generations/${this.generation}/snapshot-${seq}.tar${codec === "gzip" ? ".gz" : ""}`;
   }
   async commitInitial() {
-    const dumpMs = await this.checkpointForSnapshot();
+    const cp = await this.checkpointForSnapshot();
     const codec = await this.chooseCodec();
     const snapshotKey = this.snapshotKeyFor(0, codec);
-    await this.uploadSnapshot(snapshotKey, codec, dumpMs);
+    await this.uploadSnapshot(snapshotKey, codec, cp.ms);
+    if (cp.flushLsn) this.lastShippedLsn = parseLsn(cp.flushLsn);
+    this.walBytesSinceSnapshot = 0;
     const m = {
-      version: 1,
+      // version 2 means "walFlushLsn is recorded": incremental shipping can
+      // resume from it. Without it the next writer compacts first.
+      version: cp.flushLsn ? 2 : 1,
       generation: this.generation,
       fencingToken: this.lease?.held ? this.lease.fencingToken : 1,
       snapshot: snapshotKey,
       walSegments: [],
+      ...cp.flushLsn ? { walFlushLsn: cp.flushLsn, walSegmentBytes: this.walSegBytes, walTimeline: this.walTli } : {},
       commitSeq: 0,
       committedAt: new Date(this.now()).toISOString()
     };
@@ -969,57 +1170,150 @@ var ZeroPG = class _ZeroPG {
     if (this.closed) throw new Error("database is closed");
     if (!this.dirty) return null;
     if (this.commitInFlight) return this.commitInFlight;
-    this.commitInFlight = this.doCommit().finally(() => {
-      this.commitInFlight = null;
-    });
+    this.commitInFlight = (async () => {
+      const wait = this.commitIntervalMs - (this.now() - this.lastCasAt);
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      try {
+        return await this.doCommit();
+      } finally {
+        this.lastCasAt = this.now();
+        this.commitInFlight = null;
+      }
+    })();
     return this.commitInFlight;
   }
   async doCommit() {
+    if (this.incrementalCapable && !this.forceCompactNext && this.manifest.version === 2 && this.manifest.walSegments.length < COMPACT_AT_SEGMENTS && this.walBytesSinceSnapshot < COMPACT_AT_WAL_BYTES) {
+      const r = await this.commitIncremental();
+      if (r) return r;
+    }
+    return this.commitSnapshot();
+  }
+  /**
+   * v1 commit: ship only the WAL bytes appended since the last commit — the
+   * LSN range [lastShippedLsn, flushLsn) — as one immutable segment object,
+   * then CAS the manifest with the new entry. O(transaction size), not
+   * O(database size). Returns null if there is nothing shippable or the local
+   * WAL no longer holds the range (caller falls back to compaction).
+   */
+  async commitIncremental() {
     const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken;
     const nextSeq = this.manifest.commitSeq + 1;
-    const checkpointMs = await this.checkpointForSnapshot();
-    const codec = await this.chooseCodec();
-    const snapshotKey = this.snapshotKeyFor(nextSeq, codec);
-    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey, codec, checkpointMs);
+    const t0 = performance.now();
+    const r = await this.pg.query("SELECT pg_current_wal_flush_lsn()::text lsn");
+    const end = parseLsn(r.rows[0].lsn);
+    const start = this.lastShippedLsn;
+    if (end <= start) return null;
+    const dumpMs = performance.now() - t0;
+    const tUp = performance.now();
+    let buf;
+    try {
+      buf = await this.readWalRange(start, end);
+    } catch {
+      return null;
+    }
+    const key = `generations/${this.generation}/wal/${String(nextSeq).padStart(8, "0")}.seg`;
+    await this.store.put(key, buf, { contentType: "application/octet-stream" });
+    const entry = {
+      key,
+      startLsn: formatLsn(start),
+      endLsn: formatLsn(end),
+      crc32: crc32(buf) >>> 0
+    };
+    const uploadMs = performance.now() - tUp;
     const m = {
       ...this.manifest,
+      version: 2,
       fencingToken: token,
-      snapshot: snapshotKey,
+      walSegments: [...this.manifest.walSegments, entry],
       commitSeq: nextSeq,
       committedAt: new Date(this.now()).toISOString()
     };
+    const manifestMs = await this.casManifest(m, token);
+    this.manifest = m;
+    this.dirty = false;
+    this.lastShippedLsn = end;
+    this.walBytesSinceSnapshot += buf.length;
+    return {
+      commitSeq: nextSeq,
+      generation: this.generation,
+      mode: "incremental",
+      snapshotKey: key,
+      snapshotBytes: buf.length,
+      segments: 1,
+      dumpMs,
+      uploadMs,
+      manifestMs
+    };
+  }
+  /** v0-style full commit, now serving as compaction + rolling backup. */
+  async commitSnapshot() {
+    const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken;
+    const nextSeq = this.manifest.commitSeq + 1;
+    const cp = await this.checkpointForSnapshot();
+    const codec = await this.chooseCodec();
+    const snapshotKey = this.snapshotKeyFor(nextSeq, codec);
+    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey, codec, cp.ms);
+    const oldSnapshot = this.manifest.snapshot;
+    const oldBackup = this.manifest.previousSnapshot;
+    const oldSegments = this.manifest.walSegments;
+    const m = {
+      ...this.manifest,
+      version: cp.flushLsn ? 2 : 1,
+      fencingToken: token,
+      snapshot: snapshotKey,
+      walSegments: [],
+      walFlushLsn: cp.flushLsn ?? void 0,
+      walSegmentBytes: cp.flushLsn ? this.walSegBytes : void 0,
+      walTimeline: cp.flushLsn ? this.walTli : void 0,
+      // The compacted-away snapshot stays as a one-generation-back backup in
+      // case something corrupts the current state. GC preserves it.
+      previousSnapshot: oldSnapshot !== snapshotKey ? oldSnapshot : oldBackup,
+      commitSeq: nextSeq,
+      committedAt: new Date(this.now()).toISOString()
+    };
+    const manifestMs = await this.casManifest(m, token);
+    this.manifest = m;
+    this.dirty = false;
+    this.forceCompactNext = false;
+    if (cp.flushLsn) this.lastShippedLsn = parseLsn(cp.flushLsn);
+    this.walBytesSinceSnapshot = 0;
+    if (oldBackup && oldBackup !== m.previousSnapshot) {
+      void this.store.delete(oldBackup).catch(() => {
+      });
+    }
+    for (const seg of oldSegments) {
+      void this.store.delete(seg.key).catch(() => {
+      });
+    }
+    return {
+      commitSeq: nextSeq,
+      generation: this.generation,
+      mode: "snapshot",
+      snapshotKey,
+      snapshotBytes,
+      segments: 0,
+      dumpMs,
+      uploadMs,
+      manifestMs
+    };
+  }
+  /** Conditional manifest swap — the one operation that IS a commit. */
+  async casManifest(m, token) {
     const tMan = performance.now();
-    let etag;
     try {
       const r = await this.store.put(MANIFEST_KEY, encodeManifest(m), {
         ifMatch: this.manifestEtag ?? void 0,
         contentType: "application/json"
       });
-      etag = r.etag;
+      this.manifestEtag = r.etag;
     } catch (e) {
       if (e instanceof PreconditionFailedError) {
         throw new FencedError(token, "manifest CAS failed at commit");
       }
       throw e;
     }
-    const manifestMs = performance.now() - tMan;
-    const prevSnapshotKey = this.manifest.snapshot;
-    this.manifest = m;
-    this.manifestEtag = etag;
-    this.dirty = false;
-    if (prevSnapshotKey && prevSnapshotKey !== snapshotKey) {
-      void this.store.delete(prevSnapshotKey).catch(() => {
-      });
-    }
-    return {
-      commitSeq: nextSeq,
-      generation: this.generation,
-      snapshotKey,
-      snapshotBytes,
-      dumpMs,
-      uploadMs,
-      manifestMs
-    };
+    return performance.now() - tMan;
   }
   /** Flush pending writes (interval/sleep mode / explicit). No-op if clean. */
   async flush() {
@@ -1111,7 +1405,7 @@ var APP_LABEL = process.env.APP_LABEL ?? "zeropg demo";
 var DURABILITY = ["strict", "interval", "sleep"].includes(
   process.env.ZEROPG_DURABILITY ?? ""
 ) ? process.env.ZEROPG_DURABILITY : "sleep";
-var IDLE_FLUSH_MS = Number(process.env.ZEROPG_IDLE_FLUSH_MS ?? 6e4);
+var IDLE_FLUSH_MS = Number(process.env.ZEROPG_IDLE_FLUSH_MS ?? 25e3);
 var PORT = Number(process.env.PORT ?? 8080);
 var INSTANCE_ID = `${process.env.K_REVISION ?? "local"}-${process.pid}`;
 function loadSeed() {
@@ -1376,8 +1670,11 @@ function renderLastWrite() {
   if (!lastWrite) return "";
   const w = lastWrite;
   const f = (n) => n < 10 ? n.toFixed(2) : String(Math.round(n));
-  const commitRows = w.commit ? `<tr><td>\xB7 checkpoint</td><td>${f(w.commit.dumpMs)} ms</td></tr>
- <tr><td>\xB7 snapshot upload (${(w.commit.snapshotBytes / 1e6).toFixed(1)} MB)</td><td>${f(w.commit.uploadMs)} ms</td></tr>
+  const fmtBytes = (n) => n < 1e6 ? `${(n / 1e3).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+  const commitRows = w.commit ? w.commit.mode === "incremental" ? `<tr><td>\xB7 WAL delta scan</td><td>${f(w.commit.dumpMs)} ms</td></tr>
+ <tr><td>\xB7 WAL segment upload (${w.commit.segments} \xD7 ${fmtBytes(w.commit.snapshotBytes)})</td><td>${f(w.commit.uploadMs)} ms</td></tr>
+ <tr><td>\xB7 manifest CAS (the actual commit)</td><td>${f(w.commit.manifestMs)} ms</td></tr>` : `<tr><td>\xB7 checkpoint + WAL switch</td><td>${f(w.commit.dumpMs)} ms</td></tr>
+ <tr><td>\xB7 snapshot upload \u2014 compaction (${fmtBytes(w.commit.snapshotBytes)})</td><td>${f(w.commit.uploadMs)} ms</td></tr>
  <tr><td>\xB7 manifest CAS (the actual commit)</td><td>${f(w.commit.manifestMs)} ms</td></tr>` : `<tr><td>\xB7 bucket upload</td><td><i>deferred \u2014 happens on ${db.durabilityMode === "interval" ? "the next interval flush" : "sleep/flush"}</i></td></tr>`;
   return `<details class="write" open><summary>last write: <b>${f(w.totalMs)} ms</b> ${w.durable ? "(durable in bucket)" : "(memory; not yet in bucket)"}</summary>
 <table>
@@ -1398,6 +1695,14 @@ async function shutdown(signal) {
     if (db) await db.close();
     console.log(
       JSON.stringify({ event: "shutdown-done", flushed: pending, ms: Math.round(performance.now() - t0) })
+    );
+  } catch (e) {
+    console.error(
+      JSON.stringify({
+        event: "shutdown-flush-failed",
+        lostPendingWrites: pending,
+        error: e instanceof Error ? `${e.name}: ${e.message}` : String(e)
+      })
     );
   } finally {
     process.exit(0);
