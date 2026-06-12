@@ -146,9 +146,12 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
   // Clean restart for cold-start measurement: exit 0 so Cloud Run does not
   // apply crash-restart backoff (unlike /_fault/abort which simulates a crash).
+  // Flushes first — in sleep mode a bare exit would drop pending writes.
   if (url.pathname === '/_restart') {
-    res.end(JSON.stringify({ restarting: true }))
-    setTimeout(() => process.exit(0), 50)
+    res.end(JSON.stringify({ restarting: true, pendingFlush: db?.pendingFlush ?? false }))
+    setTimeout(() => {
+      void (db ? db.close() : Promise.resolve()).finally(() => process.exit(0))
+    }, 50)
     return
   }
 

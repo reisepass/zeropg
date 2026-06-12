@@ -244,18 +244,15 @@ export class ZeroPG {
           `this database was migrated out to ${m.movedTo}; refusing to boot stale data`,
         )
       }
-      this.manifest = m
-      this.manifestEtag = existing.etag
-      this.generation = m.generation
       // 3a) Restore: stream bucket -> gunzip -> untar -> scratch dir.
-      const tRestore = performance.now()
-      this.bootTimings.snapshotBytes = await this.restoreInto(this.dataDir, m.snapshot)
-      this.bootTimings.restoreMs = performance.now() - tRestore
-      const tPg = performance.now()
-      this.pg = await PGlite.create({ dataDir: this.dataDir })
-      await this.pg.waitReady
-      this.bootTimings.pgliteCreateMs = performance.now() - tPg
-      await this.ensureWalConfig()
+      await this.adoptManifest(m, existing.etag)
+      // If we took the lease over, the previous holder may still be running.
+      // Stamp our fencing token into the manifest so its next commit fails
+      // the CAS immediately, instead of racing us for one final win (which
+      // would leave us serving a state it is about to replace).
+      if (this.lease?.held && this.lease.tookOver) {
+        await this.fenceStamp()
+      }
     } else {
       this.bootTimings.fresh = true
       // 3b) Fresh database. Seed from the prebuilt empty snapshot if provided
@@ -285,6 +282,50 @@ export class ZeroPG {
       // Don't keep the process alive solely for the flush timer.
       this.flushTimer.unref?.()
     }
+  }
+
+  /** Make `m` our state: restore its snapshot into the scratch dir and start
+   * PGlite on it. Used at boot and when the manifest moves underneath us. */
+  private async adoptManifest(m: Manifest, etag: string): Promise<void> {
+    this.manifest = m
+    this.manifestEtag = etag
+    this.generation = m.generation
+    if (this.pg) {
+      await this.pg.close()
+      await rm(this.dataDir, { recursive: true, force: true })
+      await mkdir(this.dataDir, { recursive: true, mode: 0o700 })
+    }
+    const tRestore = performance.now()
+    this.bootTimings.snapshotBytes = await this.restoreInto(this.dataDir, m.snapshot)
+    this.bootTimings.restoreMs = performance.now() - tRestore
+    const tPg = performance.now()
+    this.pg = await PGlite.create({ dataDir: this.dataDir })
+    await this.pg.waitReady
+    this.bootTimings.pgliteCreateMs = performance.now() - tPg
+    await this.ensureWalConfig()
+  }
+
+  /** Advance manifest.fencingToken to ours (no data change). On conflict the
+   * manifest moved while we were restoring — adopt the new state and retry. */
+  private async fenceStamp(): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const m: Manifest = { ...this.manifest, fencingToken: this.lease!.fencingToken }
+      try {
+        const { etag } = await this.store.put(MANIFEST_KEY, encodeManifest(m), {
+          ifMatch: this.manifestEtag ?? undefined,
+          contentType: 'application/json',
+        })
+        this.manifest = m
+        this.manifestEtag = etag
+        return
+      } catch (e) {
+        if (!(e instanceof PreconditionFailedError)) throw e
+        const cur = await this.store.get(MANIFEST_KEY)
+        if (!cur) throw e
+        await this.adoptManifest(decodeManifest(cur.bytes), cur.etag)
+      }
+    }
+    throw new Error('fence-stamp failed after repeated manifest races')
   }
 
   /** Stream a snapshot object into dir; returns its stored size. The key
@@ -414,16 +455,7 @@ export class ZeroPG {
         // Someone else seeded first; adopt their manifest + restore.
         const cur = await this.store.get(MANIFEST_KEY)
         if (!cur) throw e
-        const cm = decodeManifest(cur.bytes)
-        this.manifest = cm
-        this.manifestEtag = cur.etag
-        this.generation = cm.generation
-        await this.pg.close()
-        await rm(this.dataDir, { recursive: true, force: true })
-        await mkdir(this.dataDir, { recursive: true, mode: 0o700 })
-        await this.restoreInto(this.dataDir, cm.snapshot)
-        this.pg = await PGlite.create({ dataDir: this.dataDir })
-        await this.pg.waitReady
+        await this.adoptManifest(decodeManifest(cur.bytes), cur.etag)
       } else throw e
     }
   }
@@ -548,11 +580,15 @@ export class ZeroPG {
    */
   async validateLease(): Promise<boolean> {
     if (!this.lease) return true
+    // Throws FencedError if someone took the lease over. Returns false when
+    // the lease is expired but still ours (idle instance under CPU throttling
+    // never got to renew) — renew() re-arms it via CAS on our own version,
+    // which is exactly as safe as the manifest CAS that guards every commit.
     const ok = await this.lease.validate()
-    if (ok && this.lease.expiresInMs(this.now()) < this.leaseTtlMs / 2) {
+    if (!ok || this.lease.expiresInMs(this.now()) < this.leaseTtlMs / 2) {
       await this.lease.renew()
     }
-    return ok
+    return true
   }
 
   async close(): Promise<void> {

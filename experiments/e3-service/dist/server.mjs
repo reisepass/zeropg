@@ -632,6 +632,22 @@ async function* createTarStream(rootDir) {
   yield* walk("");
   yield Buffer.alloc(BLOCK * 2, 0);
 }
+async function largestFile(rootDir) {
+  let best = null;
+  async function walk(dir) {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name !== "pg_wal") await walk(p);
+      } else if (e.isFile()) {
+        const st = await stat(p);
+        if (!best || st.size > best.size) best = { path: p, size: st.size };
+      }
+    }
+  }
+  await walk(rootDir);
+  return best;
+}
 
 // packages/objectstore-fs/src/zeropg.ts
 import { createGunzip, createGzip, gzipSync } from "node:zlib";
@@ -789,12 +805,38 @@ var ZeroPG = class _ZeroPG {
       this.flushTimer.unref?.();
     }
   }
-  /** Stream a snapshot object into dir; returns its compressed size. */
+  /** Stream a snapshot object into dir; returns its stored size. The key
+   * suffix says whether it is gzipped (.tar.gz) or raw tar (.tar). */
   async restoreInto(dir, snapshotKey) {
     const src = await this.store.getStream(snapshotKey);
     if (!src) throw new Error(`manifest references missing snapshot ${snapshotKey}`);
-    await extractTarStream(compose2(Readable2.from(src.stream), createGunzip()), dir);
+    const tarStream = snapshotKey.endsWith(".gz") ? compose2(Readable2.from(src.stream), createGunzip()) : Readable2.from(src.stream);
+    await extractTarStream(tarStream, dir);
     return src.size;
+  }
+  /**
+   * Decide the snapshot codec by test-compressing a slice of the largest heap
+   * file. Incompressible data (media blobs, encrypted values, random test
+   * data) makes gzip pure CPU waste — on a 1-vCPU Cloud Run instance, deflate
+   * caps the upload at ~12MB/s while a raw PUT runs at network speed.
+   */
+  async chooseCodec() {
+    try {
+      const big = await largestFile(this.dataDir);
+      if (!big || big.size < 1024 * 1024) return "gzip";
+      const fh = await import("node:fs/promises");
+      const sample = Buffer.alloc(Math.min(big.size, 4 * 1024 * 1024));
+      const f = await fh.open(big.path, "r");
+      try {
+        await f.read(sample, 0, sample.length, 0);
+      } finally {
+        await f.close();
+      }
+      const ratio = gzipSync(sample, { level: 1 }).length / sample.length;
+      return ratio > 0.65 ? "none" : "gzip";
+    } catch {
+      return "gzip";
+    }
   }
   /** Persist WAL-shrinking GUCs into the datadir (travels with snapshots). */
   async ensureWalConfig() {
@@ -815,29 +857,41 @@ var ZeroPG = class _ZeroPG {
    * quiescent during the tar: we hold the single PGlite connection and commits
    * are serialized behind commitInFlight.
    */
-  async uploadSnapshot(key) {
+  /** Flush dirty pages + trim pg_wal so the tar reflects the data, not the
+   * write burst. Must run BEFORE chooseCodec so the probe sees heap files. */
+  async checkpointForSnapshot() {
     const t0 = performance.now();
     try {
       await this.pg.exec("CHECKPOINT");
       await this.pg.exec("CHECKPOINT");
     } catch {
     }
-    const dumpMs = performance.now() - t0;
+    return performance.now() - t0;
+  }
+  async uploadSnapshot(key, codec, dumpMs) {
     const tUp = performance.now();
     let snapshotBytes = 0;
-    const gz = compose2(Readable2.from(createTarStream(this.dataDir)), createGzip({ level: 1 }));
+    const tar = Readable2.from(createTarStream(this.dataDir));
+    const body = codec === "gzip" ? compose2(tar, createGzip({ level: 1 })) : tar;
     const counted = async function* () {
-      for await (const chunk of gz) {
+      for await (const chunk of body) {
         snapshotBytes += chunk.length;
         yield chunk;
       }
     };
-    await this.store.putStream(key, counted(), { contentType: "application/gzip" });
+    await this.store.putStream(key, counted(), {
+      contentType: codec === "gzip" ? "application/gzip" : "application/x-tar"
+    });
     return { snapshotBytes, dumpMs, uploadMs: performance.now() - tUp };
   }
+  snapshotKeyFor(seq, codec) {
+    return `generations/${this.generation}/snapshot-${seq}.tar${codec === "gzip" ? ".gz" : ""}`;
+  }
   async commitInitial() {
-    const snapshotKey = `generations/${this.generation}/snapshot-0.tar.gz`;
-    await this.uploadSnapshot(snapshotKey);
+    const dumpMs = await this.checkpointForSnapshot();
+    const codec = await this.chooseCodec();
+    const snapshotKey = this.snapshotKeyFor(0, codec);
+    await this.uploadSnapshot(snapshotKey, codec, dumpMs);
     const m = {
       version: 1,
       generation: this.generation,
@@ -888,8 +942,10 @@ var ZeroPG = class _ZeroPG {
   async doCommit() {
     const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken;
     const nextSeq = this.manifest.commitSeq + 1;
-    const snapshotKey = `generations/${this.generation}/snapshot-${nextSeq}.tar.gz`;
-    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey);
+    const checkpointMs = await this.checkpointForSnapshot();
+    const codec = await this.chooseCodec();
+    const snapshotKey = this.snapshotKeyFor(nextSeq, codec);
+    const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey, codec, checkpointMs);
     const m = {
       ...this.manifest,
       fencingToken: token,
@@ -912,13 +968,12 @@ var ZeroPG = class _ZeroPG {
       throw e;
     }
     const manifestMs = performance.now() - tMan;
-    const prevSeq = this.manifest.commitSeq;
+    const prevSnapshotKey = this.manifest.snapshot;
     this.manifest = m;
     this.manifestEtag = etag;
     this.dirty = false;
-    if (prevSeq >= 0) {
-      const prevKey = `generations/${this.generation}/snapshot-${prevSeq}.tar.gz`;
-      void this.store.delete(prevKey).catch(() => {
+    if (prevSnapshotKey && prevSnapshotKey !== snapshotKey) {
+      void this.store.delete(prevSnapshotKey).catch(() => {
       });
     }
     return {
