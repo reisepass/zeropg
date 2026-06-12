@@ -80,6 +80,7 @@ export class Lease {
 
   private etag: string | null = null
   private body: LeaseBody | null = null
+  private acquiredByTakeover = false
 
   constructor(store: BlobStore, opts: LeaseOptions) {
     this.store = store
@@ -105,6 +106,11 @@ export class Lease {
   expiresInMs(now: number = this.now()): number {
     if (!this.body) return -1
     return Date.parse(this.body.expiresAt) - now
+  }
+  /** True if acquire() took over an expired lease (a previous holder may
+   * still be running). False for a clean create-if-absent acquisition. */
+  get tookOver(): boolean {
+    return this.acquiredByTakeover
   }
 
   private encode(body: LeaseBody): Uint8Array {
@@ -143,6 +149,7 @@ export class Lease {
       })
       this.etag = etag
       this.body = body
+      this.acquiredByTakeover = false
       return freshToken
     } catch (e) {
       if (!(e instanceof PreconditionFailedError)) throw e
@@ -161,6 +168,7 @@ export class Lease {
           })
           this.etag = etag
           this.body = body
+          this.acquiredByTakeover = false
           return body.fencingToken
         } catch (e) {
           if (e instanceof PreconditionFailedError) continue
@@ -182,6 +190,7 @@ export class Lease {
         })
         this.etag = etag
         this.body = body
+        this.acquiredByTakeover = true
         return takeoverToken
       } catch (e) {
         if (e instanceof PreconditionFailedError) continue // lost the race; re-evaluate
