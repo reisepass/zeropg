@@ -11,7 +11,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { GcsBlobStore } from '@zeropg/blobstore'
-import { ZeroPG, FencedError, LockedError } from '@zeropg/objectstore-fs'
+import { ZeroPG, FencedError, LockedError, type Durability, type CommitInfo } from '@zeropg/objectstore-fs'
 
 const PROCESS_START = performance.now()
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -19,7 +19,18 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const BUCKET = process.env.ZEROPG_BUCKET ?? 'zeropg-experiments-euw1'
 const DB_PREFIX = process.env.ZEROPG_PREFIX ?? 'demo/default'
 const APP_LABEL = process.env.APP_LABEL ?? 'zeropg demo'
-const RELAXED = process.env.ZEROPG_RELAXED === '1'
+// Durability: 'sleep' (default) = writes live in memory, one snapshot upload
+// when Cloud Run tells us to sleep (SIGTERM). 'interval' = background flush
+// every second. 'strict' = every write commits to the bucket before returning.
+const DURABILITY: Durability = (['strict', 'interval', 'sleep'].includes(
+  process.env.ZEROPG_DURABILITY ?? '',
+)
+  ? process.env.ZEROPG_DURABILITY
+  : 'sleep') as Durability
+// Sleep-mode backstop: Cloud Run only grants ~10s after SIGTERM, which a large
+// snapshot upload can blow through. Flush after this much request idleness so
+// the upload normally happens while we are still alive and unhurried. 0 = off.
+const IDLE_FLUSH_MS = Number(process.env.ZEROPG_IDLE_FLUSH_MS ?? 60_000)
 const PORT = Number(process.env.PORT ?? 8080)
 const INSTANCE_ID = `${process.env.K_REVISION ?? 'local'}-${process.pid}`
 
@@ -35,13 +46,42 @@ let bootError: string | null = null
 let requestsServed = 0
 let paused = false // E4 fault injection: pause request-path lease validation
 
+/** Step-by-step timing of the most recent write (what the user asked to see). */
+interface WriteTiming {
+  at: string
+  sql: string
+  execMs: number // PGlite executing the statement (memory speed)
+  leaseMs: number // request-path lease validate/renew
+  commit: CommitInfo | null // checkpoint/upload/manifest split, when durable
+  totalMs: number
+  durable: boolean // did this write reach the bucket before responding?
+}
+let lastWrite: WriteTiming | null = null
+
+let idleTimer: NodeJS.Timeout | null = null
+function armIdleFlush() {
+  if (IDLE_FLUSH_MS <= 0 || DURABILITY !== 'sleep') return
+  if (idleTimer) clearTimeout(idleTimer)
+  idleTimer = setTimeout(() => {
+    if (db?.pendingFlush) {
+      const t0 = performance.now()
+      db.flush()
+        .then((c) =>
+          console.log(JSON.stringify({ event: 'idle-flush', ms: Math.round(performance.now() - t0), commit: c })),
+        )
+        .catch((e) => console.error(JSON.stringify({ event: 'idle-flush-error', error: String(e) })))
+    }
+  }, IDLE_FLUSH_MS)
+  idleTimer.unref?.()
+}
+
 async function boot() {
   const store = new GcsBlobStore({ bucket: BUCKET, prefix: DB_PREFIX })
   try {
     db = await ZeroPG.open({
       store,
       holder: INSTANCE_ID,
-      relaxedDurability: RELAXED,
+      durability: DURABILITY,
       leaseTtlMs: 60_000, // > Cloud Run idle windows; revalidated on the request path
       seedSnapshot: loadSeed(),
     })
@@ -113,6 +153,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
   const isColdRequest = requestsServed === 0
   requestsServed++
+  armIdleFlush()
 
   if (!db) return json(res, 503, { error: bootError ?? 'still booting' })
 
@@ -141,7 +182,9 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       bootTimings: db.bootTimings,
       requestsServed,
       fencingToken: db.fencingToken,
-      relaxed: RELAXED,
+      durability: db.durabilityMode,
+      pendingFlush: db.pendingFlush,
+      lastWrite,
       rssMB: Math.round(mem.rss / 1e6),
       ...(await dbSizeInfo()),
     })
@@ -153,9 +196,28 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       const { sql } = JSON.parse(body) as { sql: string }
       const t0 = performance.now()
       const r = await db.query(sql)
-      return json(res, 200, { rows: r.rows, ms: Math.round((performance.now() - t0) * 100) / 100 })
+      return json(res, 200, {
+        rows: r.rows,
+        ms: Math.round((performance.now() - t0) * 100) / 100,
+        execMs: Math.round(r.execMs * 100) / 100,
+        commit: r.commit,
+        durability: db.durabilityMode,
+      })
     } catch (e) {
       return json(res, 400, { error: e instanceof Error ? e.message : String(e) })
+    }
+  }
+
+  // Explicit flush: push pending writes to the bucket NOW (useful in sleep
+  // mode to see the upload cost without waiting for scale-to-zero).
+  if (url.pathname === '/flush' && req.method === 'POST') {
+    try {
+      const t0 = performance.now()
+      const commit = await db.flush()
+      return json(res, 200, { flushed: !!commit, ms: Math.round(performance.now() - t0), commit })
+    } catch (e) {
+      const status = e instanceof FencedError ? 423 : 500
+      return json(res, status, { error: e instanceof Error ? e.message : String(e) })
     }
   }
 
@@ -163,9 +225,29 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const body = await readBody(req)
     const params = new URLSearchParams(body)
     const text = (params.get('body') ?? '').slice(0, 500)
+    // Per-write override: the "make durable now" checkbox flushes the snapshot
+    // before responding, regardless of the instance's durability mode.
+    const durableNow = params.get('durable') === 'on'
     try {
-      if (!paused) await db.validateLease() // E4 bet b: validate on the request path
-      await db.query('INSERT INTO notes (body) VALUES ($1)', [text || '(empty)'])
+      const t0 = performance.now()
+      let leaseMs = 0
+      if (!paused) {
+        const tl = performance.now()
+        await db.validateLease() // E4 bet b: validate on the request path
+        leaseMs = performance.now() - tl
+      }
+      const r = await db.query('INSERT INTO notes (body) VALUES ($1)', [text || '(empty)'])
+      let commit = r.commit
+      if (durableNow && !commit) commit = await db.flush()
+      lastWrite = {
+        at: new Date().toISOString(),
+        sql: 'INSERT INTO notes (body) VALUES ($1)',
+        execMs: r.execMs,
+        leaseMs,
+        commit,
+        totalMs: performance.now() - t0,
+        durable: commit !== null,
+      }
       res.writeHead(302, { location: '/' })
       res.end()
     } catch (e) {
@@ -221,6 +303,9 @@ function renderPage(
  button{padding:.5rem 1rem;border:0;background:#1a73e8;color:#fff;border-radius:6px;cursor:pointer}
  ul{list-style:none;padding:0}li{padding:.35rem 0;border-bottom:1px solid #eee}.when{color:#999;font-size:.8rem;margin-right:.5rem}
  code{background:#f3f3f3;padding:.1rem .3rem;border-radius:4px}
+ .hint{color:#888;font-size:.85rem}.durable{display:flex;align-items:center;gap:.3rem;font-size:.85rem;color:#555;white-space:nowrap}
+ details.write{background:#f6fef6;border:1px solid #bce3bc;border-radius:8px;padding:.5rem .8rem;margin:1rem 0;font-size:.9rem}
+ details.write table{margin:.3rem 0}
 </style></head><body>
 <h1>${escapeHtml(APP_LABEL)}</h1>
 <div class="sub">A real Postgres, living in a GCS bucket. No database server. Scales to zero.</div>
@@ -230,19 +315,51 @@ ${banner}
  <tr><td>notes</td><td>${info.notes}</td></tr>
  <tr><td>filler rows</td><td>${info.fillerRows}</td></tr>
  <tr><td>cold-start total</td><td><b>${Math.round(readyMs)} ms</b></td></tr>
- <tr><td>· snapshot download</td><td>${Math.round(b.snapshotGetMs)} ms (${(b.snapshotBytes / 1e6).toFixed(1)} MB)</td></tr>
- <tr><td>· gunzip</td><td>${Math.round(b.gunzipMs)} ms</td></tr>
- <tr><td>· PGlite init + restore</td><td>${Math.round(b.pgliteCreateMs)} ms</td></tr>
+ <tr><td>· snapshot restore (download+gunzip+untar, ${(b.snapshotBytes / 1e6).toFixed(1)} MB)</td><td>${Math.round(b.restoreMs)} ms</td></tr>
+ <tr><td>· PGlite open</td><td>${Math.round(b.pgliteCreateMs)} ms</td></tr>
  <tr><td>· lease acquire</td><td>${Math.round(b.leaseMs)} ms</td></tr>
+ <tr><td>durability mode</td><td><b>${db.durabilityMode}</b>${durabilityHint()}</td></tr>
+ <tr><td>unflushed writes</td><td>${db.pendingFlush ? '⏳ in memory, upload on sleep' : '✓ none — bucket is current'}</td></tr>
  <tr><td>fencing token</td><td>${db.fencingToken ?? '—'}</td></tr>
 </table>
+${renderLastWrite()}
 <form method="post" action="/notes">
  <input type="text" name="body" placeholder="leave a note (it persists in the bucket)" maxlength="500" autofocus>
+ <label class="durable"><input type="checkbox" name="durable"> durable&nbsp;now</label>
  <button>add note</button>
 </form>
 <ul>${rows || '<li><i>no notes yet — add one, then watch it survive a scale-to-zero</i></li>'}</ul>
 <p class="sub">Powered by <code>zeropg</code>: PGlite + object storage + a conditional-write lease.</p>
 </body></html>`
+}
+
+function durabilityHint(): string {
+  switch (db.durabilityMode) {
+    case 'sleep':
+      return ' <span class="hint">— writes are memory-speed; the snapshot uploads when the instance is put to sleep</span>'
+    case 'interval':
+      return ' <span class="hint">— background flush every second (bounded loss window)</span>'
+    default:
+      return ' <span class="hint">— every write is durable in the bucket before it returns</span>'
+  }
+}
+
+function renderLastWrite(): string {
+  if (!lastWrite) return ''
+  const w = lastWrite
+  const f = (n: number) => (n < 10 ? n.toFixed(2) : String(Math.round(n)))
+  const commitRows = w.commit
+    ? `<tr><td>· checkpoint</td><td>${f(w.commit.dumpMs)} ms</td></tr>
+ <tr><td>· snapshot upload (${(w.commit.snapshotBytes / 1e6).toFixed(1)} MB)</td><td>${f(w.commit.uploadMs)} ms</td></tr>
+ <tr><td>· manifest CAS (the actual commit)</td><td>${f(w.commit.manifestMs)} ms</td></tr>`
+    : `<tr><td>· bucket upload</td><td><i>deferred — happens on ${db.durabilityMode === 'interval' ? 'the next interval flush' : 'sleep/flush'}</i></td></tr>`
+  return `<details class="write" open><summary>last write: <b>${f(w.totalMs)} ms</b> ${w.durable ? '(durable in bucket)' : '(memory; not yet in bucket)'}</summary>
+<table>
+ <tr><td>SQL execute (PGlite, in memory)</td><td>${f(w.execMs)} ms</td></tr>
+ <tr><td>lease validate/renew</td><td>${f(w.leaseMs)} ms</td></tr>
+ ${commitRows}
+ <tr><td>total request</td><td><b>${f(w.totalMs)} ms</b></td></tr>
+</table></details>`
 }
 
 function escapeHtml(s: string): string {
@@ -251,9 +368,14 @@ function escapeHtml(s: string): string {
 
 // Graceful shutdown: Cloud Run sends SIGTERM + 10s grace. Flush + release lease.
 async function shutdown(signal: string) {
-  console.log(JSON.stringify({ event: 'shutdown', signal }))
+  const pending = db?.pendingFlush ?? false
+  console.log(JSON.stringify({ event: 'shutdown', signal, pendingFlush: pending }))
+  const t0 = performance.now()
   try {
-    if (db) await db.close() // flushes pending commit + releases lease
+    if (db) await db.close() // sleep-mode flush happens here + releases lease
+    console.log(
+      JSON.stringify({ event: 'shutdown-done', flushed: pending, ms: Math.round(performance.now() - t0) }),
+    )
   } finally {
     process.exit(0)
   }

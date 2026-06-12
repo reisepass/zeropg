@@ -3,6 +3,10 @@
 # service. One image, parameterized per deployment by env vars.
 #
 #   scripts/deploy.sh <service-name> <db-prefix> <app-label> [extra gcloud run flags...]
+#
+# Env knobs:
+#   DURABILITY=sleep|interval|strict   default sleep (see server.ts)
+#   SKIP_BUILD=1                       reuse the already-pushed :latest image
 set -euo pipefail
 
 PROJECT=blob-pglite
@@ -20,25 +24,27 @@ shift 3 || true
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-echo "==> bundling service"
-npx tsx experiments/e3-service/build.mjs
+if [[ "${SKIP_BUILD:-}" != "1" ]]; then
+  echo "==> bundling service"
+  npx tsx experiments/e3-service/build.mjs
 
-echo "==> building image via Cloud Build (async; this SA can't stream logs): $IMAGE"
-# The build SA isn't a project Viewer, so gcloud can't stream logs and would
-# exit non-zero even on a successful build. Submit async and poll status.
-BUILD_ID=$(gcloud builds submit experiments/e3-service \
-  --tag "$IMAGE" --project "$PROJECT" --region "$REGION" --async \
-  --format='value(id)')
-echo "    build id: $BUILD_ID"
-while :; do
-  ST=$(gcloud builds describe "$BUILD_ID" --region "$REGION" --format='value(status)')
-  echo "    build status: $ST"
-  case "$ST" in
-    SUCCESS) break ;;
-    FAILURE|TIMEOUT|CANCELLED) echo "build failed: $ST"; exit 1 ;;
-  esac
-  sleep 10
-done
+  echo "==> building image via Cloud Build (async; this SA can't stream logs): $IMAGE"
+  # The build SA isn't a project Viewer, so gcloud can't stream logs and would
+  # exit non-zero even on a successful build. Submit async and poll status.
+  BUILD_ID=$(gcloud builds submit experiments/e3-service \
+    --tag "$IMAGE" --project "$PROJECT" --region "$REGION" --async \
+    --format='value(id)')
+  echo "    build id: $BUILD_ID"
+  while :; do
+    ST=$(gcloud builds describe "$BUILD_ID" --region "$REGION" --format='value(status)')
+    echo "    build status: $ST"
+    case "$ST" in
+      SUCCESS) break ;;
+      FAILURE|TIMEOUT|CANCELLED) echo "build failed: $ST"; exit 1 ;;
+    esac
+    sleep 10
+  done
+fi
 
 echo "==> deploying Cloud Run service: $SERVICE (prefix=$DB_PREFIX)"
 gcloud run deploy "$SERVICE" \
@@ -53,7 +59,8 @@ gcloud run deploy "$SERVICE" \
   --cpu=1 \
   --memory=1Gi \
   --timeout=60 \
-  --set-env-vars "ZEROPG_BUCKET=${BUCKET},ZEROPG_PREFIX=${DB_PREFIX},APP_LABEL=${APP_LABEL}" \
+  --cpu-boost \
+  --set-env-vars "ZEROPG_BUCKET=${BUCKET},ZEROPG_PREFIX=${DB_PREFIX},APP_LABEL=${APP_LABEL},ZEROPG_DURABILITY=${DURABILITY:-sleep}" \
   "$@"
 
 URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')

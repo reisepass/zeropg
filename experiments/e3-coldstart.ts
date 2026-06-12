@@ -75,7 +75,7 @@ async function probeService(svc: { label: string; url: string }) {
     if (metrics.coldRequest) coldConfirmed++
     endToEnd.push(ms)
     serverReady.push(metrics.readyMs)
-    snapshotGet.push(metrics.bootTimings.snapshotGetMs)
+    snapshotGet.push(metrics.bootTimings.restoreMs)
     pgliteCreate.push(metrics.bootTimings.pgliteCreateMs)
     process.stdout.write(
       `  [${i + 1}/${ITER}] e2e=${round(ms)}ms ready=${metrics.readyMs}ms cold=${metrics.coldRequest}\n`,
@@ -98,7 +98,7 @@ async function probeService(svc: { label: string; url: string }) {
     coldConfirmed,
     endToEndMs: stats(endToEnd),
     serverReadyMs: stats(serverReady),
-    snapshotGetMs: stats(snapshotGet),
+    restoreMs: stats(snapshotGet),
     pgliteCreateMs: stats(pgliteCreate),
   }
   logResult('e3-coldstart.jsonl', { probe: 'summary', ...summary })

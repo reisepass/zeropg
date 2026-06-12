@@ -10,11 +10,13 @@
 // numeric string), NOT the HTTP ETag. Generation is what the preconditions act
 // on, so that is what callers must round-trip for a correct CAS.
 
+import { Readable } from 'node:stream'
 import {
   type BlobStore,
   type Bytes,
   type GetOptions,
   type GetResult,
+  type GetStreamResult,
   type ListEntry,
   type PutOptions,
   type PutResult,
@@ -71,6 +73,105 @@ export class GcsBlobStore implements BlobStore {
     const buf = new Uint8Array(await res.arrayBuffer())
     const etag = res.headers.get('x-goog-generation') ?? ''
     return { bytes: buf, etag, size: buf.byteLength }
+  }
+
+  /** Tuning for getStream's parallel-range download. */
+  static STREAM_CHUNK_BYTES = 32 * 1024 * 1024
+  static STREAM_CONCURRENCY = 4
+
+  async getStream(key: string): Promise<GetStreamResult | null> {
+    const meta = await this.head(key)
+    if (!meta) return null
+    const name = encodeURIComponent(this.fullKey(key))
+    // Pin every range request to the generation we statted, so a concurrent
+    // overwrite can never interleave bytes from two versions.
+    const base = `${BASE}/storage/v1/b/${this.bucket}/o/${name}?alt=media&generation=${meta.etag}`
+    const auth = await this.authHeaders()
+    const CHUNK = GcsBlobStore.STREAM_CHUNK_BYTES
+    const CONC = GcsBlobStore.STREAM_CONCURRENCY
+
+    async function fetchRange(start: number, endIncl: number): Promise<Response> {
+      const res = await fetch(base, {
+        headers: { ...auth, Range: `bytes=${start}-${endIncl}` },
+      })
+      if (!(res.status === 206 || res.status === 200)) {
+        throw await gcsError(res, 'getStream', key)
+      }
+      return res
+    }
+
+    const size = meta.size
+    async function* ordered(): AsyncGenerator<Uint8Array> {
+      if (size === 0) return
+      const starts: number[] = []
+      for (let s = 0; s < size; s += CHUNK) starts.push(s)
+      // Sliding window of in-flight range requests, consumed strictly in order.
+      const inflight: Promise<Response>[] = []
+      let next = 0
+      const fill = () => {
+        while (next < starts.length && inflight.length < CONC) {
+          const s = starts[next++]
+          inflight.push(fetchRange(s, Math.min(s + CHUNK, size) - 1))
+        }
+      }
+      fill()
+      while (inflight.length > 0) {
+        const res = inflight.shift()!
+        const r = await res
+        fill()
+        if (!r.body) throw new Error(`GCS getStream "${key}": empty response body`)
+        for await (const part of r.body as unknown as AsyncIterable<Uint8Array>) {
+          yield part
+        }
+      }
+    }
+    return { stream: ordered(), etag: meta.etag, size }
+  }
+
+  async putStream(
+    key: string,
+    source: AsyncIterable<Uint8Array>,
+    opts?: PutOptions,
+  ): Promise<PutResult> {
+    // Coalesce small producer chunks (tar headers, gzip flushes) into ~1MB
+    // chunks; per-chunk HTTP framing otherwise dominates the upload time.
+    async function* coalesced(): AsyncGenerator<Uint8Array> {
+      const TARGET = 1024 * 1024
+      let buf: Uint8Array[] = []
+      let n = 0
+      for await (const c of source) {
+        buf.push(c)
+        n += c.length
+        if (n >= TARGET) {
+          yield Buffer.concat(buf, n)
+          buf = []
+          n = 0
+        }
+      }
+      if (n > 0) yield Buffer.concat(buf, n)
+    }
+    const name = this.fullKey(key)
+    const params = new URLSearchParams({ uploadType: 'media', name })
+    if (opts?.ifNoneMatch) params.set('ifGenerationMatch', '0')
+    else if (opts?.ifMatch !== undefined) params.set('ifGenerationMatch', opts.ifMatch)
+    const url = `${BASE}/upload/storage/v1/b/${this.bucket}/o?${params}`
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        ...(await this.authHeaders()),
+        'Content-Type': opts?.contentType ?? 'application/octet-stream',
+      },
+      // Chunked transfer — GCS media upload accepts bodies with no length.
+      body: Readable.toWeb(Readable.from(coalesced())) as unknown as ReadableStream,
+      // Node fetch requires explicit half-duplex for streamed request bodies.
+      ...({ duplex: 'half' } as object),
+    })
+    if (res.status === 412) {
+      throw new PreconditionFailedError(key, opts?.ifNoneMatch ? 'object exists' : 'generation mismatch')
+    }
+    if (!res.ok) throw await gcsError(res, 'putStream', key)
+    const meta = (await res.json()) as { generation: string }
+    return { etag: meta.generation }
   }
 
   async put(key: string, bytes: Bytes, opts?: PutOptions): Promise<PutResult> {
