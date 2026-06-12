@@ -1124,13 +1124,20 @@ var ZeroPG = class _ZeroPG {
     });
     return { snapshotBytes, dumpMs, uploadMs: performance.now() - tUp };
   }
-  snapshotKeyFor(seq, codec) {
-    return `generations/${this.generation}/snapshot-${seq}.tar${codec === "gzip" ? ".gz" : ""}`;
+  /** Data-object keys embed the writer's fencing token (DESIGN 4.4): a fenced
+   * zombie's in-flight upload then lands at a key nobody references, instead
+   * of overwriting the same-seq object the winner's manifest points at.
+   * (E4 P4 produced exactly that collision before tokens were embedded.) */
+  snapshotKeyFor(seq, token, codec) {
+    return `generations/${this.generation}/snapshot-${seq}-t${token}.tar${codec === "gzip" ? ".gz" : ""}`;
+  }
+  segmentKeyFor(seq, token) {
+    return `generations/${this.generation}/wal/${String(seq).padStart(8, "0")}-t${token}.seg`;
   }
   async commitInitial() {
     const cp = await this.checkpointForSnapshot();
     const codec = await this.chooseCodec();
-    const snapshotKey = this.snapshotKeyFor(0, codec);
+    const snapshotKey = this.snapshotKeyFor(0, this.lease?.held ? this.lease.fencingToken : 1, codec);
     await this.uploadSnapshot(snapshotKey, codec, cp.ms);
     if (cp.flushLsn) this.lastShippedLsn = parseLsn(cp.flushLsn);
     this.walBytesSinceSnapshot = 0;
@@ -1212,7 +1219,7 @@ var ZeroPG = class _ZeroPG {
     } catch {
       return null;
     }
-    const key = `generations/${this.generation}/wal/${String(nextSeq).padStart(8, "0")}.seg`;
+    const key = this.segmentKeyFor(nextSeq, token);
     await this.store.put(key, buf, { contentType: "application/octet-stream" });
     const entry = {
       key,
@@ -1252,7 +1259,7 @@ var ZeroPG = class _ZeroPG {
     const nextSeq = this.manifest.commitSeq + 1;
     const cp = await this.checkpointForSnapshot();
     const codec = await this.chooseCodec();
-    const snapshotKey = this.snapshotKeyFor(nextSeq, codec);
+    const snapshotKey = this.snapshotKeyFor(nextSeq, token, codec);
     const { snapshotBytes, dumpMs, uploadMs } = await this.uploadSnapshot(snapshotKey, codec, cp.ms);
     const oldSnapshot = this.manifest.snapshot;
     const oldBackup = this.manifest.previousSnapshot;

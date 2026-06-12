@@ -309,14 +309,21 @@ export class ZeroPG {
     }
 
     if (existing) {
-      const m = decodeManifest(existing.bytes)
+      // Re-read AFTER the lease is ours: acquisition can wait out a previous
+      // holder for up to acquireTimeoutMs, during which that holder may have
+      // flushed (its idle-flush backstop / SIGTERM flush CASes the manifest).
+      // Adopting the pre-wait read would serve — and on the next commit,
+      // overwrite — state older than what the bucket holds. (E4 P2 caught
+      // this live; V1-WAL-SHIPPING.md called the ordering critical.)
+      const fresh = (await this.store.get(MANIFEST_KEY)) ?? existing
+      const m = decodeManifest(fresh.bytes)
       if (m.movedTo) {
         throw new Error(
           `this database was migrated out to ${m.movedTo}; refusing to boot stale data`,
         )
       }
       // 3a) Restore: stream bucket -> gunzip -> untar -> scratch dir.
-      await this.adoptManifest(m, existing.etag)
+      await this.adoptManifest(m, fresh.etag)
       // If we took the lease over, the previous holder may still be running.
       // Stamp our fencing token into the manifest so its next commit fails
       // the CAS immediately, instead of racing us for one final win (which
@@ -710,7 +717,7 @@ export class ZeroPG {
     return this.commitInFlight
   }
 
-  private async doCommit(): Promise<CommitInfo> {
+  private async doCommit(): Promise<CommitInfo | null> {
     // Incremental unless: the session can't guarantee append-only pg_wal, the
     // booted snapshot predates that guarantee (forceCompactNext), or the
     // segment tail has outgrown the compaction thresholds.
@@ -722,8 +729,16 @@ export class ZeroPG {
       this.walBytesSinceSnapshot < COMPACT_AT_WAL_BYTES
     ) {
       const r = await this.commitIncremental()
+      if (r === 'empty') {
+        // Dirty flag with zero WAL growth (idempotent DDL like CREATE TABLE
+        // IF NOT EXISTS on an existing table): nothing user-visible changed,
+        // so there is nothing to persist. Compacting here would let any
+        // read-mostly instance rewrite the whole manifest for a no-op.
+        this.dirty = false
+        return null
+      }
       if (r) return r
-      // Zero WAL delta with dirty set, or an invariant anomaly: compact.
+      // Local WAL no longer holds the range (or an anomaly): compact.
     }
     return this.commitSnapshot()
   }
@@ -732,10 +747,11 @@ export class ZeroPG {
    * v1 commit: ship only the WAL bytes appended since the last commit — the
    * LSN range [lastShippedLsn, flushLsn) — as one immutable segment object,
    * then CAS the manifest with the new entry. O(transaction size), not
-   * O(database size). Returns null if there is nothing shippable or the local
-   * WAL no longer holds the range (caller falls back to compaction).
+   * O(database size). Returns 'empty' when the WAL did not grow (a dirty
+   * flag with no real change), or null when the local WAL no longer holds
+   * the range (caller falls back to compaction).
    */
-  private async commitIncremental(): Promise<CommitInfo | null> {
+  private async commitIncremental(): Promise<CommitInfo | 'empty' | null> {
     const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken
     const nextSeq = this.manifest.commitSeq + 1
     // No CHECKPOINT here — that would defeat the point. synchronous_commit=on
@@ -746,7 +762,7 @@ export class ZeroPG {
     const r = await this.pg.query<{ lsn: string }>('SELECT pg_current_wal_flush_lsn()::text lsn')
     const end = parseLsn(r.rows[0]!.lsn)
     const start = this.lastShippedLsn
-    if (end <= start) return null // dirty flag without WAL growth: compact to be safe
+    if (end <= start) return 'empty' // dirty flag without WAL growth: no-op
     const dumpMs = performance.now() - t0
 
     const tUp = performance.now()
