@@ -2,11 +2,83 @@
 
 **Postgres that costs zero when nobody's using it.**
 
-A real Postgres database (via [PGlite](https://pglite.dev), Postgres compiled to WASM) running on serverless compute - Cloudflare Workers, Google Cloud Run, AWS Lambda - with the data living in object storage (R2, GCS, S3). No database server, no volume, no managed Postgres bill. Single writer, enforced by a lease built on conditional writes. When your app outgrows it, switching to an always-on Postgres is one env var, because it was real Postgres all along.
+A real Postgres database ([PGlite](https://pglite.dev) — Postgres compiled to WASM) running on scale-to-zero compute, with the data living in an object-storage bucket. No database server, no volume, no managed-Postgres bill. A single writer is enforced by a lease built on the bucket's own conditional writes, with fencing tokens making zombie writers physically unable to commit. When the app outgrows it, graduation to an always-on Postgres is `pg_dump | pg_restore` — it was real Postgres all along.
 
-Think of it as: Litestream, but for Postgres, and built into the database's own filesystem layer.
+Think: **Litestream, but for Postgres** — and durability semantics you can pick per workload.
 
-Status: design phase.
+## See it live (scale-to-zero, real cold starts)
 
-- [DESIGN.md](DESIGN.md) - full architecture: prior art, the lease/fencing protocol, manifest-swap commits, generations, platform notes, roadmap.
-- [EXPERIMENTS.md](EXPERIMENTS.md) - the ordered experiment plan to validate it on Google Cloud (Cloud Run + GCS).
+| demo | database | cold start (p50 / p99, measured) |
+|---|---|---|
+| [zeropg-demo-1mb](https://zeropg-demo-1mb-71428757273.europe-west1.run.app) | 10 MB | 3.8s / 4.7s |
+| [zeropg-demo-50mb](https://zeropg-demo-50mb-71428757273.europe-west1.run.app) | 52 MB | 3.5s / 4.3s |
+| [zeropg-demo-500mb](https://zeropg-demo-500mb-71428757273.europe-west1.run.app) | 501 MB | 11.2s / 12.3s |
+
+Each page tells you whether it was served cold (instance woke from zero and restored Postgres from the bucket) or warm, with the full boot breakdown. Leave a note — it persists in the bucket across scale-to-zero. The instances are reaped after ~15 idle minutes; come back later and you'll catch a cold start.
+
+Numbers from 20 forced cold starts per size on Cloud Run (1 vCPU + startup boost, europe-west1, same-region GCS), end-to-end from the client. The split: ~2s container start (the platform's floor — it dominates for small DBs), restore pipeline scaling with size (1.3s @ 10MB → 9.1s @ 500MB), and ~0.7s PGlite open regardless of size.
+
+## How a database with no server works
+
+```
+            ┌────────────── Cloud Run / Workers / Lambda ──────────────┐
+   request →│  your app ── SQL ──> PGlite (Postgres-in-WASM, in-proc)  │
+            │                        │ datadir on /tmp                 │
+            └────────────────────────┼──────────────────────────────────┘
+                 boot: restore       │ commit: snapshot
+                 (streamed)          ▼ (streamed)
+            ┌───────────────── GCS / R2 / S3 bucket ───────────────────┐
+            │  manifest.json   ← conditional PUT = THE commit          │
+            │  lease.json      ← single writer, fencing tokens         │
+            │  generations/<id>/snapshot-N.tar[.gz]   (immutable)      │
+            └───────────────────────────────────────────────────────────┘
+```
+
+- **Cold start**: stream the snapshot out of the bucket — parallel ranged GETs → (gunzip) → untar → `/tmp` — and open PGlite on it. Nothing is buffered in memory: a 500 MB database restores with ~23 MB of JS heap. PGlite faults pages lazily, so "open" is ~0.7s at any size.
+- **Commit**: `CHECKPOINT`, stream `tar(datadir)` → (gzip) → chunked PUT, then one conditional PUT of `manifest.json`. That CAS **is** the commit: crash anywhere before it and the old state is untouched; after it, the new state is durable. Torn states are impossible by construction.
+- **Single writer**: `lease.json` is created with if-absent semantics and carries a monotonic fencing token. Every commit CASes the manifest, and takeovers stamp their token into it immediately — a zombie's next commit fails instantly. Verified live with two competing Cloud Run services.
+- **Adaptive codec**: if a sample of the data doesn't compress (media, encrypted blobs), snapshots ship as raw tar — a serverless vCPU gzips at ~12 MB/s while the NIC moves 100+ MB/s.
+
+## Durability is a dial
+
+| mode | write latency (measured, 50 MB DB) | loss window on crash |
+|---|---|---|
+| `strict` | ~7.8s (v0 ships a full snapshot per commit) | zero — ack ⇒ in the bucket |
+| `interval` | ~0.15s | ≤ flush interval (Litestream-style) |
+| `sleep` *(demo default)* | **~0.15s** | since last flush; flushes on SIGTERM + after 60s idle |
+
+`sleep` is the serverless-native mode: writes run at memory speed while traffic flows, and the snapshot uploads once, when the platform puts the instance to sleep. The demo pages show the per-step timing of the last write (SQL exec / lease check / checkpoint / upload / manifest CAS) — and a "durable now" checkbox to feel the difference per write.
+
+v1 ships WAL segments instead of snapshots: strict writes become ~100–150ms at any database size (the commit is a few KB of WAL + the manifest CAS). The architecture, layout, and API don't change — see [DESIGN.md](DESIGN.md) §4.5 and the roadmap.
+
+## Status
+
+Working v0 on real infrastructure (GCS + Cloud Run). Experiment-driven; every claim above has a JSONL of evidence in [`results/`](results/).
+
+| experiment | claim | result |
+|---|---|---|
+| E0 primitives | GCS conditional writes are a correct CAS | ✅ 0 double-winners in 2,000 races |
+| E1 lease | acquire/renew/takeover/fencing correct under contention | ✅ |
+| E2 round-trip | reopen is byte-identical at 1/10/100 MB | ✅ |
+| E2b crash matrix | SIGKILL at every commit fault point → never torn | ✅ |
+| E3 cold start | distributions above, boot-path split | ✅ |
+| E3b memory tiers | smallest container per DB size | ✅ see results |
+| E4 lifecycle | revision switches, SIGTERM flush, zombie fencing — live | ✅ |
+| E5 soak + cost | 72h realistic traffic, billed cost | pending |
+
+Hard-won platform facts: Postgres silently keeps up to 1 GB of recycled WAL in the datadir (`max_wal_size` default) — a 500 MB DB once shipped 969 MB snapshots until we pinned the WAL GUCs; Cloud Run rate-limits crash-looping containers (exit 0 on purpose-restarts); revision switches run two instances against one lease (boot must wait it out, not fail).
+
+## Layout
+
+- [`packages/blobstore`](packages/blobstore) — GCS JSON-API transport: GET/PUT/LIST/DELETE + conditional PUT (`ifGenerationMatch`), parallel-range streaming GET, chunked streaming PUT. The only strong primitive the whole design needs is the conditional PUT, so S3/R2 transports are small.
+- [`packages/lease`](packages/lease) — the writer lease: conditional-create, CAS renew/takeover, fencing tokens, zero clock-dependence for correctness.
+- [`packages/objectstore-fs`](packages/objectstore-fs) — ZeroPG itself: streaming restore/commit, durability modes, manifest-swap commits, adaptive codec, fence-stamping, GC.
+- [`experiments/`](experiments/) — the E0–E5 harnesses; [`scripts/deploy.sh`](scripts/deploy.sh) builds and ships the demo service.
+
+- [DESIGN.md](DESIGN.md) — full architecture: prior art, lease/fencing protocol, manifest-swap commits, generations, platform notes, roadmap.
+- [EXPERIMENTS.md](EXPERIMENTS.md) — the ordered experiment plan and kill criteria.
+- [pglite-stream.md](pglite-stream.md) — the "Litestream for Postgres" framing memo.
+
+## What this is not
+
+Not multi-writer, not low-latency-strict-durability (yet — v1), not for databases that don't fit in instance memory. It is for the enormous class of apps that are read-mostly, single-region, and idle 95% of the day: side projects, internal tools, per-tenant databases, preview environments. For those, the math is a bucket bill measured in cents.
