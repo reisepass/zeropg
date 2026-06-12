@@ -204,6 +204,10 @@ export class ZeroPG {
   /** False when this session can't do LSN-mapped shipping (function missing,
    * or our file-name math disagrees with pg_walfile_name). */
   private incrementalCapable = false
+  /** Cluster flush LSN right after this life's boot: WAL at or below this is
+   * recovery artifacts, not user writes — a dirty flag with no growth past it
+   * (idempotent boot DDL) must not upload anything. */
+  private lifeBaseLsn = 0n
   /** Force the next commit to compact (e.g. the manifest predates v2 and has
    * no walFlushLsn to resume shipping from). */
   private forceCompactNext = false
@@ -397,32 +401,24 @@ export class ZeroPG {
     await this.pg.waitReady
     this.bootTimings.pgliteCreateMs = performance.now() - tPg
     await this.ensureWalConfig()
-    // No walFlushLsn (pre-v2 manifest) -> nowhere to resume shipping from.
-    // One compaction records it and the database ships incrementally forever.
-    this.forceCompactNext = m.version !== 2 || !m.walFlushLsn
-    // Continuity check: recovery must have replayed through the resume point.
-    // If the cluster sits behind it, incremental shipping from here would
-    // emit ranges from a diverged stream — re-snapshot reality instead.
-    if (!this.forceCompactNext && this.incrementalCapable && this.lastShippedLsn > 0n) {
+    // WAL ranges never span writer lives (the Litestream rule: new generation
+    // per process). E4 measured why: pg_current_wal_flush_lsn() at a writer's
+    // end of life can overshoot the last replayable record by a header-sized
+    // tail (observed: resume exactly 24 bytes past the recovery end, always),
+    // so a successor resuming from the dead writer's LSN ships from a
+    // misaligned stream and a restorer silently drops the tail — acked-write
+    // loss. The first commit of every life therefore compacts (one snapshot,
+    // normally absorbed by the idle flush); all later commits in this life
+    // ship incrementally from LSNs this process measured itself.
+    this.forceCompactNext = true
+    if (this.incrementalCapable) {
       try {
         const r = await this.pg.query<{ lsn: string }>(
           'SELECT pg_current_wal_flush_lsn()::text lsn',
         )
-        const at = parseLsn(r.rows[0]!.lsn)
-        if (at < this.lastShippedLsn) {
-          console.error(
-            JSON.stringify({
-              event: 'zeropg-wal-continuity-violation',
-              at: 'boot',
-              clusterFlushLsn: formatLsn(at),
-              resumeLsn: formatLsn(this.lastShippedLsn),
-              action: 'force-compact-next-commit',
-            }),
-          )
-          this.forceCompactNext = true
-        }
+        this.lifeBaseLsn = parseLsn(r.rows[0]!.lsn)
       } catch {
-        this.forceCompactNext = true
+        this.lifeBaseLsn = 0n
       }
     }
   }
@@ -681,7 +677,10 @@ export class ZeroPG {
     const codec = await this.chooseCodec()
     const snapshotKey = this.snapshotKeyFor(0, this.lease?.held ? this.lease.fencingToken : 1, codec)
     await this.uploadSnapshot(snapshotKey, codec, cp.ms)
-    if (cp.flushLsn) this.lastShippedLsn = parseLsn(cp.flushLsn)
+    if (cp.flushLsn) {
+      this.lastShippedLsn = parseLsn(cp.flushLsn)
+      this.lifeBaseLsn = this.lastShippedLsn
+    }
     this.walBytesSinceSnapshot = 0
     const m: Manifest = {
       // version 2 means "walFlushLsn is recorded": incremental shipping can
@@ -743,9 +742,26 @@ export class ZeroPG {
   }
 
   private async doCommit(): Promise<CommitInfo | null> {
+    // Nothing real happened this life? (dirty flag from idempotent boot DDL,
+    // no WAL growth past the boot baseline) -> never upload for it; without
+    // this, compact-on-first-commit would ship a full snapshot per cold start
+    // for read-only traffic.
+    if (this.incrementalCapable && this.lifeBaseLsn > 0n) {
+      try {
+        const r = await this.pg.query<{ lsn: string }>(
+          'SELECT pg_current_wal_flush_lsn()::text lsn',
+        )
+        if (parseLsn(r.rows[0]!.lsn) <= this.lifeBaseLsn) {
+          this.dirty = false
+          return null
+        }
+      } catch {
+        // fall through to the normal paths
+      }
+    }
     // Incremental unless: the session can't guarantee append-only pg_wal, the
-    // booted snapshot predates that guarantee (forceCompactNext), or the
-    // segment tail has outgrown the compaction thresholds.
+    // first commit of this life hasn't compacted yet (forceCompactNext), or
+    // the segment tail has outgrown the compaction thresholds.
     if (
       this.incrementalCapable &&
       !this.forceCompactNext &&
