@@ -82,6 +82,7 @@ export async function applyWalSegments(store: BlobStore, dir: string, m: Manifes
       return obj.bytes
     }),
   )
+  const touched = new Set<string>()
   for (let i = 0; i < segments.length; i++) {
     const body = bodies[i]
     let pos = parseLsn(segments[i].startLsn)
@@ -90,6 +91,7 @@ export async function applyWalSegments(store: BlobStore, dir: string, m: Manifes
       const offInFile = Number(pos % BigInt(segBytes))
       const take = Math.min(body.byteLength - bodyOff, segBytes - offInFile)
       const path = join(dir, 'pg_wal', walFileName(tli, pos, segBytes))
+      touched.add(path)
       // Create-if-missing without truncating, then write at the offset.
       const fh = await open(path, 'a').then(async (h) => {
         await h.close()
@@ -102,6 +104,22 @@ export async function applyWalSegments(store: BlobStore, dir: string, m: Manifes
       }
       pos += BigInt(take)
       bodyOff += take
+    }
+  }
+  // Postgres reads WAL in full 8KB pages and treats a short read at EOF as
+  // end-of-WAL: a segment file that ends mid-page silently truncates replay
+  // at the previous page boundary (measured: a restore dropped the last 5KB
+  // of a commit — including its commit record — exactly this way). Extend
+  // every touched file to the full segment size; the zero tail is sparse on
+  // disk and reads as an invalid record, ending replay precisely at the last
+  // shipped byte, the same as the writer's own preallocated files.
+  for (const path of touched) {
+    const fh = await open(path, 'r+')
+    try {
+      const st = await fh.stat()
+      if (st.size < segBytes) await fh.truncate(segBytes)
+    } finally {
+      await fh.close()
     }
   }
 }
