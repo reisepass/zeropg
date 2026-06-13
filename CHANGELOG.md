@@ -2,6 +2,30 @@
 
 All notable changes to zeropg. Dates are UTC.
 
+## Unreleased (2026-06-13)
+
+- **WAL re-baseline on first commit of a writer life** instead of a full DB
+  snapshot. After a cold start the first durable write used to re-snapshot the
+  whole database (the generation-per-life safety rule) — ~18s / 533MB on the
+  500MB demo. It now re-ships only the WAL since the current snapshot, read
+  from the instance's own coherent on-disk stream between two clean boundaries
+  (so it never touches the dead predecessor's ragged tail LSN). Measured live:
+  the first durable write after a cold start on the 500MB demo is **349ms /
+  3MB** instead of 18s. Bounded by the compaction threshold; falls back to a
+  full snapshot when WAL-since-snapshot is too large. Full battery re-passed
+  (E2b crash, E2c, E2d, e4b) plus a new **E2f** rebaseline test.
+- **`ZeroPG.compact()`** to force a snapshot on demand; `seed-db` uses it so a
+  freshly seeded DB persists as a clean snapshot (cold-start first writes hit
+  the rebaseline fast path immediately).
+- **Read replicas** (`ZeroPGReplica`) — leaseless followers that poll the
+  manifest and converge across segments + compactions (E2d).
+- **Demo pages**: a **"put to sleep"** button that streams the flush + lease-
+  release steps with object-storage timing then exits 0 (an on-demand cold
+  start), and a **"run TPC-C benchmark"** button that streams a standard OLTP
+  benchmark (all five transactions, single-writer tpmC, ~1,330 tpmC on the
+  50MB demo) while self-capping its size to ~1.5x baseline and cleaning up
+  after.
+
 ## v1 (2026-06-12) — incremental WAL shipping
 
 The headline: **writes are O(transaction size), not O(database size).**
