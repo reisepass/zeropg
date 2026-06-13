@@ -8,13 +8,16 @@ Think: **Litestream, but for Postgres** — and durability semantics you can pic
 
 ## See it live (scale-to-zero, real cold starts)
 
-| demo | database | cold start (p50 / p99, measured) |
-|---|---|---|
-| [zeropg-demo-1mb](https://zeropg-demo-1mb-71428757273.europe-west1.run.app) | 10 MB | 3.8s / 4.7s |
-| [zeropg-demo-50mb](https://zeropg-demo-50mb-71428757273.europe-west1.run.app) | 52 MB | 3.5s / 4.3s |
-| [zeropg-demo-500mb](https://zeropg-demo-500mb-71428757273.europe-west1.run.app) | 501 MB | 11.2s / 12.3s |
+| demo | platform | database | cold start (measured) |
+|---|---|---|---|
+| [zeropg-demo-1mb](https://zeropg-demo-1mb-71428757273.europe-west1.run.app) | Cloud Run + GCS | 10 MB | 3.8s / 4.7s (p50 / p99) |
+| [zeropg-demo-50mb](https://zeropg-demo-50mb-71428757273.europe-west1.run.app) | Cloud Run + GCS | 52 MB | 3.5s / 4.3s |
+| [zeropg-demo-500mb](https://zeropg-demo-500mb-71428757273.europe-west1.run.app) | Cloud Run + GCS | 501 MB | 11.2s / 12.3s |
+| [zeropg-demo (IBM)](https://zeropg-demo.2b2pxs7e2mxy.eu-de.codeengine.appdomain.cloud) | IBM Code Engine + COS | ~5 MB | ~15s end-to-end † |
 
 Each page tells you whether it was served cold (instance woke from zero and restored Postgres from the bucket) or warm, with the full boot breakdown. Leave a note — it persists in the bucket across scale-to-zero. Two buttons let you drive it yourself: **put to sleep** streams the flush + lease-release steps (with per-step object-storage timing) and exits the instance so your next reload is a real cold start; **run TPC-C benchmark** streams a standard OLTP benchmark live against the database (single-writer tpmC, self-capping its size, then cleaning up). The instances are also reaped after ~15 idle minutes; come back later and you'll catch a cold start.
+
+**† The IBM demo is the same code, same image, same single-writer-lease-on-conditional-writes design** — just deployed to IBM Code Engine (a scale-to-zero container runtime, Cloud Run's analog) backed by IBM Cloud Object Storage. It needed no new transport code: the existing S3/SigV4 store is pointed at the COS endpoint (see [scripts/deploy-ibm.sh](scripts/deploy-ibm.sh)). Expect a heavier cold start there — Code Engine's container-scheduling floor on a true scale-from-zero is higher than Cloud Run's ~2s, so the first request can take **~15s**. Once the container is up, the in-process restore is ~4s for this small database and the durable write round-trip to COS is <100ms ([results/ibm-coldstart.jsonl](results/ibm-coldstart.jsonl); reproduced under [Track C](docs/STORAGE-BACKENDS.md)).
 
 Numbers from 20 forced cold starts per size on Cloud Run (1 vCPU + startup boost, europe-west1, same-region GCS), end-to-end from the client. The split: ~2s container start (the platform's floor — it dominates for small DBs), restore pipeline scaling with size (1.3s @ 10MB → 9.1s @ 500MB), and ~0.7s PGlite open regardless of size. Memory floor: the 500MB database runs even in a 1GiB container (datadir on tmpfs ~535MB + ~430MB RSS — tight but 5/5 stable); 2GiB is the comfortable tier, and 4GiB changes nothing because restore is bandwidth-bound, not memory-bound.
 
@@ -111,14 +114,17 @@ Hard-won platform facts: Postgres silently keeps up to 1 GB of recycled WAL in t
 - [`packages/blobstore`](packages/blobstore) — GCS JSON-API transport: GET/PUT/LIST/DELETE + conditional PUT (`ifGenerationMatch`), parallel-range streaming GET, chunked streaming PUT. The only strong primitive the whole design needs is the conditional PUT, so S3/R2 transports are small.
 - [`packages/lease`](packages/lease) — the writer lease: conditional-create, CAS renew/takeover, fencing tokens, zero clock-dependence for correctness.
 - [`packages/objectstore-fs`](packages/objectstore-fs) — ZeroPG itself: streaming restore/commit, durability modes, manifest-swap commits, adaptive codec, fence-stamping, GC.
-- [`experiments/`](experiments/) — the E0–E5 harnesses; [`scripts/deploy.sh`](scripts/deploy.sh) builds and ships the demo service.
+- [`experiments/`](experiments/) — the E0–E5 harnesses; [`scripts/deploy.sh`](scripts/deploy.sh) builds and ships the Cloud Run demo, [`scripts/deploy-ibm.sh`](scripts/deploy-ibm.sh) the IBM Code Engine + COS one.
 
 - [DESIGN.md](DESIGN.md) — full architecture: prior art, lease/fencing protocol, manifest-swap commits, generations, platform notes.
 - [V1-WAL-SHIPPING.md](V1-WAL-SHIPPING.md) — incremental commits, including the three design corrections live testing forced.
 - [STATUS.md](STATUS.md) — the experiment scoreboard and the full bug ledger.
 - [COST-MODEL.md](COST-MODEL.md) — provider cost/limit tables driving commit pacing and compaction policy.
+- [BREAK-EVEN.md](BREAK-EVEN.md) — when the bucket bill beats managed Postgres, and the traffic/size point where it stops.
+- [docs/STORAGE-BACKENDS.md](docs/STORAGE-BACKENDS.md) — per-provider atomic-primitive survey (GCS / R2 / S3 / IBM COS / Dropbox / SFTP) behind multi-cloud support; the IBM Code Engine + COS reproduction (Track C) lives here.
 - [docs/ROADMAP.md](docs/ROADMAP.md) + [docs/RESEARCH-NOTES.md](docs/RESEARCH-NOTES.md) — what's next, grounded in a survey of Litestream/LTX, LiteFS, SlateDB, Neon, and D1.
 - [EXPERIMENTS.md](EXPERIMENTS.md) — the ordered experiment plan and kill criteria.
+- [`results/`](results/) — a JSONL of evidence per experiment (E0–E5, `ibm-coldstart.jsonl`, …); every claim above traces to one.
 - [pglite-stream.md](pglite-stream.md) — the "Litestream for Postgres" framing memo.
 - [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) · MIT licensed.
 
