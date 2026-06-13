@@ -433,6 +433,43 @@ export class ZeroPG {
     return null
   }
 
+  /**
+   * Read [start, end) from local pg_wal for shipping: force the engine's FS
+   * write-back first (PGlite accounts WAL flushed ahead of physically writing
+   * it — large commits lose that race), then validate every full WAL page's
+   * self-address, retrying while write-back catches up. Returns null if the
+   * bytes never validate or the range has fallen off disk — the caller then
+   * compacts rather than ship garbage. The one read-and-trust gate both the
+   * incremental and rebaseline commit paths go through.
+   */
+  private async readShippableWal(start: bigint, end: bigint): Promise<Buffer | null> {
+    await this.pg.syncToFs()
+    let buf: Buffer
+    try {
+      buf = await this.readWalRange(start, end)
+      for (let attempt = 0; ; attempt++) {
+        const badPage = this.validateWalRange(buf, start)
+        if (badPage === null) break
+        if (attempt >= 20) {
+          console.error(
+            JSON.stringify({
+              event: 'zeropg-wal-writeback-stall',
+              badPageLsn: formatLsn(badPage),
+              range: `${formatLsn(start)}..${formatLsn(end)}`,
+              action: 'compacting',
+            }),
+          )
+          return null
+        }
+        await new Promise((r) => setTimeout(r, 25 * (attempt + 1)))
+        buf = await this.readWalRange(start, end)
+      }
+    } catch {
+      return null
+    }
+    return buf
+  }
+
   /** Read WAL bytes [start, end) out of the local pg_wal segment files. */
   private async readWalRange(start: bigint, end: bigint): Promise<Buffer> {
     const out = Buffer.alloc(Number(end - start))
@@ -702,29 +739,112 @@ export class ZeroPG {
         // fall through to the normal paths
       }
     }
-    // Incremental unless: the session can't guarantee append-only pg_wal, the
-    // first commit of this life hasn't compacted yet (forceCompactNext), or
-    // the segment tail has outgrown the compaction thresholds.
-    if (
-      this.incrementalCapable &&
-      !this.forceCompactNext &&
-      this.manifest.version === 2 &&
-      this.manifest.walSegments.length < COMPACT_AT_SEGMENTS &&
-      this.walBytesSinceSnapshot < COMPACT_AT_WAL_BYTES
-    ) {
-      const r = await this.commitIncremental()
-      if (r === 'empty') {
-        // Dirty flag with zero WAL growth (idempotent DDL like CREATE TABLE
-        // IF NOT EXISTS on an existing table): nothing user-visible changed,
-        // so there is nothing to persist. Compacting here would let any
-        // read-mostly instance rewrite the whole manifest for a no-op.
-        this.dirty = false
-        return null
+    if (this.incrementalCapable && this.manifest.version === 2) {
+      if (this.forceCompactNext) {
+        // First commit of this writer life. WAL ranges can't cross lives via
+        // the inherited resume LSN (the dead writer's flush LSN overshoots its
+        // last replayable record), so v1 re-snapshotted the whole DB here.
+        // Cheaper and equally sound: re-baseline only the WAL since the
+        // current snapshot, read from THIS instance's own coherent on-disk
+        // stream between two clean boundaries. Falls back to a full snapshot
+        // when that isn't possible (too much WAL, suspect bytes, no flush LSN).
+        const r = await this.commitRebaseline()
+        if (r) return r
+      } else if (
+        // Steady state: append this commit's WAL delta, until the tail grows
+        // past the compaction thresholds.
+        this.manifest.walSegments.length < COMPACT_AT_SEGMENTS &&
+        this.walBytesSinceSnapshot < COMPACT_AT_WAL_BYTES
+      ) {
+        const r = await this.commitIncremental()
+        if (r === 'empty') {
+          // Dirty flag with zero WAL growth (idempotent DDL like CREATE TABLE
+          // IF NOT EXISTS on an existing table): nothing user-visible changed,
+          // so there is nothing to persist. Compacting here would let any
+          // read-mostly instance rewrite the whole manifest for a no-op.
+          this.dirty = false
+          return null
+        }
+        if (r) return r
+        // Local WAL no longer holds the range (or an anomaly): compact.
       }
-      if (r) return r
-      // Local WAL no longer holds the range (or an anomaly): compact.
     }
     return this.commitSnapshot()
+  }
+
+  /**
+   * First commit of a writer life: re-ship the WAL accumulated since the
+   * current snapshot as ONE fresh segment and REPLACE the inherited segment
+   * list, instead of re-snapshotting the whole database.
+   *
+   * Why this is sound where cross-life incremental resume is not: it ships
+   * [snapshot.walFlushLsn, ourCurrentFlushLsn) — both ends are clean
+   * boundaries this instance can trust (the snapshot's own checkpoint LSN and
+   * our own post-recovery flush LSN), read from one coherent on-disk WAL
+   * stream that recovery just replayed and extended. It never relies on the
+   * dead predecessor's ragged tail LSN, which is the whole reason the
+   * per-life rule exists. The new range covers everything the inherited
+   * segments did (recovery replayed them) plus our end-of-recovery
+   * checkpoint, so replacing them drops no committed data.
+   *
+   * Cost: O(WAL since the snapshot) ≤ the compaction threshold, not O(database
+   * size) — a few KB–MB on the 500MB demo vs a 533MB snapshot. Returns null
+   * to fall back to a full snapshot when preconditions don't hold.
+   */
+  private async commitRebaseline(): Promise<CommitInfo | null> {
+    const snapFlush = this.manifest.walFlushLsn
+    if (!snapFlush) return null // pre-v2 snapshot has no resume point; must compact
+    const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken
+    const nextSeq = this.manifest.commitSeq + 1
+    const start = parseLsn(snapFlush)
+    const t0 = performance.now()
+    const r = await this.pg.query<{ lsn: string }>('SELECT pg_current_wal_flush_lsn()::text lsn')
+    const end = parseLsn(r.rows[0]!.lsn)
+    if (end <= start) return null // nothing since the snapshot — fall back
+    if (end - start > BigInt(COMPACT_AT_WAL_BYTES)) return null // too much WAL: a real snapshot restores faster
+    const dumpMs = performance.now() - t0
+
+    const tUp = performance.now()
+    const buf = await this.readShippableWal(start, end)
+    if (!buf) return null
+    const key = this.segmentKeyFor(nextSeq, token)
+    await this.store.put(key, buf, { contentType: 'application/octet-stream' })
+    const entry: WalSegment = {
+      key,
+      startLsn: formatLsn(start),
+      endLsn: formatLsn(end),
+      crc32: crc32(buf) >>> 0,
+    }
+    const uploadMs = performance.now() - tUp
+
+    const oldSegments = this.manifest.walSegments
+    const m: Manifest = {
+      ...this.manifest,
+      version: 2,
+      fencingToken: token,
+      walSegments: [entry], // REPLACE: this range supersedes + extends the inherited ones
+      commitSeq: nextSeq,
+      committedAt: new Date(this.now()).toISOString(),
+    }
+    const manifestMs = await this.casManifest(m, token)
+    this.manifest = m
+    this.dirty = false
+    this.forceCompactNext = false
+    this.lastShippedLsn = end
+    this.walBytesSinceSnapshot = Number(end - start)
+    // The inherited segments are no longer referenced (our range covers them).
+    for (const seg of oldSegments) void this.store.delete(seg.key).catch(() => {})
+    return {
+      commitSeq: nextSeq,
+      generation: this.generation,
+      mode: 'incremental',
+      snapshotKey: key,
+      snapshotBytes: buf.length,
+      segments: 1,
+      dumpMs,
+      uploadMs,
+      manifestMs,
+    }
   }
 
   /**
@@ -765,43 +885,9 @@ export class ZeroPG {
       return null
     }
     const dumpMs = performance.now() - t0
-
-    // Force the engine's FS write-back BEFORE reading the files: PGlite
-    // accounts WAL as flushed ahead of physically writing it to the host FS,
-    // and large commits lose that race (observed: a 5MB commit's mid-page
-    // bytes read back stale while the page header was already in place).
-    await this.pg.syncToFs()
     const tUp = performance.now()
-    let buf: Buffer
-    try {
-      buf = await this.readWalRange(start, end)
-      // The engine can account WAL as flushed before the bytes physically
-      // land in the host FS (large commits lose the race; observed live).
-      // Validate every page's self-address and give write-back a moment to
-      // catch up; if it never does, compact — never ship garbage.
-      for (let attempt = 0; ; attempt++) {
-        const badPage = this.validateWalRange(buf, start)
-        if (badPage === null) break
-        if (attempt >= 20) {
-          console.error(
-            JSON.stringify({
-              event: 'zeropg-wal-writeback-stall',
-              badPageLsn: formatLsn(badPage),
-              range: `${formatLsn(start)}..${formatLsn(end)}`,
-              action: 'compacting',
-            }),
-          )
-          return null
-        }
-        await new Promise((r) => setTimeout(r, 25 * (attempt + 1)))
-        buf = await this.readWalRange(start, end)
-      }
-    } catch {
-      // The range fell off the local pg_wal (an automatic checkpoint removed
-      // segments past our resume point — possible after a huge unflushed
-      // burst in sleep mode). A full snapshot is the right answer anyway.
-      return null
-    }
+    const buf = await this.readShippableWal(start, end)
+    if (!buf) return null // bytes never validated / range fell off disk -> compact
     const key = this.segmentKeyFor(nextSeq, token)
     await this.store.put(key, buf, { contentType: 'application/octet-stream' })
     const entry: WalSegment = {
@@ -917,6 +1003,24 @@ export class ZeroPG {
   /** Flush pending writes (interval/sleep mode / explicit). No-op if clean. */
   async flush(): Promise<CommitInfo | null> {
     return this.commit()
+  }
+
+  /**
+   * Force a full-snapshot compaction now: fold the current state + all shipped
+   * WAL into a fresh snapshot and empty the segment list, bounding future
+   * cold-start restore to the snapshot alone. No-op if already compact
+   * (nothing dirty and no WAL tail). Useful right after a bulk load so the
+   * persisted state is a clean snapshot rather than one giant WAL segment.
+   */
+  async compact(): Promise<CommitInfo | null> {
+    if (this.closed) throw new Error('database is closed')
+    while (this.commitInFlight) await this.commitInFlight.catch(() => {})
+    if (!this.dirty && this.manifest.walSegments.length === 0) return null
+    this.commitInFlight = this.commitSnapshot().finally(() => {
+      this.lastCasAt = this.now()
+      this.commitInFlight = null
+    })
+    return this.commitInFlight
   }
 
   /** Mark the database dirty after writes made via `raw` (bypassing exec/query). */
