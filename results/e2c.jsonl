@@ -25,3 +25,6 @@
 {"ts":"2026-06-13T10:32:29.259Z","probe":"roundtrip","latency":{"n":60,"min":120.5,"p50":579.42,"p99":2224.07,"max":2224.07,"mean":605.81},"commitWork":{"n":60,"min":97.15,"p50":127.8,"p99":1773.48,"max":1773.48,"mean":168.66},"modes":{"incremental":60,"snapshot":0},"segments":20}
 {"ts":"2026-06-13T10:32:53.349Z","probe":"compaction","commitSeq":64}
 {"ts":"2026-06-13T10:33:29.003Z","probe":"group-commit","casCount":1,"groupMs":188.67}
+{"ts":"2026-06-13T13:23:08.721Z","probe":"roundtrip","latency":{"n":60,"min":120,"p50":574.65,"p99":1281.19,"max":1281.19,"mean":585.17},"commitWork":{"n":60,"min":96.65,"p50":123.18,"p99":830,"max":830,"mean":149.42},"modes":{"incremental":60,"snapshot":0},"segments":20}
+{"ts":"2026-06-13T13:23:21.892Z","probe":"compaction","commitSeq":64}
+{"ts":"2026-06-13T13:23:38.701Z","probe":"group-commit","casCount":1,"groupMs":134.06}
