@@ -62,6 +62,7 @@ interface WriteTiming {
   durable: boolean // did this write reach the bucket before responding?
 }
 let lastWrite: WriteTiming | null = null
+let sleeping = false // a /sleep is in progress; the instance is on its way out
 
 let idleTimer: NodeJS.Timeout | null = null
 function armIdleFlush() {
@@ -217,6 +218,72 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     }
   }
 
+  // On-demand sleep: run the same flush + lease-release the SIGTERM handler
+  // runs, but STREAM each object-storage step and its timing to the client,
+  // then exit 0. The next request cold-starts a fresh instance. There is no
+  // Cloud Run API to ask the platform to SIGTERM us from inside the container;
+  // a clean self-exit is the idiom and yields the same observable cold start
+  // without the crash-restart backoff a non-zero exit triggers (see E3).
+  // No special concurrency handling: a second caller just gets told we're
+  // already on our way out; everyone else cold-starts on the fresh instance.
+  if (url.pathname === '/sleep' && req.method === 'POST') {
+    if (sleeping) return json(res, 409, { error: 'already shutting down' })
+    sleeping = true
+    res.writeHead(200, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-cache',
+      'x-content-type-options': 'nosniff', // keep proxies from buffering/ sniffing
+    })
+    const t0 = performance.now()
+    const since = () => `${Math.round(performance.now() - t0)}ms`
+    const line = (s = '') => res.write(s + '\n')
+    const fmtBytes = (n: number) => (n < 1e6 ? `${(n / 1e3).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`)
+
+    line(`💤 sleep requested — instance ${INSTANCE_ID}`)
+    line(`   bucket:    gs://${BUCKET}/${DB_PREFIX}`)
+    line(`   durability: ${db.durabilityMode}`)
+    line()
+    try {
+      if (db.pendingFlush) {
+        line(`→ flushing pending writes to object storage…`)
+        const c = await db.flush()
+        if (c && c.mode === 'incremental') {
+          line(`  · scan WAL delta                 ${Math.round(c.dumpMs)}ms`)
+          line(`  · PUT ${c.segments} WAL segment (${fmtBytes(c.snapshotBytes)})         ${Math.round(c.uploadMs)}ms`)
+          line(`  · CAS manifest.json (the commit) ${Math.round(c.manifestMs)}ms   ← durable at this instant`)
+          line(`  ✓ committed seq ${c.commitSeq} in ${since()}`)
+        } else if (c) {
+          line(`  · checkpoint + WAL switch        ${Math.round(c.dumpMs)}ms`)
+          line(`  · PUT snapshot — compaction (${fmtBytes(c.snapshotBytes)}) ${Math.round(c.uploadMs)}ms`)
+          line(`  · CAS manifest.json (the commit) ${Math.round(c.manifestMs)}ms   ← durable at this instant`)
+          line(`  ✓ committed seq ${c.commitSeq} in ${since()}`)
+        } else {
+          line(`  ✓ nothing to flush after all`)
+        }
+      } else {
+        line(`→ no pending writes — the bucket is already current`)
+        line(`  (in sleep mode, nothing uploads until there is something to flush)`)
+      }
+      line()
+      line(`→ releasing the writer lease + closing the engine…`)
+      const tc = performance.now()
+      await db.close() // flush is a no-op now; releases lease.json, clears /tmp
+      line(`  ✓ lease released, scratch dir cleared   ${Math.round(performance.now() - tc)}ms`)
+      line()
+      line(`✅ instance exiting (exit 0) after ${since()}.`)
+      line(`   the next request cold-starts a fresh instance that restores from the bucket.`)
+      line(`   reload the page to watch it wake up. 🥶`)
+    } catch (e) {
+      // A fenced flush means a successor already took the lease (e.g. you held
+      // this open past the idle-flush + TTL window). Honest about it.
+      line(`✗ ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`)
+      line(`  (a successor instance already took over; this one exits empty-handed)`)
+    }
+    res.end()
+    setTimeout(() => process.exit(0), 100) // let the last bytes reach the client
+    return
+  }
+
   // Explicit flush: push pending writes to the bucket NOW (useful in sleep
   // mode to see the upload cost without waiting for scale-to-zero).
   if (url.pathname === '/flush' && req.method === 'POST') {
@@ -315,6 +382,9 @@ function renderPage(
  .hint{color:#888;font-size:.85rem}.durable{display:flex;align-items:center;gap:.3rem;font-size:.85rem;color:#555;white-space:nowrap}
  details.write{background:#f6fef6;border:1px solid #bce3bc;border-radius:8px;padding:.5rem .8rem;margin:1rem 0;font-size:.9rem}
  details.write table{margin:.3rem 0}
+ .sleepbox{margin:1.5rem 0;border-top:1px solid #eee;padding-top:1rem}
+ #sleepbtn{background:#5f6368}#sleepbtn:disabled{opacity:.6;cursor:default}
+ #sleeplog{background:#1e1e1e;color:#d4f7d4;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:.8rem 1rem;border-radius:8px;margin:.8rem 0 0;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 </style></head><body>
 <h1>${escapeHtml(APP_LABEL)}</h1>
 <div class="sub">A real Postgres, living in a GCS bucket. No database server. Scales to zero.</div>
@@ -338,7 +408,26 @@ ${renderLastWrite()}
  <button>add note</button>
 </form>
 <ul>${rows || '<li><i>no notes yet — add one, then watch it survive a scale-to-zero</i></li>'}</ul>
+<div class="sleepbox">
+ <button type="button" id="sleepbtn">💤 put this instance to sleep</button>
+ <span class="hint">flushes to the bucket, releases the lease, exits — the next load cold-starts</span>
+ <pre id="sleeplog" hidden></pre>
+</div>
 <p class="sub">Powered by <code>zeropg</code>: PGlite + object storage + a conditional-write lease.</p>
+<script>
+const sb = document.getElementById('sleepbtn'), sl = document.getElementById('sleeplog')
+sb.addEventListener('click', async () => {
+  if (sb.dataset.done) { location.reload(); return }
+  sb.disabled = true; sb.textContent = '💤 sleeping…'; sl.hidden = false; sl.textContent = ''
+  try {
+    const res = await fetch('/sleep', { method: 'POST' })
+    const reader = res.body.getReader(), dec = new TextDecoder()
+    for (;;) { const { value, done } = await reader.read(); if (done) break
+      sl.textContent += dec.decode(value, { stream: true }); sl.scrollTop = sl.scrollHeight }
+  } catch (e) { sl.textContent += '\\n[connection closed — the instance is gone]' }
+  sb.disabled = false; sb.dataset.done = '1'; sb.textContent = '↻ reload to wake it (cold start)'
+})
+</script>
 </body></html>`
 }
 
