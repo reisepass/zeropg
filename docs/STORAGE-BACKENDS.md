@@ -83,7 +83,13 @@ off zeropg anyway.
 ## Build order
 
 1. **R2** (Track B) — free, zero egress, confirmed.
-2. **IBM COS** — 25GB free + full CAS; verify the `If-None-Match: *` wildcard.
+2. **IBM COS** — 25GB free + full CAS. **Confirmed and shipped (Track C, 2026-06-13):**
+   the `If-None-Match: *` wildcard and `If-Match` CAS both pass against COS through
+   the existing `R2BlobStore` (S3/SigV4) with zero new transport code, and the full
+   demo runs on **IBM Code Engine + COS** at
+   <https://zeropg-demo.2b2pxs7e2mxy.eu-de.codeengine.appdomain.cloud> — cold-restore
+   byte-identical, CAS lease handoff intact ([results/ibm-coldstart.jsonl](../results/ibm-coldstart.jsonl),
+   [scripts/deploy-ibm.sh](../scripts/deploy-ibm.sh)).
 3. **Numbered manifests** (Track A #2) — unlocks create-if-absent-only backends;
    also fixes the GCS rate cap. Prerequisite for the next two.
 4. **SFTP** — then Hetzner Storage Box (1TB/€3.20) is a real story.
