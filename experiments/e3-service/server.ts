@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { GcsBlobStore } from '@zeropg/blobstore'
 import { ZeroPG, FencedError, LockedError, type Durability, type CommitInfo } from '@zeropg/objectstore-fs'
+import { runBenchmark } from './bench.js' // BENCH: TPC-C engine (additive feature)
 
 const PROCESS_START = performance.now()
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -63,6 +64,7 @@ interface WriteTiming {
 }
 let lastWrite: WriteTiming | null = null
 let sleeping = false // a /sleep is in progress; the instance is on its way out
+let benching = false // BENCH: a /bench run is in progress (one at a time)
 
 let idleTimer: NodeJS.Timeout | null = null
 function armIdleFlush() {
@@ -216,6 +218,32 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     } catch (e) {
       return json(res, 400, { error: e instanceof Error ? e.message : String(e) })
     }
+  }
+
+  // BENCH: run a TPC-C OLTP benchmark against the live PGlite DB and STREAM
+  // progress (tpmC / throughput / latency percentiles / live DB size / rows
+  // trimmed) to the client, exactly like /sleep streams its flush steps. The
+  // engine (bench.ts) records pg_database_size as a baseline and trims its own
+  // tables so total DB never exceeds ~2x baseline, then drops them at the end.
+  if (url.pathname === '/bench' && req.method === 'POST') {
+    if (benching) return json(res, 409, { error: 'benchmark already running' })
+    benching = true
+    res.writeHead(200, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-cache',
+      'x-content-type-options': 'nosniff', // keep proxies from buffering/sniffing
+    })
+    const line = (s = '') => res.write(s + '\n')
+    try {
+      const durationMs = Math.min(60_000, Math.max(5_000, Number(url.searchParams.get('seconds') ?? 25) * 1000))
+      await runBenchmark(db, { durationMs }, line)
+    } catch (e) {
+      line(`✗ ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`)
+    } finally {
+      benching = false
+      res.end()
+    }
+    return
   }
 
   // On-demand sleep: run the same flush + lease-release the SIGTERM handler
@@ -388,6 +416,9 @@ function renderPage(
  .sleepbox{margin:1.5rem 0;border-top:1px solid #eee;padding-top:1rem}
  #sleepbtn{background:#5f6368}#sleepbtn:disabled{opacity:.6;cursor:default}
  #sleeplog{background:#1e1e1e;color:#d4f7d4;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:.8rem 1rem;border-radius:8px;margin:.8rem 0 0;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+ /* BENCH: TPC-C benchmark button + live log (mirrors the sleep box) */
+ #benchbtn{background:#0b8043}#benchbtn:disabled{opacity:.6;cursor:default}
+ #benchlog{background:#1e1e1e;color:#cfe8ff;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:.8rem 1rem;border-radius:8px;margin:.8rem 0 0;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 </style></head><body>
 <h1>${escapeHtml(APP_LABEL)}</h1>
 <div class="sub">A real Postgres, living in a GCS bucket. No database server. Scales to zero.</div>
@@ -416,6 +447,11 @@ ${renderLastWrite()}
  <span class="hint">flushes to the bucket, releases the lease, exits — the next load cold-starts</span>
  <pre id="sleeplog" hidden></pre>
 </div>
+<div class="sleepbox">
+ <button type="button" id="benchbtn">🏎 run TPC-C benchmark</button>
+ <span class="hint">a standard OLTP benchmark vs this PGlite DB, streamed live — self-caps its size, then cleans up</span>
+ <pre id="benchlog" hidden></pre>
+</div>
 <p class="sub">Powered by <code>zeropg</code>: PGlite + object storage + a conditional-write lease.</p>
 <script>
 const sb = document.getElementById('sleepbtn'), sl = document.getElementById('sleeplog')
@@ -429,6 +465,18 @@ sb.addEventListener('click', async () => {
       sl.textContent += dec.decode(value, { stream: true }); sl.scrollTop = sl.scrollHeight }
   } catch (e) { sl.textContent += '\\n[connection closed — the instance is gone]' }
   sb.disabled = false; sb.dataset.done = '1'; sb.textContent = '↻ reload to wake it (cold start)'
+})
+// BENCH: stream the TPC-C benchmark into its log pane (same reader loop as sleep).
+const bb = document.getElementById('benchbtn'), bl = document.getElementById('benchlog')
+bb.addEventListener('click', async () => {
+  bb.disabled = true; bb.textContent = '🏎 benchmarking…'; bl.hidden = false; bl.textContent = ''
+  try {
+    const res = await fetch('/bench', { method: 'POST' })
+    const reader = res.body.getReader(), dec = new TextDecoder()
+    for (;;) { const { value, done } = await reader.read(); if (done) break
+      bl.textContent += dec.decode(value, { stream: true }); bl.scrollTop = bl.scrollHeight }
+  } catch (e) { bl.textContent += '\\n[connection closed]' }
+  bb.disabled = false; bb.textContent = '🏎 run TPC-C benchmark again'
 })
 </script>
 </body></html>`
