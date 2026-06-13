@@ -127,9 +127,11 @@ Step 1 concluded reads ARE interceptable, so this step ran.
   table, externalize its relation file, zero the datadir copy, reboot with
   `LazyFS` and re-run the query.
 
-### Result: the read intercept is PROVEN; full-boot VFS is incomplete
+### Result: the end-to-end lazy boot POC now PASSES
 
-**`intercept-unit.mjs` PASSES** (`node experiments/lazy-restore-spike/intercept-unit.mjs`):
+Both the unit-level read proof AND the full PGlite-boot-to-query POC pass.
+
+**`intercept-unit.mjs` PASSES** (read-method contract):
 
 | check | result |
 |---|---|
@@ -139,49 +141,84 @@ Step 1 concluded reads ARE interceptable, so this step ran.
 | non-intercepted file reads straight from datadir | correct |
 | mid-file sub-block read (offset 12345, len 3000) | byte-correct |
 
-Because the datadir copy of the relation was **overwritten with zeros**, the
-only way to get correct bytes is the intercept actually firing and supplying
-them. It does. This proves the load-bearing claim of Step 3: we own the
-synchronous read and can supply byte-identical data from an alternate source,
-exactly through the method pglite calls.
+**`intercept-poc.mjs` PASSES end-to-end** (real PGlite, 50,000-row table whose
+relation file `base/5/16384` is 2,613,248 bytes = 319 x 8KB heap blocks; the
+datadir copy is ZEROED, so only a working fault path can return correct data):
 
-**The full end-to-end PGlite boot (`intercept-poc.mjs`) does NOT yet pass.** The
-blocker is unrelated to read interception: a from-scratch writable `BaseFilesystem`
-must satisfy Postgres's boot/create path, and `LazyFS`'s file-creation path is
-incomplete. Concretely, Postgres's create of `postmaster.pid` (and during initdb,
-`PG_VERSION`) fails with `Bad file descriptor`. Tracing shows
-`BaseFilesystem.writeFile` (the `node_ops.mknod` hook) is **never invoked** for
-these new files during boot, so `stream_ops.open` leaves `stream.nfd` undefined
-and the subsequent write hits an undefined fd -> EBADF. The conf-file and
-PG_VERSION READS during boot DO route correctly through `LazyFS` (observed in the
-debug trace), confirming the read hook itself is wired right; the gap is purely
-the file-CREATE/mode handling on the write side.
+| query shape | result match | faulted reads | faulted bytes |
+|---|---|---|---|
+| aggregate (count/sum/min/max) | yes | 23 | 2,613,248 (whole relation) |
+| point lookup (`WHERE id = 41234`) | yes | **1** | 8,192 (one block) |
+| indexed range (`id BETWEEN ...`) | yes | 2 | 16,384 |
+| full-scan filter (`WHERE v = 0`) | yes | 23 | 2,613,248 |
+| full row set (`ORDER BY id`, sha256) | yes (hash match) | 319 | every block |
 
-This is an FS-completeness engineering task, **orthogonal to the spike's
-kill-criterion** (which is about read interceptability, already proven in Step 1
-from source and in `intercept-unit.mjs` at runtime). The fix is to mirror
-`OpfsAhpFS`'s node creation precisely (it maintains its own node tree with
-explicit `INITIAL_MODE.FILE = 32768` mode bits so `FS.isFile(node.mode)` is true
-on a freshly created file) rather than leaning on `node:fs` + `lstat` for newly
-mknod'd files. That, or seed the datadir via `loadDataDir` so no files are
-created through the custom FS during boot. Either is a follow-up, not a
-re-architecture.
+Every result is byte-identical to the full-restore baseline, including a sha256
+over the entire ordered row set. The point lookup faulting **1 block out of 319**
+while the full scan faults all 319 is exactly the working-set-driven TTFQ win the
+design predicts: lazy restore pays only for what the first query touches.
 
-### What Step 3 proves vs leaves open
+Postgres reads heap pages from the relation in ~128KB runs for sequential access
+(23 faults x ~114KB avg => the full 2.6MB), and a single 8KB block for the point
+lookup. The faults are served from the local "remote" store through
+`LazyFS.read()` - the exact method pglite's `stream_ops.read` calls.
 
-- PROVEN: the intercept fires through pglite's actual read method and returns
-  byte-identical data from an alternate store; non-target files are unaffected;
-  partial/offset reads are correct. Combined with the Step 1 source proof that
-  pglite invokes exactly this method, the read-side cold-start mechanism is
-  validated end-to-end at the read layer.
-- OPEN: a complete, boot-capable custom VFS (the write/create path). Needed
-  before a real PGlite boots on sparse placeholders + intercept. Tractable;
-  mirror `OpfsAhpFS`'s node-mode handling or seed via `loadDataDir`.
+### What the write-path fix turned out to be
+
+The earlier `postmaster.pid` / `PG_VERSION` `Bad file descriptor` failure had
+three compounding causes, all fixed by rewriting `LazyFS` to mirror `OpfsAhpFS`:
+
+1. **String errno codes.** The old `FsError` set `this.code = 'ENOENT'` (a
+   string). pglite's `tryFSOperation` (`src/fs/base.ts:251`) forwards `e.code`
+   straight into `new FS.ErrnoError(e.code)`, which expects a **number**. A
+   string errno produced a malformed `ErrnoError` that corrupted emscripten's
+   create/open path. Fix: `FsError` maps string codes to numbers via
+   `ERRNO_CODES[code]` (exactly as OpfsAhpFS's `FsError` does).
+2. **No own node tree / wrong mode bits.** The old version leaned on `node:fs` +
+   `lstat` and never guaranteed `FS.isFile(node.mode)` for freshly created files.
+   Fix: keep an in-memory node tree with explicit `INITIAL_MODE.FILE` (S_IFREG)
+   and `INITIAL_MODE.DIR` (S_IFDIR) set in `writeFile` (the `node_ops.mknod`
+   hook) so a brand-new node is unambiguously a regular file and
+   `stream_ops.open` sets `stream.nfd`.
+3. **Missing permission bits.** `INITIAL_MODE` started as bare `16384`/`32768`
+   (type bits, zero rwx). initdb then failed with `could not access directory
+   "/pglite/data": Permission denied`. Fix: `DIR = 16384 | 0o755`,
+   `FILE = 32768 | 0o644` so Postgres's `access()` checks pass.
+
+With those, `LazyFS` boots fresh (runs initdb), boots an existing
+NodeFS-created datadir, and boots a datadir with a zeroed relation - all
+returning correct query results. The backing store is still a real local
+datadir per file, so the fixture can pre-seed and zero individual relation files.
+
+### What Step 3 proves now
+
+- PROVEN end-to-end: a real PGlite boots on a datadir whose large relation
+  segment is zeroed; queries fault the missing blocks on demand through
+  `LazyFS.read()` (served from a local store) and return byte-identical results
+  - including a full-row-set hash - vs full restore. The read-side cold-start
+  mechanism is validated boot-to-query.
+- The fault counts directly demonstrate the TTFQ thesis (point lookup: 1 block;
+  full scan: all 319). The Phase-2 sweep quantifies when this beats eager.
+
+### New gotchas surfaced
+
+- Postgres issues **multi-block sequential reads** (~128KB / 16 blocks per
+  `pread` here), not strictly one 8KB block at a time. Good for us: coalescing is
+  partly done by Postgres itself, so the object-layer page-group does not have to
+  be the only coalescer. The page-group still matters for prefetch and for turning
+  remaining gaps into single range GETs.
+- `writeFile` receives `data` that may be a string, a Uint8Array, or an
+  ArrayBuffer view; the impl normalizes all three. `write` receives the raw WASM
+  heap ArrayBuffer (not a typed view) - handled by constructing a view over
+  `[offset, offset+length)`.
+- The intercept currently opens/closes the remote backing file per `read`. Fine
+  for the POC; a real impl would keep a handle/connection and coalesce via the
+  page-group + SAB bridge.
 
 ### Reproduce
 
 ```
-node experiments/lazy-restore-spike/intercept-unit.mjs   # PASSES - the read-intercept proof
-node experiments/lazy-restore-spike/intercept-poc.mjs    # full boot - fails at postmaster.pid create (write-path VFS gap)
+node experiments/lazy-restore-spike/intercept-unit.mjs   # PASSES - read-method contract
+node experiments/lazy-restore-spike/intercept-poc.mjs    # PASSES - full boot-to-query, zeroed relation
 ```
 
