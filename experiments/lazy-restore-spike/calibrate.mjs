@@ -40,6 +40,8 @@ const HERE = dirname(new URL(import.meta.url).pathname)
 const outFile = process.argv[2] || join(HERE, 'footprints.jsonl')
 const TRIALS = Number(process.argv[3] || 6)
 const MAX_SIZE_MB = Number(process.argv[4] || 1024) // include 1GB by default; lower to skip
+const MIN_SIZE_MB = Number(process.argv[5] || 0) // skip tiers below this (to run a single tier)
+const APPEND = process.env.APPEND === '1' // append instead of truncating outFile
 
 // Size plans. `scale` multiplies base row counts. Measured: db ~= 6.8MB * scale
 // for this schema, so scale = targetMB / 6.8. The ACTUAL measured total is what
@@ -52,7 +54,7 @@ const SIZE_PLANS = [
   { sizeMB: 100, scale: 14.7, trials: TRIALS },
   { sizeMB: 500, scale: 73.5, trials: Math.min(TRIALS, 3) },
   { sizeMB: 1024, scale: 150, trials: Math.min(TRIALS, 2) },
-].filter((p) => p.sizeMB <= MAX_SIZE_MB)
+].filter((p) => p.sizeMB <= MAX_SIZE_MB && p.sizeMB >= MIN_SIZE_MB)
 
 // Realistic e-commerce-ish schema with FKs, secondary indexes, a narrow table
 // (users), a medium table (orders), a high-row table (line_items), and a WIDE
@@ -257,7 +259,7 @@ const work = mkdtempSync(join(tmpdir(), 'lazy-calib3-'))
 console.error('calibration workdir:', work, '\noutput:', outFile, '\ntrials per scenario:', TRIALS,
   '\nsizes:', SIZE_PLANS.map((p) => p.sizeMB + 'MB').join(', '))
 
-writeFileSync(outFile, '') // fresh
+if (!APPEND) writeFileSync(outFile, '') // fresh unless appending another tier
 
 const shapeNames = Object.keys(makeShapes(1))
 const totalBoots = SIZE_PLANS.reduce((a, p) => a + p.trials * shapeNames.length, 0)

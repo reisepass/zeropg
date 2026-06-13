@@ -222,3 +222,109 @@ node experiments/lazy-restore-spike/intercept-unit.mjs   # PASSES - read-method 
 node experiments/lazy-restore-spike/intercept-poc.mjs    # PASSES - full boot-to-query, zeroed relation
 ```
 
+
+## Phase 3 - richer multi-relation footprints, variance, latency sensitivity
+
+Phase 2 measured footprints from ONE 50k-row flat table. Phase 3 replaces that
+with a realistic multi-relation schema and hardens the policy. Files:
+`calibrate.mjs` (rewritten), `sweep.mjs` (+ latency axis), `analyze.mjs`
+(rewritten), `store-model.mjs` (+ `withTTFB`). Regenerated `footprints.jsonl`,
+`sweep-results.jsonl`, `POLICY.md`.
+
+### Schema (REAL measurements)
+
+`users / orders / line_items / documents` with foreign keys, 5 secondary indexes,
+a narrow table (users), a high-row table (line_items), and a WIDE-row table
+(documents, large text column). 13 user relations total (4 heaps + 9 indexes).
+Footprints now record faults across ALL relations a query touches (heap + index),
+not just one heap. Query shapes: point lookup by PK, point lookup by secondary
+index, indexed join, range scan, wide-row point lookup, full table scan.
+
+### What multi-relation footprints showed (10/50/100MB, 6 trials each)
+
+| shape | mean touched fraction | relations touched | note |
+|---|---|---|---|
+| pointPk | 0.21% | 4 of 13 | faults PK + secondary index pages, not just 1 heap block (6-7 blocks total, ~constant in DB size -> fraction shrinks as DB grows) |
+| pointWide | 0.17% | 3 of 13 | wide-row lookup, 5 blocks, shrinks with size |
+| rangeScan | 2.38% | 4 of 13 | heap + PK-index leaf pages |
+| pointSecondary | 5.43% | 4 of 13 | scattered HEAP blocks (matching rows spread across the heap); fraction ~stable across sizes |
+| fullScan | 30.24% | 4 of 13 | whole line_items heap |
+| indexedJoin | 30.54% | 8 of 13 | planner SeqScans the large heap side -> a join is NOT a small working set |
+
+All footprints deterministic across 6 trials per scenario (touched-block stddev
+= 0 everywhere). The only run-to-run TTFQ variation is the modeled network
+latency sampling, captured in p99 vs p50.
+
+### (a) Did the crossover move vs Phase 2? YES - it got LARGER (lazy needs a bigger DB)
+
+Phase 2 headline (low-ws shape, prefetch ON, 1MB): s3-standard 100MB, gcs
+**50MB**, s3-express 10MB. Phase 3 (lowest-ws shapes pointPk/pointWide): s3-standard
+100MB, gcs **100MB**, s3-express 10MB. gcs-same-region moved 50MB -> 100MB. The
+direction is **up**: counting the index pages a "point lookup" really faults
+(6-7 blocks across 4 relations, plus the fixed eager-set) raises lazy's floor at
+small DB sizes, so lazy needs a larger DB before it beats a single bulk eager
+transfer. This is the honest, more-faithful number: Phase 2 understated lazy's
+cost by ignoring index/catalog faults.
+
+### (b) Latency sensitivity (one sentence)
+
+For the gcs-same-region profile and the lowest-working-set shape, the crossover
+DB size swings from **10MB at 5ms first-byte latency to 100MB at 30-60ms, and
+lazy stops winning at all (in the 10-100MB range) at 120ms** - the thresholds are
+SENSITIVE to first-byte latency, so the real GCS/S3 number must be measured
+before fixing them.
+
+### (c) Variance
+
+None. All 18 footprint scenarios x 6 trials were deterministic (stddev 0). A
+fixed query on a fixed dataset faults a fixed block set; nothing is noisy.
+
+### (d) Updated on/off recommendation (one paragraph)
+
+Enable LazyFS when the snapshot is large AND the first query's working set is
+small AND the first query is not scan-heavy. With multi-relation costs counted,
+the crossover for a low-working-set first query is ~100MB on standard
+S3/GCS-class first-byte latency (tens of ms) and as low as ~10MB on fast
+single-digit-ms storage (S3 Express). Keep LazyFS OFF for small DBs (a single
+bulk parallel restore wins), for scan-heavy first queries (a full/seq scan faults
+~30% of the DB over the same bytes as eager plus per-group RTT, so eager wins),
+and whenever first-byte latency is high (>~60ms) unless the DB is large and the
+working set tiny. Crucially, drive the scan-heavy flag from the actual query plan,
+not the SQL text: the indexedJoin shape "looks" selective but the planner
+seq-scans the large heap, faulting ~30%.
+
+### (e) Totals and what was cut
+
+- Measured boots: 108 (18 scenarios x 6 trials) at 10/50/100MB, all deterministic.
+  Calibration wall-clock ~38s with the disk-frugal harness (build one datadir per
+  size tier, reuse across shapes, re-zero relation segments in place per trial).
+- Sweep: 324 main cells x 400 iters + 90 latency-sweep cells; ~1s (pure model).
+- **CUT: 500MB and 1GB tiers.** Two reasons: (1) the test volume filled up -
+  earlier spike runs (including the now-fixed per-trial-full-copy version) leaked
+  ~56GB of OS temp under `/var/folders/.../T/lazy-*` that I cannot remove (the no-`rm`
+  rule), leaving too little free space for a 500MB+ datadir; (2) the 500MB schema
+  build hit a PGlite error (`XLogBeginInsert was already called`) on the very
+  large single INSERT+CHECKPOINT - a PGlite build-side fragility, unrelated to
+  lazy restore, that needs the bulk insert batched. To add the large tiers: free
+  the leaked temp (see below), then `APPEND=1 node calibrate.mjs footprints.jsonl
+  6 1024 500` (runs 500MB + 1GB and appends), and re-run sweep + analyze.
+
+### Disk cleanup needed (I cannot run `rm`)
+
+~56GB of throwaway calibration/bridge temp from these spikes sits under the OS
+temp dir and is blocking large-tier runs. Please delete it:
+
+```
+rm -rf /var/folders/lg/jm0qw9k55tv16fc828vfnpl00000gn/T/lazy-*
+```
+
+(macOS will also clear `/var/folders/.../T` on its own eventually, but not soon
+enough for a 500MB/1GB re-run.)
+
+### Reproduce
+
+```
+node experiments/lazy-restore-spike/calibrate.mjs                 # footprints (10/50/100MB, 6 trials)
+node experiments/lazy-restore-spike/sweep.mjs                     # main + latency sweep
+node experiments/lazy-restore-spike/analyze.mjs                   # POLICY.md
+```
