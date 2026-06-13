@@ -114,7 +114,12 @@ function hmac(key: Buffer | string, data: string): Buffer {
 }
 
 function stripQuotes(s: string): string {
-  return s.replace(/^"|"$/g, '')
+  // R2 quirk: GET returns a WEAK etag (W/"<hash>") for objects that LIST/PUT
+  // report with a STRONG etag ("<hash>") — same hash, different validator. An
+  // If-Match conditional PUT requires a strong validator, so a weak etag never
+  // matches and lease takeover livelocks ("contention"). Strip the W/ prefix so
+  // every etag we hand back is the strong form R2 accepts in If-Match.
+  return s.replace(/^W\//, '').replace(/^"|"$/g, '')
 }
 
 export class R2BlobStore implements BlobStore {
