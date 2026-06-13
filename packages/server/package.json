@@ -1,0 +1,35 @@
+{
+  "name": "@zeropg/server",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@zeropg/blobstore": "*",
+    "@zeropg/objectstore-fs": "*"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": "*",
+    "@electric-sql/pglite-socket": "*"
+  },
+  "description": "Standalone dedicated-Postgres server for zeropg: one scale-to-zero container holding the lease + PGlite + ObjectStoreFS, exposing the real Postgres wire protocol (pglite-socket) on a local port, a default-on PostgREST auto-REST API, and an HTTP control face (/wake, /ready, POST /sql) a remote app connects to.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reisepass/zeropg.git",
+    "directory": "packages/server"
+  },
+  "keywords": [
+    "postgres",
+    "pglite",
+    "postgrest",
+    "wire-protocol",
+    "scale-to-zero",
+    "serverless"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
+}
