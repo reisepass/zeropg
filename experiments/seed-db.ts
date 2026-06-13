@@ -45,9 +45,12 @@ async function main() {
       console.log(`  ${round(dbBytes / 1e6)}MB / ${targetMB}MB (${rows} rows)`)
     }
   }
-  // Force a durable commit of the whole dataset.
+  // Force a durable commit of the whole dataset AS A SNAPSHOT (compact),
+  // so the seeded state is a clean snapshot + empty WAL tail rather than one
+  // giant WAL segment. That way a demo instance's first cold-start write hits
+  // the cheap WAL-rebaseline path instead of a one-time full compaction.
   db.markDirty()
-  const commit = await db.commit()
+  const commit = await db.compact()
   const m = db.currentManifest
   await db.close()
   console.log(

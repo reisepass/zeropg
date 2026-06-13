@@ -1689,8 +1689,11 @@ async function handle(req, res) {
           line(`  \xB7 CAS manifest.json (the commit) ${Math.round(c.manifestMs)}ms   \u2190 durable at this instant`);
           line(`  \u2713 committed seq ${c.commitSeq} in ${since()}`);
         } else if (c) {
+          line(`  (full-snapshot compaction \u2014 the first commit of an instance's life`);
+          line(`   always re-snapshots so WAL ranges never cross writer lives; the`);
+          line(`   2nd+ write in a life ships only its tiny WAL delta instead)`);
           line(`  \xB7 checkpoint + WAL switch        ${Math.round(c.dumpMs)}ms`);
-          line(`  \xB7 PUT snapshot \u2014 compaction (${fmtBytes(c.snapshotBytes)}) ${Math.round(c.uploadMs)}ms`);
+          line(`  \xB7 PUT snapshot (${fmtBytes(c.snapshotBytes)})${" ".repeat(Math.max(1, 14 - fmtBytes(c.snapshotBytes).length))}${Math.round(c.uploadMs)}ms`);
           line(`  \xB7 CAS manifest.json (the commit) ${Math.round(c.manifestMs)}ms   \u2190 durable at this instant`);
           line(`  \u2713 committed seq ${c.commitSeq} in ${since()}`);
         } else {
