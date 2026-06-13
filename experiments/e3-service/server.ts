@@ -10,15 +10,45 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFileSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { GcsBlobStore } from '@zeropg/blobstore'
+import { GcsBlobStore, R2BlobStore } from '@zeropg/blobstore'
+import type { BlobStore } from '@zeropg/blobstore'
 import { ZeroPG, FencedError, LockedError, type Durability, type CommitInfo } from '@zeropg/objectstore-fs'
 import { runBenchmark } from './bench.js' // BENCH: TPC-C engine (additive feature)
 
 const PROCESS_START = performance.now()
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-const BUCKET = process.env.ZEROPG_BUCKET ?? 'zeropg-experiments-euw1'
+// Transport selection. When COS_* (IBM Cloud Object Storage) HMAC creds are
+// present we drive the existing S3/SigV4 R2BlobStore against the COS endpoint —
+// no new transport code, exactly the construction the storage survey confirmed.
+// Otherwise we use the GCS store (the original Cloud Run wiring). This is the
+// only difference between the Cloud Run + GCS demo and the Code Engine + COS one.
+const USE_COS = !!(
+  process.env.COS_HMAC_ACCESS_KEY_ID && process.env.COS_HMAC_SECRET_ACCESS_KEY
+)
+const BUCKET = USE_COS
+  ? process.env.COS_BUCKET ?? 'zeropg-cos'
+  : process.env.ZEROPG_BUCKET ?? 'zeropg-experiments-euw1'
 const DB_PREFIX = process.env.ZEROPG_PREFIX ?? 'demo/default'
+const STORAGE_SCHEME = USE_COS ? 's3' : 'gs'
+
+function selectStore(): BlobStore {
+  if (USE_COS) {
+    // Prefer the same-cloud DIRECT endpoint from inside Code Engine (no egress);
+    // fall back to the public endpoint if only that is set.
+    const endpoint = process.env.COS_ENDPOINT_DIRECT || process.env.COS_ENDPOINT
+    if (!endpoint) throw new Error('COS_* creds set but no COS_ENDPOINT/COS_ENDPOINT_DIRECT')
+    return new R2BlobStore({
+      endpoint,
+      accessKeyId: process.env.COS_HMAC_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.COS_HMAC_SECRET_ACCESS_KEY!,
+      bucket: BUCKET,
+      prefix: DB_PREFIX,
+      region: process.env.IBM_COS_REGION ?? 'eu-de',
+    })
+  }
+  return new GcsBlobStore({ bucket: BUCKET, prefix: DB_PREFIX })
+}
 const APP_LABEL = process.env.APP_LABEL ?? 'zeropg demo'
 // Durability: 'sleep' (default) = writes live in memory, one snapshot upload
 // when Cloud Run tells us to sleep (SIGTERM). 'interval' = background flush
@@ -84,7 +114,7 @@ function armIdleFlush() {
 }
 
 async function boot() {
-  const store = new GcsBlobStore({ bucket: BUCKET, prefix: DB_PREFIX })
+  const store = selectStore()
   try {
     db = await ZeroPG.open({
       store,
@@ -268,7 +298,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const fmtBytes = (n: number) => (n < 1e6 ? `${(n / 1e3).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`)
 
     line(`💤 sleep requested — instance ${INSTANCE_ID}`)
-    line(`   bucket:    gs://${BUCKET}/${DB_PREFIX}`)
+    line(`   bucket:    ${STORAGE_SCHEME}://${BUCKET}/${DB_PREFIX}`)
     line(`   durability: ${db.durabilityMode}`)
     line()
     try {
@@ -421,7 +451,7 @@ function renderPage(
  #benchlog{background:#1e1e1e;color:#cfe8ff;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:.8rem 1rem;border-radius:8px;margin:.8rem 0 0;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 </style></head><body>
 <h1>${escapeHtml(APP_LABEL)}</h1>
-<div class="sub">A real Postgres, living in a GCS bucket. No database server. Scales to zero.</div>
+<div class="sub">A real Postgres, living in ${USE_COS ? 'an IBM COS' : 'a GCS'} bucket. No database server. Scales to zero.</div>
 ${banner}
 <table>
  <tr><td>database size</td><td><b>${dbMB} MB</b> on disk</td></tr>

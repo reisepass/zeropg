@@ -1,12 +1,12 @@
 import { createRequire } from 'module'; const require = createRequire(import.meta.url);
 
-// experiments/e3-service/server.ts
+// server.ts
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join as join4 } from "node:path";
 
-// packages/blobstore/src/types.ts
+// ../../packages/blobstore/src/types.ts
 var PreconditionFailedError = class extends Error {
   key;
   constructor(key, detail) {
@@ -16,10 +16,10 @@ var PreconditionFailedError = class extends Error {
   }
 };
 
-// packages/blobstore/src/gcs.ts
+// ../../packages/blobstore/src/gcs.ts
 import { Readable } from "node:stream";
 
-// packages/blobstore/src/token.ts
+// ../../packages/blobstore/src/token.ts
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
@@ -72,7 +72,7 @@ async function getAccessToken() {
   );
 }
 
-// packages/blobstore/src/gcs.ts
+// ../../packages/blobstore/src/gcs.ts
 var GCS_COST = {
   asOf: "2026-06",
   writeOpUsd: 5e-3 / 1e3,
@@ -81,7 +81,10 @@ var GCS_COST = {
   // Class B
   storageGbMonthUsd: 0.02,
   internetEgressGbUsd: 0.12,
-  maxWritesPerObjectPerSec: 1
+  maxWritesPerObjectPerSec: 1,
+  // True monotonic generation numbers — no ABA window. The strongest CAS tier
+  // (TODO B3); R2/S3 are 'etag'. See types.ts CostModel.casStrength.
+  casStrength: "generation"
 };
 var BASE = "https://storage.googleapis.com";
 function joinPrefix(prefix, key) {
@@ -300,10 +303,446 @@ async function gcsError(res, op, key) {
   return new Error(`GCS ${op} "${key}" failed: ${res.status} ${res.statusText} ${detail.slice(0, 400)}`);
 }
 
-// packages/objectstore-fs/src/zeropg.ts
+// ../../packages/blobstore/src/r2.ts
+import { createHash, createHmac } from "node:crypto";
+var R2_COST = {
+  asOf: "2026-06",
+  writeOpUsd: 4.5 / 1e6,
+  // Class A $4.50 / million
+  readOpUsd: 0.36 / 1e6,
+  // Class B $0.36 / million
+  storageGbMonthUsd: 0.015,
+  internetEgressGbUsd: 0,
+  // the whole point of R2
+  casStrength: "etag",
+  // S3 If-Match/If-None-Match, not monotonic generations
+  freeTier: { storageGb: 10, writeOps: 1e6, readOps: 1e7 }
+};
+var EMPTY_SHA256 = createHash("sha256").update("").digest("hex");
+function r2OptionsFromEnv(prefix) {
+  const e = process.env;
+  const accessKeyId = e.R2_ACCESS_KEY_ID ?? e.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = e.R2_SECRET_ACCESS_KEY ?? e.AWS_SECRET_ACCESS_KEY;
+  const bucket = e.R2_BUCKET ?? e.AWS_BUCKET ?? e.S3_BUCKET;
+  const accountId = e.R2_ACCOUNT_ID ?? e.CF_ACCOUNT_ID;
+  const endpoint = e.R2_ENDPOINT ?? e.AWS_ENDPOINT_URL_S3 ?? e.AWS_ENDPOINT_URL;
+  if (!accessKeyId || !secretAccessKey || !bucket) return null;
+  if (!accountId && !endpoint) return null;
+  return {
+    accessKeyId,
+    secretAccessKey,
+    bucket,
+    accountId,
+    endpoint,
+    prefix,
+    region: e.R2_REGION ?? e.AWS_REGION ?? "auto"
+  };
+}
+function joinPrefix2(prefix, key) {
+  if (!prefix) return key;
+  const p = prefix.replace(/\/+$/, "");
+  return `${p}/${key}`;
+}
+function uriEncode(s, encodeSlash = true) {
+  let out = "";
+  for (const ch of Buffer.from(s, "utf8").toString("latin1")) {
+    if (/[A-Za-z0-9\-._~]/.test(ch)) out += ch;
+    else if (ch === "/") out += encodeSlash ? "%2F" : "/";
+    else out += "%" + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+function hmac(key, data) {
+  return createHmac("sha256", key).update(data, "utf8").digest();
+}
+function stripQuotes(s) {
+  return s.replace(/^"|"$/g, "");
+}
+var R2BlobStore = class _R2BlobStore {
+  cost = R2_COST;
+  accessKeyId;
+  secretAccessKey;
+  bucket;
+  prefix;
+  origin;
+  region;
+  constructor(opts) {
+    this.accessKeyId = opts.accessKeyId;
+    this.secretAccessKey = opts.secretAccessKey;
+    this.bucket = opts.bucket;
+    this.prefix = opts.prefix;
+    this.region = opts.region ?? "auto";
+    const endpoint = opts.endpoint ?? (opts.accountId ? `https://${opts.accountId}.r2.cloudflarestorage.com` : void 0);
+    if (!endpoint) throw new Error("R2BlobStore: provide either `endpoint` or `accountId`");
+    this.origin = endpoint.replace(/\/+$/, "");
+  }
+  static fromEnv(prefix) {
+    const opts = r2OptionsFromEnv(prefix);
+    return opts ? new _R2BlobStore(opts) : null;
+  }
+  fullKey(key) {
+    return joinPrefix2(this.prefix, key);
+  }
+  /** Path-style object URL: <origin>/<bucket>/<key>. */
+  objectPath(key) {
+    return `/${this.bucket}/${uriEncode(this.fullKey(key), false)}`;
+  }
+  // ---- SigV4 -------------------------------------------------------------
+  /**
+   * Sign a request and return the headers to send. `query` is the parsed query
+   * params (already decoded values); they are canonicalised and signed. The
+   * caller builds the final URL from `path` + the same query.
+   */
+  sign(method, path, query, headers, payloadHash) {
+    const now = /* @__PURE__ */ new Date();
+    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+    const dateStamp = amzDate.slice(0, 8);
+    const host = new URL(this.origin).host;
+    const allHeaders = {
+      ...headers,
+      host,
+      "x-amz-content-sha256": payloadHash,
+      "x-amz-date": amzDate
+    };
+    const headerNames = Object.keys(allHeaders).map((h) => h.toLowerCase()).sort();
+    const lower = {};
+    for (const [k, v] of Object.entries(allHeaders)) lower[k.toLowerCase()] = String(v).trim();
+    const canonicalHeaders = headerNames.map((h) => `${h}:${lower[h]}
+`).join("");
+    const signedHeaders = headerNames.join(";");
+    const canonicalQuery = Object.keys(query).sort().map((k) => `${uriEncode(k)}=${uriEncode(query[k])}`).join("&");
+    const canonicalRequest = [
+      method,
+      path,
+      // already RFC3986-encoded (slashes preserved)
+      canonicalQuery,
+      canonicalHeaders,
+      signedHeaders,
+      payloadHash
+    ].join("\n");
+    const scope = `${dateStamp}/${this.region}/s3/aws4_request`;
+    const stringToSign = [
+      "AWS4-HMAC-SHA256",
+      amzDate,
+      scope,
+      createHash("sha256").update(canonicalRequest).digest("hex")
+    ].join("\n");
+    const kDate = hmac(`AWS4${this.secretAccessKey}`, dateStamp);
+    const kRegion = hmac(kDate, this.region);
+    const kService = hmac(kRegion, "s3");
+    const kSigning = hmac(kService, "aws4_request");
+    const signature = createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
+    return {
+      ...allHeaders,
+      Authorization: `AWS4-HMAC-SHA256 Credential=${this.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+    };
+  }
+  buildUrl(path, query) {
+    const qs = Object.keys(query).sort().map((k) => `${uriEncode(k)}=${uriEncode(query[k])}`).join("&");
+    return `${this.origin}${path}${qs ? `?${qs}` : ""}`;
+  }
+  /** Map S3 conditional headers from our PutOptions. */
+  condHeaders(opts) {
+    const h = {};
+    if (opts?.ifNoneMatch) h["If-None-Match"] = "*";
+    else if (opts?.ifMatch !== void 0) h["If-Match"] = opts.ifMatch;
+    if (opts?.contentType) h["Content-Type"] = opts.contentType;
+    return h;
+  }
+  // ---- core ops ----------------------------------------------------------
+  async get(key, opts) {
+    const path = this.objectPath(key);
+    const headers = {};
+    if (opts?.range) {
+      const { start, end } = opts.range;
+      headers.Range = `bytes=${start}-${end ?? ""}`;
+    }
+    const signed = this.sign("GET", path, {}, headers, EMPTY_SHA256);
+    const res = await fetch(this.buildUrl(path, {}), { headers: signed });
+    if (res.status === 404) return null;
+    if (!(res.ok || res.status === 206)) throw await r2Error(res, "get", key);
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return { bytes: buf, etag: stripQuotes(res.headers.get("etag") ?? ""), size: buf.byteLength };
+  }
+  async head(key) {
+    const path = this.objectPath(key);
+    const signed = this.sign("HEAD", path, {}, {}, EMPTY_SHA256);
+    const res = await fetch(this.buildUrl(path, {}), { method: "HEAD", headers: signed });
+    if (res.status === 404) return null;
+    if (!res.ok) throw await r2Error(res, "head", key);
+    return {
+      etag: stripQuotes(res.headers.get("etag") ?? ""),
+      size: Number(res.headers.get("content-length") ?? "0")
+    };
+  }
+  async put(key, bytes, opts) {
+    const path = this.objectPath(key);
+    const payloadHash = createHash("sha256").update(bytes).digest("hex");
+    const cond = this.condHeaders(opts);
+    for (let attempt = 0; ; attempt++) {
+      const signed = this.sign("PUT", path, {}, cond, payloadHash);
+      const res = await fetch(this.buildUrl(path, {}), {
+        method: "PUT",
+        headers: signed,
+        body: bytes
+      });
+      if (res.status === 412 || res.status === 409) {
+        await res.body?.cancel().catch(() => {
+        });
+        throw new PreconditionFailedError(
+          key,
+          opts?.ifNoneMatch ? "object exists" : "etag mismatch"
+        );
+      }
+      if ((res.status === 429 || res.status >= 500) && attempt < 5) {
+        await res.text().catch(() => {
+        });
+        const backoff = Math.min(3e3, 200 * 2 ** attempt) * (0.5 + Math.random());
+        await new Promise((r) => setTimeout(r, backoff));
+        continue;
+      }
+      if (!res.ok) throw await r2Error(res, "put", key);
+      const etag = stripQuotes(res.headers.get("etag") ?? "");
+      await res.body?.cancel().catch(() => {
+      });
+      return { etag };
+    }
+  }
+  async delete(key) {
+    const path = this.objectPath(key);
+    const signed = this.sign("DELETE", path, {}, {}, EMPTY_SHA256);
+    const res = await fetch(this.buildUrl(path, {}), { method: "DELETE", headers: signed });
+    if (res.status === 404 || res.status === 204 || res.ok) {
+      await res.body?.cancel().catch(() => {
+      });
+      return;
+    }
+    throw await r2Error(res, "delete", key);
+  }
+  async *list(prefix) {
+    const fullPrefix = this.fullKey(prefix);
+    const stripLen = this.prefix ? this.prefix.replace(/\/+$/, "").length + 1 : 0;
+    let token;
+    do {
+      const query = { "list-type": "2", prefix: fullPrefix };
+      if (token) query["continuation-token"] = token;
+      const path = `/${this.bucket}`;
+      const signed = this.sign("GET", path, query, {}, EMPTY_SHA256);
+      const res = await fetch(this.buildUrl(path, query), { headers: signed });
+      if (!res.ok) throw await r2Error(res, "list", prefix);
+      const xml = await res.text();
+      for (const block of xml.match(/<Contents>[\s\S]*?<\/Contents>/g) ?? []) {
+        const name = decodeXml(matchTag(block, "Key") ?? "");
+        const etag = stripQuotes(decodeXml(matchTag(block, "ETag") ?? ""));
+        const size = Number(matchTag(block, "Size") ?? "0");
+        const logical = stripLen ? name.slice(stripLen) : name;
+        yield { key: logical, etag, size };
+      }
+      const truncated = matchTag(xml, "IsTruncated") === "true";
+      token = truncated ? matchTag(xml, "NextContinuationToken") ?? void 0 : void 0;
+    } while (token);
+  }
+  /**
+   * Server-side copy within the bucket (S3 CopyObject) — no bytes flow through
+   * the client. The source is pinned via x-amz-copy-source.
+   */
+  async copy(srcKey, destKey) {
+    const path = this.objectPath(destKey);
+    const headers = {
+      "x-amz-copy-source": `/${this.bucket}/${uriEncode(this.fullKey(srcKey), false)}`
+    };
+    const signed = this.sign("PUT", path, {}, headers, EMPTY_SHA256);
+    const res = await fetch(this.buildUrl(path, {}), { method: "PUT", headers: signed });
+    if (!res.ok) throw await r2Error(res, "copy", srcKey);
+    const xml = await res.text();
+    return { etag: stripQuotes(decodeXml(matchTag(xml, "ETag") ?? "")) };
+  }
+  // ---- streaming ---------------------------------------------------------
+  /** Tuning for getStream's parallel-range download (mirrors gcs.ts). */
+  static STREAM_CHUNK_BYTES = 32 * 1024 * 1024;
+  static STREAM_CONCURRENCY = 4;
+  /** Multipart part size for putStream (S3 minimum is 5MB per non-final part). */
+  static PART_BYTES = 8 * 1024 * 1024;
+  async getStream(key) {
+    const meta = await this.head(key);
+    if (!meta) return null;
+    const path = this.objectPath(key);
+    const self = this;
+    const CHUNK = _R2BlobStore.STREAM_CHUNK_BYTES;
+    const CONC = _R2BlobStore.STREAM_CONCURRENCY;
+    async function fetchRange(start, endIncl) {
+      const headers = { Range: `bytes=${start}-${endIncl}`, "If-Match": meta.etag };
+      const signed = self.sign("GET", path, {}, headers, EMPTY_SHA256);
+      const res = await fetch(self.buildUrl(path, {}), { headers: signed });
+      if (res.status === 412) throw await r2Error(res, "getStream(version changed)", key);
+      if (!(res.status === 206 || res.status === 200)) throw await r2Error(res, "getStream", key);
+      return res;
+    }
+    const size = meta.size;
+    async function* ordered() {
+      if (size === 0) return;
+      const starts = [];
+      for (let s = 0; s < size; s += CHUNK) starts.push(s);
+      const inflight = [];
+      let next = 0;
+      const fill = () => {
+        while (next < starts.length && inflight.length < CONC) {
+          const s = starts[next++];
+          inflight.push(fetchRange(s, Math.min(s + CHUNK, size) - 1));
+        }
+      };
+      fill();
+      while (inflight.length > 0) {
+        const r = await inflight.shift();
+        fill();
+        if (!r.body) throw new Error(`R2 getStream "${key}": empty response body`);
+        for await (const part of r.body) yield part;
+      }
+    }
+    return { stream: ordered(), etag: meta.etag, size };
+  }
+  /**
+   * PUT from a byte stream. Small streams (under one part) collapse to a single
+   * conditional PutObject; larger ones use an S3 multipart upload (parts
+   * buffered to PART_BYTES, so peak memory is O(part size)). The conditional
+   * precondition is applied to the final commit step in both cases — a single
+   * PUT, or CompleteMultipartUpload — so it stays atomic.
+   */
+  async putStream(key, source2, opts) {
+    const PART = _R2BlobStore.PART_BYTES;
+    const it = source2[Symbol.asyncIterator]();
+    let buf = [];
+    let n = 0;
+    let done = false;
+    while (n < PART) {
+      const { value, done: d } = await it.next();
+      if (d) {
+        done = true;
+        break;
+      }
+      buf.push(value);
+      n += value.length;
+    }
+    if (done) return this.put(key, Buffer.concat(buf, n), opts);
+    const path = this.objectPath(key);
+    const uploadId = await this.createMultipart(path, key, opts?.contentType);
+    const parts = [];
+    try {
+      let partNo = 0;
+      const flush = async (chunks, total) => {
+        partNo++;
+        const body = Buffer.concat(chunks, total);
+        const etag = await this.uploadPart(path, key, uploadId, partNo, body);
+        parts.push({ PartNumber: partNo, ETag: etag });
+      };
+      await flush(buf, n);
+      buf = [];
+      n = 0;
+      for (; ; ) {
+        const { value, done: d } = await it.next();
+        if (d) break;
+        buf.push(value);
+        n += value.length;
+        if (n >= PART) {
+          await flush(buf, n);
+          buf = [];
+          n = 0;
+        }
+      }
+      if (n > 0) await flush(buf, n);
+      return await this.completeMultipart(path, key, uploadId, parts, opts);
+    } catch (e) {
+      await this.abortMultipart(path, uploadId).catch(() => {
+      });
+      throw e;
+    }
+  }
+  async createMultipart(path, key, contentType) {
+    const query = { uploads: "" };
+    const headers = {};
+    if (contentType) headers["Content-Type"] = contentType;
+    const signed = this.sign("POST", path, query, headers, EMPTY_SHA256);
+    const res = await fetch(this.buildUrl(path, query), { method: "POST", headers: signed });
+    if (!res.ok) throw await r2Error(res, "createMultipart", key);
+    const xml = await res.text();
+    const id = matchTag(xml, "UploadId");
+    if (!id) throw new Error(`R2 createMultipart "${key}": no UploadId in response`);
+    return id;
+  }
+  async uploadPart(path, key, uploadId, partNumber, body) {
+    const query = { partNumber: String(partNumber), uploadId };
+    const payloadHash = createHash("sha256").update(body).digest("hex");
+    for (let attempt = 0; ; attempt++) {
+      const signed = this.sign("PUT", path, query, {}, payloadHash);
+      const res = await fetch(this.buildUrl(path, query), {
+        method: "PUT",
+        headers: signed,
+        body
+      });
+      if ((res.status === 429 || res.status >= 500) && attempt < 5) {
+        await res.text().catch(() => {
+        });
+        await new Promise((r) => setTimeout(r, Math.min(3e3, 200 * 2 ** attempt) * (0.5 + Math.random())));
+        continue;
+      }
+      if (!res.ok) throw await r2Error(res, `uploadPart#${partNumber}`, key);
+      const etag = res.headers.get("etag") ?? "";
+      await res.body?.cancel().catch(() => {
+      });
+      if (!etag) throw new Error(`R2 uploadPart "${key}" #${partNumber}: no ETag header`);
+      return etag;
+    }
+  }
+  async completeMultipart(path, key, uploadId, parts, opts) {
+    const query = { uploadId };
+    const xmlBody = "<CompleteMultipartUpload>" + parts.map((p) => `<Part><PartNumber>${p.PartNumber}</PartNumber><ETag>${p.ETag}</ETag></Part>`).join("") + "</CompleteMultipartUpload>";
+    const bodyBytes = Buffer.from(xmlBody, "utf8");
+    const payloadHash = createHash("sha256").update(bodyBytes).digest("hex");
+    const headers = this.condHeaders(opts);
+    const signed = this.sign("POST", path, query, headers, payloadHash);
+    const res = await fetch(this.buildUrl(path, query), {
+      method: "POST",
+      headers: signed,
+      body: bodyBytes
+    });
+    if (res.status === 412 || res.status === 409) {
+      await res.body?.cancel().catch(() => {
+      });
+      throw new PreconditionFailedError(key, opts?.ifNoneMatch ? "object exists" : "etag mismatch");
+    }
+    if (!res.ok) throw await r2Error(res, "completeMultipart", key);
+    const xml = await res.text();
+    if (/<Error>/.test(xml)) throw new Error(`R2 completeMultipart "${key}" failed: ${xml.slice(0, 400)}`);
+    return { etag: stripQuotes(decodeXml(matchTag(xml, "ETag") ?? "")) };
+  }
+  async abortMultipart(path, uploadId) {
+    const query = { uploadId };
+    const signed = this.sign("DELETE", path, query, {}, EMPTY_SHA256);
+    const res = await fetch(this.buildUrl(path, query), { method: "DELETE", headers: signed });
+    await res.body?.cancel().catch(() => {
+    });
+  }
+};
+function matchTag(xml, tag) {
+  const m = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+  return m ? m[1] : void 0;
+}
+function decodeXml(s) {
+  return s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+async function r2Error(res, op, key) {
+  let detail = "";
+  try {
+    detail = await res.text();
+  } catch {
+  }
+  return new Error(`R2 ${op} "${key}" failed: ${res.status} ${res.statusText} ${detail.slice(0, 400)}`);
+}
+
+// ../../packages/objectstore-fs/src/zeropg.ts
 import { PGlite } from "@electric-sql/pglite";
 
-// packages/lease/src/index.ts
+// ../../packages/lease/src/index.ts
 var LockedError = class extends Error {
   holder;
   expiresAt;
@@ -494,7 +933,7 @@ var Lease = class {
   }
 };
 
-// packages/objectstore-fs/src/manifest.ts
+// ../../packages/objectstore-fs/src/manifest.ts
 var MANIFEST_KEY = "manifest.json";
 function encodeManifest(m) {
   return new TextEncoder().encode(JSON.stringify(m, null, 2));
@@ -503,7 +942,7 @@ function decodeManifest(bytes) {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
-// packages/objectstore-fs/src/tar.ts
+// ../../packages/objectstore-fs/src/tar.ts
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, readdir, readFile, stat } from "node:fs/promises";
 import { join, posix } from "node:path";
@@ -700,7 +1139,7 @@ async function largestFile(rootDir) {
   return best;
 }
 
-// packages/objectstore-fs/src/restore.ts
+// ../../packages/objectstore-fs/src/restore.ts
 import { createGunzip, crc32 } from "node:zlib";
 import { Readable as Readable2 } from "node:stream";
 import * as nodeStream from "node:stream";
@@ -790,7 +1229,7 @@ async function applyWalSegments(store, dir, m) {
   }
 }
 
-// packages/objectstore-fs/src/zeropg.ts
+// ../../packages/objectstore-fs/src/zeropg.ts
 import { createGunzip as createGunzip2, createGzip, gzipSync, crc32 as crc322 } from "node:zlib";
 import { Readable as Readable3 } from "node:stream";
 import * as nodeStream2 from "node:stream";
@@ -826,6 +1265,8 @@ var ZeroPG = class _ZeroPG {
   now;
   scratchBase;
   dataDir;
+  fullPageWrites;
+  walCompression;
   manifest;
   manifestEtag = null;
   generation;
@@ -862,6 +1303,10 @@ var ZeroPG = class _ZeroPG {
     this.commitIntervalMs = opts.commitIntervalMs ?? (capPerSec ? Math.ceil(1e3 / capPerSec) : 0);
     this.now = opts.now ?? Date.now;
     this.scratchBase = opts.scratchDir ?? join3(tmpdir(), "zeropg");
+    this.fullPageWrites = opts.fullPageWrites ?? !/^(off|false|0)$/i.test(
+      process.env.ZEROPG_FULL_PAGE_WRITES ?? ""
+    );
+    this.walCompression = opts.walCompression ?? process.env.ZEROPG_WAL_COMPRESSION;
   }
   commitIntervalMs;
   lastCasAt = 0;
@@ -1136,9 +1581,11 @@ var ZeroPG = class _ZeroPG {
       return "gzip";
     }
   }
-  /** Persist WAL GUCs into the datadir (travels with snapshots), and probe
-   * whether this session can ship WAL incrementally: the flush-LSN function
-   * must exist and our LSN->filename math must agree with the server's. */
+  /** Persist WAL GUCs into the datadir (travels with snapshots), reconcile the
+   * per-instance WAL knobs (full_page_writes / wal_compression) so they are
+   * LIVE for this life's writes, and probe whether this session can ship WAL
+   * incrementally: the flush-LSN function must exist and our LSN->filename math
+   * must agree with the server's. */
   async ensureWalConfig() {
     try {
       const cur = await this.pg.query(
@@ -1149,7 +1596,30 @@ var ZeroPG = class _ZeroPG {
         for (const [k, v] of WAL_GUCS) {
           await this.pg.exec(`ALTER SYSTEM SET ${k} = ${v}`);
         }
-        await this.pg.query("SELECT pg_reload_conf()");
+      }
+      const fpw = this.fullPageWrites ? "on" : "off";
+      await this.pg.exec(`ALTER SYSTEM SET full_page_writes = ${fpw}`);
+      let walcApplied = false;
+      if (this.walCompression) {
+        try {
+          await this.pg.exec(`ALTER SYSTEM SET wal_compression = ${this.walCompression}`);
+          walcApplied = true;
+        } catch {
+        }
+      }
+      await this.pg.query("SELECT pg_reload_conf()");
+      const live = await this.pg.query(
+        "SELECT setting FROM pg_settings WHERE name = 'full_page_writes'"
+      );
+      const liveWalc = walcApplied ? (await this.pg.query(
+        "SELECT setting FROM pg_settings WHERE name = 'wal_compression'"
+      )).rows[0]?.setting : void 0;
+      const fpwMismatch = live.rows[0]?.setting !== fpw;
+      const walcMismatch = walcApplied && liveWalc !== this.walCompression;
+      if (fpwMismatch || walcMismatch) {
+        await this.pg.close();
+        this.pg = await PGlite.create({ dataDir: this.dataDir });
+        await this.pg.waitReady;
       }
     } catch {
     }
@@ -1619,10 +2089,10 @@ var ZeroPG = class _ZeroPG {
   }
 };
 
-// packages/objectstore-fs/src/replica.ts
+// ../../packages/objectstore-fs/src/replica.ts
 import { PGlite as PGlite2 } from "@electric-sql/pglite";
 
-// experiments/e3-service/bench.ts
+// bench.ts
 var rnd = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
 var CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 function astr(lo, hi) {
@@ -2123,11 +2593,28 @@ async function stockLevel(db2, p) {
   );
 }
 
-// experiments/e3-service/server.ts
+// server.ts
 var PROCESS_START = performance.now();
 var __dirname = dirname(fileURLToPath(import.meta.url));
-var BUCKET = process.env.ZEROPG_BUCKET ?? "zeropg-experiments-euw1";
+var USE_COS = !!(process.env.COS_HMAC_ACCESS_KEY_ID && process.env.COS_HMAC_SECRET_ACCESS_KEY);
+var BUCKET = USE_COS ? process.env.COS_BUCKET ?? "zeropg-cos" : process.env.ZEROPG_BUCKET ?? "zeropg-experiments-euw1";
 var DB_PREFIX = process.env.ZEROPG_PREFIX ?? "demo/default";
+var STORAGE_SCHEME = USE_COS ? "s3" : "gs";
+function selectStore() {
+  if (USE_COS) {
+    const endpoint = process.env.COS_ENDPOINT_DIRECT || process.env.COS_ENDPOINT;
+    if (!endpoint) throw new Error("COS_* creds set but no COS_ENDPOINT/COS_ENDPOINT_DIRECT");
+    return new R2BlobStore({
+      endpoint,
+      accessKeyId: process.env.COS_HMAC_ACCESS_KEY_ID,
+      secretAccessKey: process.env.COS_HMAC_SECRET_ACCESS_KEY,
+      bucket: BUCKET,
+      prefix: DB_PREFIX,
+      region: process.env.IBM_COS_REGION ?? "eu-de"
+    });
+  }
+  return new GcsBlobStore({ bucket: BUCKET, prefix: DB_PREFIX });
+}
 var APP_LABEL = process.env.APP_LABEL ?? "zeropg demo";
 var DURABILITY = ["strict", "interval", "sleep"].includes(
   process.env.ZEROPG_DURABILITY ?? ""
@@ -2162,7 +2649,7 @@ function armIdleFlush() {
   idleTimer.unref?.();
 }
 async function boot() {
-  const store = new GcsBlobStore({ bucket: BUCKET, prefix: DB_PREFIX });
+  const store = selectStore();
   try {
     db = await ZeroPG.open({
       store,
@@ -2313,7 +2800,7 @@ async function handle(req, res) {
     const line = (s = "") => res.write(s + "\n");
     const fmtBytes = (n) => n < 1e6 ? `${(n / 1e3).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`;
     line(`\u{1F4A4} sleep requested \u2014 instance ${INSTANCE_ID}`);
-    line(`   bucket:    gs://${BUCKET}/${DB_PREFIX}`);
+    line(`   bucket:    ${STORAGE_SCHEME}://${BUCKET}/${DB_PREFIX}`);
     line(`   durability: ${db.durabilityMode}`);
     line();
     try {
@@ -2446,7 +2933,7 @@ function renderPage(info, notes, cold) {
  #benchlog{background:#1e1e1e;color:#cfe8ff;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:.8rem 1rem;border-radius:8px;margin:.8rem 0 0;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 </style></head><body>
 <h1>${escapeHtml(APP_LABEL)}</h1>
-<div class="sub">A real Postgres, living in a GCS bucket. No database server. Scales to zero.</div>
+<div class="sub">A real Postgres, living in ${USE_COS ? "an IBM COS" : "a GCS"} bucket. No database server. Scales to zero.</div>
 ${banner}
 <table>
  <tr><td>database size</td><td><b>${dbMB} MB</b> on disk</td></tr>
