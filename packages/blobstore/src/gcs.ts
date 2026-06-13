@@ -35,6 +35,9 @@ export const GCS_COST: CostModel = {
   storageGbMonthUsd: 0.02,
   internetEgressGbUsd: 0.12,
   maxWritesPerObjectPerSec: 1,
+  // True monotonic generation numbers — no ABA window. The strongest CAS tier
+  // (TODO B3); R2/S3 are 'etag'. See types.ts CostModel.casStrength.
+  casStrength: 'generation',
 }
 
 const BASE = 'https://storage.googleapis.com'

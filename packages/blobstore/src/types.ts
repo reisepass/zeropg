@@ -91,6 +91,34 @@ export interface CostModel {
    * forces group-commit batching above it. Omit when no such limit exists.
    */
   maxWritesPerObjectPerSec?: number
+  /**
+   * Strength of the store's conditional-write primitive — the property the
+   * whole lease/manifest design rests on (TODO B3):
+   *
+   *  - `'generation'`: the precondition compares a server-assigned, strictly
+   *    monotonic *generation number* (GCS `ifGenerationMatch`). A generation is
+   *    never reused, so there is no ABA window: a token you hold is either the
+   *    current version or it is in the past, never "the past, reincarnated".
+   *  - `'etag'`: the precondition compares an *ETag* (S3 / R2 `If-Match` /
+   *    `If-None-Match`). An ETag is a content hash (or opaque per-version id);
+   *    it is unique per write in practice, but it is not a monotonic counter,
+   *    so there is a *theoretical* ABA window — write A (etag X), overwrite to
+   *    B, overwrite back to byte-identical A (etag X again) could let a stale
+   *    `If-Match: X` succeed against what it thinks is the original A.
+   *
+   * Why ABA is moot for zeropg (see docs/R2.md): the two CAS sites never reuse
+   * a name with reverting content. (1) The lease is create-if-absent + CAS to a
+   * strictly *incrementing* fencing token, so the body never reverts to an
+   * earlier value. (2) The numbered-immutable-manifest plan (ROADMAP v2 #1)
+   * makes every commit a create-if-absent on a fresh, never-reused name —
+   * which has no ABA window at all on any etag store.
+   */
+  casStrength?: 'generation' | 'etag'
+  /**
+   * Free monthly allowance, where the provider grants one (R2: 10GB stored +
+   * 1M Class A + 10M Class B per month). Feeds the README cost calculator.
+   */
+  freeTier?: { storageGb: number; writeOps: number; readOps: number }
 }
 
 export interface BlobStore {
