@@ -369,6 +369,37 @@ export class ColdArchiver {
   }
 
   /**
+   * Restore a backup from the cold store into a datadir. Picks the entry by
+   * `commitSeq` if given, else the newest. A backup is already a clean,
+   * WAL-folded snapshot, so this is the snapshot half of the restore path with
+   * NO WAL overlay (restoreSnapshotInto handles the .tar / .tar.gz codecs).
+   *
+   * Returns the chosen entry + the datadir it was materialized into; the caller
+   * boots a ZeroPG/PGlite on it directly, or seeds a fresh primary bucket from
+   * it for disaster recovery into a new home.
+   */
+  async restoreFromBackup(
+    seq?: number,
+    into?: string,
+  ): Promise<{ entry: BackupEntry; dir: string; bytes: number }> {
+    const cur = await this.secondary.get(INDEX_KEY)
+    if (!cur) throw new Error('no backup index at secondary (nothing to restore)')
+    const idx = decodeBackupIndex(cur.bytes)
+    if (idx.backups.length === 0) throw new Error('backup index is empty')
+    const entry =
+      seq === undefined
+        ? idx.backups[idx.backups.length - 1] // newest last
+        : idx.backups.find((b) => b.commitSeq === seq)
+    if (!entry) throw new Error(`no backup with commitSeq ${seq}`)
+
+    const dir = into ?? (await mkdtemp(join(this.scratchBase, 'zpg-restore-')))
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    const bytes = await restoreSnapshotInto(this.secondary, dir, entry.key)
+    this.log({ event: 'zeropg-restore-ok', key: entry.key, commitSeq: entry.commitSeq, dir, bytes })
+    return { entry, dir, bytes }
+  }
+
+  /**
    * Apply a retention policy to the cold store: compute the keep-set with the
    * pure `retain`, delete everything outside it from the secondary, and rewrite
    * the index — mirroring gc.ts's keep-set-first discipline (never delete
