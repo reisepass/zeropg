@@ -1,12 +1,22 @@
-// ZeroPG — the v0 product: a real Postgres (PGlite) whose durable home is an
-// object-storage bucket, with a single-writer lease and manifest-swap commits.
+// ZeroPG — a real Postgres (PGlite) whose durable home is an object-storage
+// bucket, with a single-writer lease and manifest-swap commits.
 //
-// v0 strategy (DESIGN.md roadmap): whole-datadir snapshot per commit. Crude but
-// correct. The snapshot pipeline is fully streaming in both directions:
+// COMMIT STRATEGY (v1, shipped): incremental WAL shipping (V1-WAL-SHIPPING.md).
+// A normal commit uploads ONLY the WAL bytes the transaction appended — the
+// LSN range [lastShippedLsn, pg_current_wal_flush_lsn()) — as one immutable
+// segment object, then CASes the manifest to append it. O(transaction size),
+// not O(database size). The full-datadir snapshot is now a *compaction*
+// artifact: when the accumulated WAL tail outgrows COMPACT_AT_WAL_BYTES /
+// COMPACT_AT_SEGMENTS the next commit rolls a fresh snapshot and empties the
+// segment list (keeping the old snapshot as a one-back backup). The FIRST
+// commit of every writer life re-baselines the WAL since the current snapshot
+// (commitRebaseline) rather than spanning the dead predecessor's ragged WAL
+// tail — see the "generation per writer life" correction in V1-WAL-SHIPPING.md.
 //
+// Both pipelines are fully streaming in each direction:
 //   restore: GCS ranged GETs (parallel) -> gunzip -> untar -> scratch dir,
-//            then PGlite opens the scratch dir via its NodeFS backend.
-//   commit:  CHECKPOINT -> tar(scratch dir) -> gzip -> chunked PUT.
+//            overlay WAL segments, then PGlite opens it (recovery replays WAL).
+//   compaction snapshot: double-CHECKPOINT -> tar(scratch dir) -> gzip -> PUT.
 //
 // Peak memory is one chunk, not three copies of the database — a 500MB DB
 // restores inside a 1-2GiB container instead of OOMing it. On Cloud Run the
@@ -18,12 +28,9 @@
 // WAL segments in pg_wal/, which a naive datadir snapshot ships forever — that
 // is how a 500MB database once produced a 969MB snapshot. Every writer boot
 // persists small WAL GUCs via ALTER SYSTEM (they live in postgresql.auto.conf
-// inside the snapshot) and commits double-CHECKPOINT first, so pg_wal stays at
-// a few segments.
-//
-// v1 will replace per-commit full snapshots with incremental pg_wal/ segment
-// shipping via a true PGlite Filesystem VFS. The public API here does not
-// change when that lands.
+// inside the snapshot) and compaction double-CHECKPOINTs first, so pg_wal stays
+// at a few segments. The manifest schema is v2 (manifest.ts); v1 single-snapshot
+// manifests still decode and restore — the first commit compacts them forward.
 
 import { PGlite } from '@electric-sql/pglite'
 import { type BlobStore, PreconditionFailedError } from '@zeropg/blobstore'
@@ -107,6 +114,32 @@ export interface ZeroPGOptions {
   /** If true, skip taking the lease (single-tenant platform guarantees it).
    * The lease is still validated as belt-and-suspenders if present. */
   noLease?: boolean
+  /**
+   * full_page_writes (A1). Postgres writes a full 8KB page image into WAL on
+   * the first change to each page after a checkpoint, to repair torn pages
+   * during local crash recovery — often the MAJORITY of WAL bytes, which is
+   * exactly the volume we ship per commit. zeropg never recovers from a torn
+   * local datadir (it restores from a consistent post-CHECKPOINT snapshot on
+   * tmpfs and replays complete, CRC/page-address-verified WAL over it), so the
+   * protection is plausibly redundant and turning it off shrinks every
+   * incremental commit and stretches compaction intervals.
+   *
+   * It is correctness-sensitive, NOT a free win, so the default is the safe
+   * stock behavior (`true`). Turn it off only with the E2b/e4b crash matrix
+   * green WITH it off (see results/fpw.jsonl + V1-WAL-SHIPPING.md). Default:
+   * `true`, overridable for the harnesses by env `ZEROPG_FULL_PAGE_WRITES`
+   * (`off`/`false`/`0` => off) when this option is left unset.
+   */
+  fullPageWrites?: boolean
+  /**
+   * wal_compression (A1.3): compress full-page images inside the WAL before
+   * our per-segment handling, shrinking the shipped LSN range itself. Lower
+   * value when fullPageWrites is off (no FPIs to compress). Undefined leaves
+   * the engine default (off). Values: 'off' | 'pglz' | 'lz4' | 'zstd' — the
+   * non-default codecs require the PGlite WASM build to include them (probed
+   * at boot; unsupported values are ignored, non-fatally).
+   */
+  walCompression?: 'off' | 'pglz' | 'lz4' | 'zstd'
 }
 
 export interface CommitInfo {
@@ -138,6 +171,21 @@ const SQL_WRITE = /^\s*(insert|update|delete|create|alter|drop|truncate|comment|
 // (created small, grown by appends, never rewritten, never zero-padded).
 // Incremental WAL shipping is built on that invariant: "new bytes" is just
 // "file grew past its high-water mark".
+//
+// GUARDRAIL — wal_level MUST stay `replica` (its default here), NEVER `minimal`
+// (TODO A1.2 / V1-WAL-SHIPPING.md "wal_level constraint"). This is a data-loss
+// landmine SPECIFICALLY BECAUSE we ship WAL. Under wal_level=minimal Postgres
+// skips WAL for bulk operations against a relation created or truncated in the
+// SAME transaction — COPY, CREATE TABLE AS, CREATE INDEX, CLUSTER, ALTER TABLE
+// rewrites — and instead only fsync()s the heap/index files at commit. Those
+// changes therefore NEVER appear in any shipped WAL segment: an incremental
+// commit ships an LSN range that does not contain them, so a restore that
+// replays our segments over the snapshot silently loses the entire bulk load
+// until the next FULL snapshot (compaction) happens to capture the heap files.
+// `replica` forces every such change through the WAL, which is the only thing
+// our restore path replays. We deliberately do NOT add wal_level to this list:
+// leaving it at the engine default keeps it at `replica` and makes any future
+// override require a conscious edit right here, with this warning attached.
 const WAL_GUCS = [
   ["max_wal_size", "'64MB'"],
   ["min_wal_size", "'32MB'"],
@@ -171,6 +219,8 @@ export class ZeroPG {
   private now: () => number
   private scratchBase: string
   private dataDir!: string
+  private fullPageWrites: boolean
+  private walCompression?: string
 
   private manifest!: Manifest
   private manifestEtag: string | null = null
@@ -210,6 +260,11 @@ export class ZeroPG {
     this.commitIntervalMs = opts.commitIntervalMs ?? (capPerSec ? Math.ceil(1000 / capPerSec) : 0)
     this.now = opts.now ?? Date.now
     this.scratchBase = opts.scratchDir ?? join(tmpdir(), 'zeropg')
+    // Option wins; else env override (test convenience); else safe default on.
+    this.fullPageWrites = opts.fullPageWrites ?? !/^(off|false|0)$/i.test(
+      process.env.ZEROPG_FULL_PAGE_WRITES ?? '',
+    )
+    this.walCompression = opts.walCompression ?? process.env.ZEROPG_WAL_COMPRESSION
   }
 
   private commitIntervalMs: number
@@ -546,9 +601,11 @@ export class ZeroPG {
     }
   }
 
-  /** Persist WAL GUCs into the datadir (travels with snapshots), and probe
-   * whether this session can ship WAL incrementally: the flush-LSN function
-   * must exist and our LSN->filename math must agree with the server's. */
+  /** Persist WAL GUCs into the datadir (travels with snapshots), reconcile the
+   * per-instance WAL knobs (full_page_writes / wal_compression) so they are
+   * LIVE for this life's writes, and probe whether this session can ship WAL
+   * incrementally: the flush-LSN function must exist and our LSN->filename math
+   * must agree with the server's. */
   private async ensureWalConfig(): Promise<void> {
     try {
       const cur = await this.pg.query<{ name: string; setting: string }>(
@@ -560,7 +617,48 @@ export class ZeroPG {
         for (const [k, v] of WAL_GUCS) {
           await this.pg.exec(`ALTER SYSTEM SET ${k} = ${v}`)
         }
-        await this.pg.query('SELECT pg_reload_conf()')
+      }
+      // full_page_writes / wal_compression are per-instance choices (A1/A1.3),
+      // NOT part of WAL_GUCS: the live writer's setting must win over whatever
+      // the restored snapshot's postgresql.auto.conf carried. ALTER SYSTEM
+      // writes auto.conf now; the value becomes live below.
+      const fpw = this.fullPageWrites ? 'on' : 'off'
+      await this.pg.exec(`ALTER SYSTEM SET full_page_writes = ${fpw}`)
+      let walcApplied = false
+      if (this.walCompression) {
+        try {
+          await this.pg.exec(`ALTER SYSTEM SET wal_compression = ${this.walCompression}`)
+          walcApplied = true
+        } catch {
+          // codec not compiled into this PGlite WASM build — leave at default.
+        }
+      }
+      await this.pg.query('SELECT pg_reload_conf()')
+      // PGlite applies SIGHUP-context GUCs (max_wal_size, full_page_writes,
+      // wal_compression) only at PROCESS START — pg_reload_conf() does NOT make
+      // them live in-process (verified). So if the running value still differs
+      // from what we need, reopen the datadir ONCE: a clean shutdown + restart
+      // reads the auto.conf we just wrote, and this life's writes then use it
+      // (e.g. ship WAL with full_page_writes genuinely off). This self-heals —
+      // once any life's snapshot bakes the value into auto.conf, every later
+      // restore starts with it already live and skips the reopen, so steady
+      // state pays zero extra boot cost. FPW only governs WAL about to be
+      // WRITTEN; it never affects replay of WAL already shipped, so a reopen
+      // here (before this life's first commit) is safe.
+      const live = await this.pg.query<{ setting: string }>(
+        "SELECT setting FROM pg_settings WHERE name = 'full_page_writes'",
+      )
+      const liveWalc = walcApplied
+        ? (await this.pg.query<{ setting: string }>(
+            "SELECT setting FROM pg_settings WHERE name = 'wal_compression'",
+          )).rows[0]?.setting
+        : undefined
+      const fpwMismatch = live.rows[0]?.setting !== fpw
+      const walcMismatch = walcApplied && liveWalc !== this.walCompression
+      if (fpwMismatch || walcMismatch) {
+        await this.pg.close()
+        this.pg = await PGlite.create({ dataDir: this.dataDir })
+        await this.pg.waitReady
       }
     } catch {
       // Non-fatal: snapshots are just bigger than they need to be.

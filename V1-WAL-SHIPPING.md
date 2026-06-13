@@ -54,6 +54,35 @@ does zero writes. The boot/commit continuity guards stay as defense in depth.
 Cross-life chaining (record-boundary parsing of the WAL tail) is a v2
 investigation, not a v1 need.
 
+## Constraint: `wal_level` MUST stay `replica` (never `minimal`)
+
+This is a named, non-negotiable invariant of the WAL-shipping design, enforced
+by a guardrail comment at the `WAL_GUCS` list in `zeropg.ts` (TODO A1.2).
+
+We ship WAL. Our restore path reconstructs state by replaying the shipped LSN
+ranges over a base snapshot — so **anything Postgres does not route through the
+WAL is invisible to a restore until the next full snapshot.** Under the default
+`wal_level=replica`, every data change is WAL-logged, so every change is in some
+shipped segment. Under `wal_level=minimal`, Postgres applies an optimization
+that is normally harmless but is a silent-data-loss landmine for us: bulk
+operations against a relation created or truncated *in the same transaction* —
+`COPY` into a freshly-created table, `CREATE TABLE AS`, `CREATE INDEX`,
+`CLUSTER`, table-rewriting `ALTER TABLE` — **skip the WAL entirely** and only
+`fsync()` the underlying heap/index files at commit (the engine can do this
+safely on a single node because, if it crashes, the whole transaction is rolled
+back and the files are discarded). For zeropg this means the incremental commit
+after such an operation ships an LSN range that *does not contain the bulk
+load*; a successor that restores the snapshot and replays our segments recovers
+a database missing that table's contents, with no error — exactly the class of
+acked-then-vanished write the crash matrix exists to forbid. The loss heals
+only when a later compaction happens to tar up the heap files.
+
+We therefore keep `wal_level` at the engine default (`replica`) and deliberately
+do **not** list it in `WAL_GUCS`: a future change to it must be a conscious edit
+at the guardrail comment, where this reasoning is restated. (`minimal` would
+also break read replicas and disable point-in-time/standby use — but the
+data-loss path above is the reason it is forbidden *here*.)
+
 ## Manifest v2
 
 ```json
@@ -116,3 +145,28 @@ Litestream snapshots on every process start because, as an external observer wit
 3. Crash matrix: SIGKILL between segment PUT and manifest CAS (x20), mid-segment-PUT (x20), mid-compaction (x20) - every reopen is a clean pre- or post-commit state, replaying segments through Postgres recovery.
 4. WAL-file-switch boundary: force commits that straddle a 16MB segment switch; verify multi-entry commit restores correctly.
 5. Fencing: zombie ships a segment then loses CAS - segment is orphaned garbage, successor never references it (extend E1 zombie test to v2 manifests).
+
+## A1: full_page_writes=off — findings (measured)
+
+`full_page_writes` (FPW) is now a configurable per-instance GUC (`ZeroPGOptions.fullPageWrites`, default **on**; env `ZEROPG_FULL_PAGE_WRITES=off` for the harnesses). It is reconciled live in `ensureWalConfig`: PGlite applies SIGHUP-context GUCs only at process start (`pg_reload_conf()` is a no-op in-process — verified), so when the running value differs from what we want we ALTER SYSTEM it (writing `postgresql.auto.conf`) and reopen the datadir once. This self-heals: once a life's snapshot bakes the value into auto.conf, every later restore starts with it already live and skips the reopen, so steady state pays zero extra boot cost.
+
+**Why FPW is plausibly redundant here.** Postgres writes a full 8KB page image (FPI) into WAL on the first modification of each page after a checkpoint, solely to repair *torn pages* during LOCAL crash recovery. zeropg never recovers from a torn local datadir: the datadir lives on tmpfs (it vanishes with the instance, it is never fsck'd back to life), and recovery is always "restore the consistent post-CHECKPOINT snapshot, overlay complete CRC- and page-address-verified WAL, let Postgres replay." The base pages a restore replays over come from a clean snapshot, not from a possibly-torn local disk, so the FPIs repair a failure mode the architecture cannot enter.
+
+**Measured win (`experiments/efpw.ts`, results/fpw.jsonl).** Workload: 200 strict update-commits, each touching 250 random rows of a work table, after a clean compaction, at three DB sizes. FPW off vs on:
+
+| DB size | WAL/commit on | WAL/commit off | total WAL on→off | compactions on→off | snapshot/compaction |
+|---|---|---|---|---|---|
+| ~1 MB | ~1058 KB | ~46 KB | 200 → 9.1 MB | 11 → 3 | 4.6 MB |
+| ~50 MB | ~1066 KB | ~46 KB | 201 → 9.1 MB | 11 → 3 | 102 MB |
+| ~500 MB | ~1052 KB | ~46 KB | 199 → 9.1 MB | 11 → 3 | 555 MB |
+
+FPW off ships **~22x less WAL (~95% smaller)** per commit, and the per-commit WAL becomes flat and tiny (~46 KB) — it is pure row delta, no page images. Because the 16 MB compaction threshold is then reached ~3.7x slower, compactions drop 11→3 over the same workload; at 500 MB each *avoided* compaction saves a **555 MB snapshot upload**, so the second-order win (compaction-interval stretch) dwarfs the per-commit win at scale. The per-commit FPI cost is independent of DB size (it tracks pages touched, not bytes stored), which is why WAL/commit is identical across the three sizes.
+
+**A1.3 — wal_compression.** Only `pglz` is compiled into the PGlite WASM build (`lz4`/`zstd` are rejected; the option ignores unsupported codecs non-fatally). With FPW **on**, `wal_compression=pglz` shrinks WAL ~91% (201 MB → 17 MB at 50 MB DB) by compressing the FPIs in-WAL — nearly matching FPW-off. But FPW-off (9 MB) still beats pglz-on (17 MB), and once FPW is off there are essentially no FPIs left to compress, so pglz adds little on top of FPW-off. Recommendation: prefer FPW-off; `wal_compression=pglz` is a useful fallback for workloads that must keep FPW on (e.g. a future non-tmpfs deployment).
+
+**Crash gate (the decision gate, NOT a free win).** FPW-off only changes the bytes Postgres *writes*; it cannot affect replay of WAL already shipped. The risk it removes is local torn-page repair, which the model says it never needs — the E2b crash matrix and e4b handover races are exactly what would expose a base page that FPW would have repaired (kill mid-commit → reopen from snapshot+WAL → byte-identical verify). Run with FPW off:
+
+- **E2b crash matrix, `ZEROPG_FULL_PAGE_WRITES=off`, 20×3 = 60 SIGKILL rounds (2026-06-13):** ✅ PASSED — kill-before-snapshot 20/20, kill-after-snapshot 20/20, kill-during-manifest 20/20; every reopen a clean pre- or post-commit state, zero torn states. (The default-FPW=on matrix re-passed identically, 60/60.)
+- **e4b handover races, FPW off (2026-06-13):** ✅ PASSED — clean-release handover (B sees 3/3 notes), takeover handover (2/2), zombie fenced.
+
+**Decision: default stays `on`; FPW-off is a validated opt-in.** Per the project rule ("when unsure, keep the safe behavior and make FPW-off opt-in"), and because this touches the most dangerous code in the repo on a single session, the conservative default is FPW on. The evidence above shows FPW-off is *safe to enable* and worth a large amount (22x WAL, 3.7x fewer compactions, 555 MB snapshots avoided at scale) for any deployment that holds the tmpfs/restore-from-bucket invariant. Recommend promoting it to the default after it rides the 72h E5 soak with the crash matrix periodically re-run.
