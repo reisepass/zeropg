@@ -86,6 +86,16 @@ export interface CostModel {
   /** 0 where egress to the internet is free (R2). */
   internetEgressGbUsd: number
   /**
+   * Minimum billed storage duration of this store's tier, in days (Track D).
+   * Archive/Glacier/Infrequent-Access classes charge for a floor regardless of
+   * when an object is deleted (GCS Archive 365d, Coldline 90d; S3 Glacier
+   * 90-180d): deleting earlier still pays the remainder. The retention engine
+   * reads this to refuse early deletes and to warn when a configured policy
+   * would routinely churn under it. Omit/0 for Standard-class stores, where a
+   * delete is free at any age. See docs/D-COLD-BACKUP.md "cold-tier" note.
+   */
+  minStorageDurationDays?: number
+  /**
    * Sustained write cap per object NAME (GCS: ~1/s, soft, 429s beyond).
    * The manifest is one object name, so this caps strict-mode commit rate and
    * forces group-commit batching above it. Omit when no such limit exists.
