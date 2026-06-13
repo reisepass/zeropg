@@ -6,10 +6,13 @@ export {
   type ColdArchiverOptions,
   type BackupEntry,
   type BackupIndex,
+  type RetentionPolicy,
+  type RetentionResult,
   INDEX_KEY,
   encodeBackupIndex,
   decodeBackupIndex,
   backupKey,
+  retain,
 } from './archive.js'
 export {
   type Manifest,

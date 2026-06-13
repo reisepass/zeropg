@@ -91,6 +91,112 @@ export function backupKey(commitSeq: number, committedAt: string, codec: 'gzip' 
   return `backups/${seq}-${stamp}.tar${codec === 'gzip' ? '.gz' : ''}`
 }
 
+/** What to keep in the cold store. The keep-set is the UNION of every
+ * configured policy's keep-set: a backup survives if ANY policy wants it. */
+export interface RetentionPolicy {
+  /** Keep the N most-recent backups. */
+  keepLast?: number
+  /** Delete backups whose committedAt is older than X days. */
+  maxAgeDays?: number
+  /** Grandfather-father-son: keep the newest backup in each of the most-recent
+   * `daily` days, `weekly` ISO-weeks, and `monthly` months. */
+  gfs?: {
+    daily?: number
+    weekly?: number
+    monthly?: number
+  }
+  /** Honor the destination tier's minimum-storage-duration (default true): do
+   * not delete an object younger than the tier minimum, and warn when a policy
+   * would routinely churn under it. See CostModel.minStorageDurationDays. */
+  respectMinStorageDuration?: boolean
+}
+
+const DAY_MS = 86_400_000
+
+function utcDayKey(d: Date): string {
+  return d.toISOString().slice(0, 10) // YYYY-MM-DD
+}
+function utcMonthKey(d: Date): string {
+  return d.toISOString().slice(0, 7) // YYYY-MM
+}
+/** ISO-8601 year-week key (YYYY-Www), Monday-based, sortable lexically. */
+function isoWeekKey(d: Date): string {
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
+  // Thursday of this week decides the ISO year + week number.
+  const dayNum = (t.getUTCDay() + 6) % 7 // Mon=0 .. Sun=6
+  t.setUTCDate(t.getUTCDate() - dayNum + 3)
+  const firstThursday = new Date(Date.UTC(t.getUTCFullYear(), 0, 4))
+  const firstDayNum = (firstThursday.getUTCDay() + 6) % 7
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - firstDayNum + 3)
+  const week = 1 + Math.round((t.getTime() - firstThursday.getTime()) / (7 * DAY_MS))
+  return `${t.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
+}
+
+/** GFS keep-set: bucket the backups by day/week/month, keep the newest in each
+ * of the most-recent N buckets of each granularity. `sorted` is ascending. */
+function gfsKeep(sorted: BackupEntry[], gfs: NonNullable<RetentionPolicy['gfs']>): Set<string> {
+  const keep = new Set<string>()
+  const pick = (keyOf: (d: Date) => string, limit?: number) => {
+    if (!limit || limit <= 0) return
+    // Ascending walk: a later entry in the same bucket overwrites, so each
+    // bucket ends up mapped to its newest member.
+    const newestPerBucket = new Map<string, BackupEntry>()
+    for (const b of sorted) newestPerBucket.set(keyOf(new Date(b.committedAt)), b)
+    // Most-recent `limit` buckets: bucket keys sort lexically by time.
+    const bucketKeys = [...newestPerBucket.keys()].sort()
+    for (const bk of bucketKeys.slice(-limit)) keep.add(newestPerBucket.get(bk)!.key)
+  }
+  pick(utcDayKey, gfs.daily)
+  pick(isoWeekKey, gfs.weekly)
+  pick(utcMonthKey, gfs.monthly)
+  return keep
+}
+
+/**
+ * Pure retention decision (unit-tested in isolation): which backups to KEEP
+ * under `policy` at wall-clock `nowMs`. The clock is injected exactly as gc.ts
+ * does so retention is deterministically testable.
+ *
+ * The keep-set is the UNION across every configured policy, and the newest
+ * backup is ALWAYS kept regardless of policy — the cold store must never go
+ * empty while the feature is "on" (the GC-grace-rule analog). Returns the kept
+ * subset in newest-last order; deleting `backups \ retain(...)` is the caller's
+ * job (applyRetention).
+ */
+export function retain(backups: BackupEntry[], policy: RetentionPolicy, nowMs: number): BackupEntry[] {
+  if (backups.length === 0) return []
+  const sorted = [...backups].sort(
+    (a, b) => Date.parse(a.committedAt) - Date.parse(b.committedAt) || a.commitSeq - b.commitSeq,
+  )
+  const keep = new Set<string>()
+  // Invariant, always: never delete the most-recent backup.
+  keep.add(sorted[sorted.length - 1].key)
+
+  if (policy.keepLast && policy.keepLast > 0) {
+    for (const b of sorted.slice(-policy.keepLast)) keep.add(b.key)
+  }
+  if (policy.maxAgeDays && policy.maxAgeDays > 0) {
+    const cutoff = nowMs - policy.maxAgeDays * DAY_MS
+    for (const b of sorted) if (Date.parse(b.committedAt) >= cutoff) keep.add(b.key)
+  }
+  if (policy.gfs) {
+    for (const k of gfsKeep(sorted, policy.gfs)) keep.add(k)
+  }
+  return sorted.filter((b) => keep.has(b.key))
+}
+
+/** Outcome of an applyRetention sweep. */
+export interface RetentionResult {
+  /** Backups still present after the sweep (kept by policy or blocked). */
+  kept: BackupEntry[]
+  /** Backups deleted from the secondary (empty on dryRun). */
+  deleted: BackupEntry[]
+  /** Backups a policy wanted to delete but the cold-tier minimum-storage-
+   * duration guard kept (too young to delete without an early-deletion fee). */
+  blocked: BackupEntry[]
+  bytesFreed: number
+}
+
 export interface ColdArchiverOptions {
   /** Local scratch directory for the temp restore datadir. Default os.tmpdir(). */
   scratchDir?: string
@@ -260,6 +366,85 @@ export class ColdArchiver {
     if (!cur) return null
     const idx = decodeBackupIndex(cur.bytes)
     return idx.backups.find((b) => b.key === key) ?? null
+  }
+
+  /**
+   * Apply a retention policy to the cold store: compute the keep-set with the
+   * pure `retain`, delete everything outside it from the secondary, and rewrite
+   * the index — mirroring gc.ts's keep-set-first discipline (never delete
+   * outside the computed set).
+   *
+   * Cold-tier guard: when respectMinStorageDuration is set (default) and the
+   * destination's CostModel declares a minStorageDurationDays, an object younger
+   * than that minimum is NOT deleted (deleting early still pays the floored
+   * price — the opposite of the savings the cold tier is for); it is reported as
+   * `blocked` and survives in the index. A policy that would routinely churn
+   * under the minimum (e.g. maxAgeDays below it) is warned about.
+   */
+  async applyRetention(
+    policy: RetentionPolicy,
+    opts: { dryRun?: boolean } = {},
+  ): Promise<RetentionResult> {
+    const cur = await this.secondary.get(INDEX_KEY)
+    if (!cur) {
+      // No index: nothing exists to judge, so do nothing (cf. gc.ts on no manifest).
+      this.log({ event: 'zeropg-retention-skip', reason: 'no backup index' })
+      return { kept: [], deleted: [], blocked: [], bytesFreed: 0 }
+    }
+    const dryRun = opts.dryRun ?? false
+    const idx = decodeBackupIndex(cur.bytes)
+    const nowMs = this.now()
+    const keepKeys = new Set(retain(idx.backups, policy, nowMs).map((b) => b.key))
+
+    const minDays = this.secondary.cost?.minStorageDurationDays
+    const respectMin = policy.respectMinStorageDuration ?? true
+    if (respectMin && minDays && policy.maxAgeDays && policy.maxAgeDays < minDays) {
+      this.log({
+        event: 'zeropg-retention-warn',
+        reason: `maxAgeDays ${policy.maxAgeDays} on a tier with a ${minDays}-day minimum storage duration will incur early-deletion fees on every backup; raise maxAgeDays >= ${minDays} or use a Standard/IA-class bucket`,
+      })
+    }
+
+    const deleted: BackupEntry[] = []
+    const blocked: BackupEntry[] = []
+    let bytesFreed = 0
+    for (const b of idx.backups) {
+      if (keepKeys.has(b.key)) continue
+      // Min-storage-duration counts from object creation (createdAt).
+      if (respectMin && minDays) {
+        const ageDays = (nowMs - Date.parse(b.createdAt)) / DAY_MS
+        if (ageDays < minDays) {
+          blocked.push(b)
+          this.log({ event: 'zeropg-retention-blocked', key: b.key, ageDays: Math.floor(ageDays), minDays })
+          continue
+        }
+      }
+      if (!dryRun) await this.secondary.delete(b.key)
+      deleted.push(b)
+      bytesFreed += b.sizeBytes
+    }
+
+    // Survivors = policy-kept plus min-duration-blocked (those still exist).
+    const deletedKeys = new Set(deleted.map((b) => b.key))
+    const kept = idx.backups.filter((b) => !deletedKeys.has(b.key))
+    if (!dryRun && deleted.length > 0) {
+      const newIdx: BackupIndex = { version: 1, backups: kept }
+      // CAS the index against the version we read; a concurrent run racing us
+      // means our delete-set may be stale, so surface the conflict.
+      await this.secondary.put(INDEX_KEY, encodeBackupIndex(newIdx), {
+        ifMatch: cur.etag,
+        contentType: 'application/json',
+      })
+    }
+    this.log({
+      event: 'zeropg-retention-ok',
+      dryRun,
+      kept: kept.length,
+      deleted: deleted.length,
+      blocked: blocked.length,
+      bytesFreed,
+    })
+    return { kept, deleted, blocked, bytesFreed }
   }
 
   /**
