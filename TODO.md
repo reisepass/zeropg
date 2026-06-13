@@ -66,20 +66,59 @@ conditional-write semantics (step 2 is non-negotiable).
 
 ---
 
-## Track A — writer / Postgres-engine (continue on GCS + Cloud Run)
+## Track C — IBM Cloud (Code Engine + COS): the next experiment after R2
 
-> **Status 2026-06-13.** A1 **landed**: `full_page_writes` is configurable
-> (`ZeroPGOptions.fullPageWrites` / `ZEROPG_FULL_PAGE_WRITES`), plus
-> `wal_compression`. Default stays stock-safe ON; OFF ships **~22× less WAL**
-> (~46KB vs ~1MB per update-commit) and cut compactions 11→3 over 200 commits
-> (`results/fpw.jsonl`). **Crash-gated on main**: E2b 20/20/20 + e4b pass with
-> FPW both on AND off (`results/trackA-merge-battery.log`) — FPW-off proven
-> safe to enable; kept opt-in pending the E5 soak. A1.2 **done** (wal_level
-> guardrail comment + V1-WAL-SHIPPING.md constraint). A1.3 measured (only
-> `pglz` in the WASM build). A2 **design only** —
-> [docs/A2-NUMBERED-MANIFESTS.md](docs/A2-NUMBERED-MANIFESTS.md), no change to
-> the commit point yet. **Remaining: A2 implementation, A3 output gates, A4
-> dedup-chunking / client-encryption, A5 the 72h E5 soak.**
+The most interesting next platform. IBM Cloud has **both** halves of a perfect
+match for zeropg: **Cloud Object Storage** (25GB free Lite tier) and **Code
+Engine**, a scale-to-zero container runtime that is a near-exact analog of
+Cloud Run. So the experiment is: run the *whole* zeropg stack — writer +
+storage — entirely inside IBM Cloud, the same shape we proved on GCS, on the
+most generous free tier found in the storage survey ([docs/STORAGE-BACKENDS.md](docs/STORAGE-BACKENDS.md)).
+
+> **Prepared 2026-06-13 — credentials + storage are live on the orchestrator VM:**
+> - `ibmcloud` CLI installed on blob-pglite-dev, logged in via API key
+>   (account "Forest Protocols Inc", region eu-de); `cloud-object-storage` and
+>   `code-engine` plugins installed.
+> - COS Lite instance `zeropg-cos` + bucket `zeropg-exp-eude-cd4040f4` created.
+> - HMAC credentials + endpoints + bucket in `~/.zeropg-ibm.env` (chmod 600,
+>   NOT in the repo). `source ~/.zeropg-ibm.env` to use.
+> - **CAS confirmed live**: a probe through our own `R2BlobStore` (S3+SigV4)
+>   pointed at the COS endpoint passed both create-if-absent AND
+>   compare-and-swap-on-update. So **the existing S3 transport already drives
+>   IBM COS with zero new transport code** — just construct `R2BlobStore` with
+>   `endpoint=$COS_ENDPOINT`, the HMAC keys, and `region=eu-de`.
+
+Steps:
+
+1. **Confirm the storage half is wired** (done in spirit): run the
+   transport-agnostic `experiments/cas-conformance.ts` against COS (point it at
+   the env above) so the per-backend gate is on record alongside GCS/R2. Decide
+   whether COS deserves a named `IbmCosBlobStore` thin wrapper (endpoint +
+   `casStrength: 'etag'`) or just documented `R2BlobStore` construction.
+2. **Code Engine deploy**: containerize the e3-service (already built) and
+   `ibmcloud ce application create` it with scale-to-zero (min-scale 0,
+   max-scale 1, concurrency 1 — the Cloud Run flags have direct CE analogs).
+   Use the COS **direct** endpoint (`$COS_ENDPOINT_DIRECT`,
+   `s3.direct.eu-de…`) from inside Code Engine — same-cloud, no egress.
+3. **Port the experiment harness**: E3 (cold-start distribution — CE's
+   cold-start floor vs Cloud Run's ~2s is the headline unknown), E2c
+   (incremental round-trip + crash matrix) against COS, E4 (CE lifecycle:
+   scale-to-zero handoff, SIGTERM grace, the idle-shutdown-vs-new-request race
+   — CE's revision/scaling behavior may differ from Cloud Run's). Reuse the
+   JSONL result format; this produces the IBM column for the cost/perf tables.
+4. **Cost reconcile**: COS Lite 25GB free + CE free grant (vCPU-s/GiB-s monthly,
+   like Cloud Run's). Update [COST-MODEL.md](COST-MODEL.md) and
+   [BREAK-EVEN.md](BREAK-EVEN.md) with a measured IBM row — IBM may be the
+   cheapest all-in free-tier home (25GB storage vs R2's 10GB / GCS's US-only 5GB).
+
+**Watch:** Code Engine cold-start latency and CPU-throttling behavior between
+requests (the E4 lease-liveness bet — request-path lease validation, no
+background work — must re-hold on CE); COS `If-None-Match: *` wildcard already
+confirmed; CE's max instance / concurrency knobs map to the single-writer model.
+
+---
+
+## Track A — writer / Postgres-engine (continue on GCS + Cloud Run)
 
 ### A1. Postgres WAL-reduction GUCs (the under-explored lever)
 
