@@ -53,6 +53,16 @@ Two provider realities are engineered around (see [COST-MODEL.md](COST-MODEL.md)
 
 `sleep` is the serverless-native mode: writes run at memory speed while traffic flows, and one flush happens when the platform puts the instance to sleep. The demo pages show the per-step timing of the last write (SQL exec / lease check / WAL scan / upload / manifest CAS) — and a "durable now" checkbox to feel the difference per write.
 
+## The first write after a cold start (and why it must be async)
+
+There is exactly one write per instance life that costs more than the others: the **first** one. When an instance wakes from zero it inherits a WAL position from whatever instance ran last, and that hand-off can't be spliced — the dead writer's recorded flush LSN sits a record-header past the last replayable record, so a successor that just appended to it could ship a torn tail and silently lose a committed write (the full reasoning, and the live byte-level forensics behind it, are in [V1-WAL-SHIPPING.md](V1-WAL-SHIPPING.md)). Litestream solves this by starting a new *generation* — a fresh full snapshot — on every restart that can't prove WAL continuity.
+
+zeropg does the cheaper, equivalent thing: the first commit of each life **re-baselines just the WAL** since the current snapshot, read from the new instance's own coherent on-disk stream between two clean boundaries, never the predecessor's ragged tail. The existing database snapshot is reused untouched. So the one-time cost is bounded by the WAL since the last compaction (≤16 MB), not by database size: on the 500 MB demo the first durable write after a cold start is **~350 ms / 3 MB**, where a full re-snapshot would be **~18 s / 533 MB**. Every write after it in that life is a plain incremental WAL ship of a few hundred bytes.
+
+**But cheap is not the point — off the request path is.** A one-time, per-instance housekeeping cost should never land on a *user's* click. It is the wrong thing to make a person wait on, and it is avoidable: the durability dial exists precisely so the first write (and every write) can return at memory speed and let the baseline ride a **background** flush. In `sleep` or `interval` mode the user's write acknowledges in ~150 µs–ms from memory; the re-baseline happens on the idle-flush timer, on `waitUntil`, or on the SIGTERM that puts the instance to sleep — never blocking the response. Only `strict` mode puts durability (and therefore the first-write baseline) on the critical path, and that is a deliberate choice you make for a workload that needs ack-equals-durable, not the default for an interactive page.
+
+This is the same bargain Litestream and every object-storage-backed database make: a bucket round-trip is 50–150 ms and the cold-start baseline is a one-off on top of that, so for anything user-facing you **ack from memory and persist in the background**, accepting a bounded, well-defined loss window instead of taxing the interactive path. zeropg makes that window explicit (the table above), makes the baseline cheap, and — most importantly — keeps it asynchronous by default.
+
 ## Use it
 
 ```ts
