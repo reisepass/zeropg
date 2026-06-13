@@ -5,3 +5,7 @@ results/*.log
 _waltest.mjs
 .claude/worktrees/
 _debug-*.mjs
+
+# secrets
+.env
+*.env
