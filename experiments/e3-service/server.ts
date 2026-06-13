@@ -50,6 +50,12 @@ function selectStore(): BlobStore {
   return new GcsBlobStore({ bucket: BUCKET, prefix: DB_PREFIX })
 }
 const APP_LABEL = process.env.APP_LABEL ?? 'zeropg demo'
+// Human label for the storage backend, shown on the demo page. Env-driven so a
+// single image serves every backend without hardcoded copy. Falls back to a
+// generic phrase derived from the transport when unset.
+const BACKEND_LABEL =
+  process.env.ZEROPG_BACKEND_LABEL ??
+  (USE_COS ? 'an S3-compatible object store' : 'Google Cloud Storage')
 // Durability: 'sleep' (default) = writes live in memory, one snapshot upload
 // when Cloud Run tells us to sleep (SIGTERM). 'interval' = background flush
 // every second. 'strict' = every write commits to the bucket before returning.
@@ -451,7 +457,7 @@ function renderPage(
  #benchlog{background:#1e1e1e;color:#cfe8ff;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:.8rem 1rem;border-radius:8px;margin:.8rem 0 0;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 </style></head><body>
 <h1>${escapeHtml(APP_LABEL)}</h1>
-<div class="sub">A real Postgres, living in ${USE_COS ? 'an IBM COS' : 'a GCS'} bucket. No database server. Scales to zero.</div>
+<div class="sub">A real Postgres, living in ${escapeHtml(BACKEND_LABEL)}. No database server. Scales to zero.</div>
 ${banner}
 <table>
  <tr><td>database size</td><td><b>${dbMB} MB</b> on disk</td></tr>
