@@ -68,6 +68,19 @@ conditional-write semantics (step 2 is non-negotiable).
 
 ## Track A — writer / Postgres-engine (continue on GCS + Cloud Run)
 
+> **Status 2026-06-13.** A1 **landed**: `full_page_writes` is configurable
+> (`ZeroPGOptions.fullPageWrites` / `ZEROPG_FULL_PAGE_WRITES`), plus
+> `wal_compression`. Default stays stock-safe ON; OFF ships **~22× less WAL**
+> (~46KB vs ~1MB per update-commit) and cut compactions 11→3 over 200 commits
+> (`results/fpw.jsonl`). **Crash-gated on main**: E2b 20/20/20 + e4b pass with
+> FPW both on AND off (`results/trackA-merge-battery.log`) — FPW-off proven
+> safe to enable; kept opt-in pending the E5 soak. A1.2 **done** (wal_level
+> guardrail comment + V1-WAL-SHIPPING.md constraint). A1.3 measured (only
+> `pglz` in the WASM build). A2 **design only** —
+> [docs/A2-NUMBERED-MANIFESTS.md](docs/A2-NUMBERED-MANIFESTS.md), no change to
+> the commit point yet. **Remaining: A2 implementation, A3 output gates, A4
+> dedup-chunking / client-encryption, A5 the 72h E5 soak.**
+
 ### A1. Postgres WAL-reduction GUCs (the under-explored lever)
 
 The research was storage-systems-centric and skipped the engine knobs that
