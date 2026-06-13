@@ -10,6 +10,18 @@ bucket or the live Cloud Run demos. Background and ranking: [docs/ROADMAP.md](do
 
 ## Track B — Cloudflare R2 (do this in parallel, high priority)
 
+> **Status 2026-06-13 — landed (build + design); live-R2 gate pending creds.**
+> `R2BlobStore` (S3 API + SigV4, streaming + multipart + R2 `CostModel`) in
+> `packages/blobstore/src/r2.ts`; transport-agnostic CAS conformance suite
+> (`experiments/cas-conformance.ts`) **passes all 5 probes against GCS** and is
+> one env-block from gating real R2; `casStrength` tier added to `CostModel`
+> (GCS `generation` / R2 `etag`, ABA shown moot — B3 done); Durable-Object
+> compute recommendation + Workers/DO porting plan + free-egress replica plan in
+> [docs/R2.md](docs/R2.md), with a typechecking DO/Worker skeleton in
+> `examples/cloudflare-do/`. **Blocked on real R2 credentials:** the live-R2
+> conformance run (the non-negotiable per-backend gate), deploying the DO/Worker,
+> and porting E2c/E3/E4 for real numbers.
+
 Bring zeropg up on R2 + a scale-to-zero compute, mirroring what we proved on
 GCS + Cloud Run. R2 is the cost-optimal home (free egress, cheap storage,
 generous free tier — see [COST-MODEL.md](COST-MODEL.md)), so it is the next
