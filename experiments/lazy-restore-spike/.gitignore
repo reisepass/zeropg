@@ -1,0 +1,3 @@
+# Throwaway debug scripts from the emscripten create-path investigation.
+# Kept on disk for reference but not part of the deliverable.
+_dbg*.mjs

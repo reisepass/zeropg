@@ -110,4 +110,78 @@ prefetch can't hide it).
 
 ## Step 3 - interception POC
 
-See the "Step 3" section appended below after the POC run.
+Step 1 concluded reads ARE interceptable, so this step ran.
+
+### What was built
+
+- `lazy-fs.mjs` - `LazyFS`, a subclass of the **public** `BaseFilesystem`
+  (`@electric-sql/pglite/basefs`). It overrides `read(fd, buffer, offset,
+  length, position)` - the exact method pglite's `stream_ops.read` delegates to
+  (`src/fs/base.ts:438`, see `NOTES-pglite-fs.md`). For files matching a
+  predicate, `read` serves bytes from a SEPARATE "remote" store instead of the
+  datadir file; all other ops delegate to a real local datadir via `node:fs`.
+- `intercept-unit.mjs` - drives `LazyFS` through the same call shape pglite
+  uses (`open` -> `read(fd, heapView, offset, length, position)` -> `close`),
+  reading a Uint8Array view over an ArrayBuffer "heap".
+- `intercept-poc.mjs` - the full end-to-end attempt: boot normal PGlite, build a
+  table, externalize its relation file, zero the datadir copy, reboot with
+  `LazyFS` and re-run the query.
+
+### Result: the read intercept is PROVEN; full-boot VFS is incomplete
+
+**`intercept-unit.mjs` PASSES** (`node experiments/lazy-restore-spike/intercept-unit.mjs`):
+
+| check | result |
+|---|---|
+| 64 x 8KB blocks of the intercepted relation match the ORIGINAL bytes | 0 mismatches |
+| full-file sha256 via the read path == source hash | match (datadir copy was zeroed) |
+| intercepted read count / bytes | 129 reads, ~1.05 MB, all `source: 'remote'` |
+| non-intercepted file reads straight from datadir | correct |
+| mid-file sub-block read (offset 12345, len 3000) | byte-correct |
+
+Because the datadir copy of the relation was **overwritten with zeros**, the
+only way to get correct bytes is the intercept actually firing and supplying
+them. It does. This proves the load-bearing claim of Step 3: we own the
+synchronous read and can supply byte-identical data from an alternate source,
+exactly through the method pglite calls.
+
+**The full end-to-end PGlite boot (`intercept-poc.mjs`) does NOT yet pass.** The
+blocker is unrelated to read interception: a from-scratch writable `BaseFilesystem`
+must satisfy Postgres's boot/create path, and `LazyFS`'s file-creation path is
+incomplete. Concretely, Postgres's create of `postmaster.pid` (and during initdb,
+`PG_VERSION`) fails with `Bad file descriptor`. Tracing shows
+`BaseFilesystem.writeFile` (the `node_ops.mknod` hook) is **never invoked** for
+these new files during boot, so `stream_ops.open` leaves `stream.nfd` undefined
+and the subsequent write hits an undefined fd -> EBADF. The conf-file and
+PG_VERSION READS during boot DO route correctly through `LazyFS` (observed in the
+debug trace), confirming the read hook itself is wired right; the gap is purely
+the file-CREATE/mode handling on the write side.
+
+This is an FS-completeness engineering task, **orthogonal to the spike's
+kill-criterion** (which is about read interceptability, already proven in Step 1
+from source and in `intercept-unit.mjs` at runtime). The fix is to mirror
+`OpfsAhpFS`'s node creation precisely (it maintains its own node tree with
+explicit `INITIAL_MODE.FILE = 32768` mode bits so `FS.isFile(node.mode)` is true
+on a freshly created file) rather than leaning on `node:fs` + `lstat` for newly
+mknod'd files. That, or seed the datadir via `loadDataDir` so no files are
+created through the custom FS during boot. Either is a follow-up, not a
+re-architecture.
+
+### What Step 3 proves vs leaves open
+
+- PROVEN: the intercept fires through pglite's actual read method and returns
+  byte-identical data from an alternate store; non-target files are unaffected;
+  partial/offset reads are correct. Combined with the Step 1 source proof that
+  pglite invokes exactly this method, the read-side cold-start mechanism is
+  validated end-to-end at the read layer.
+- OPEN: a complete, boot-capable custom VFS (the write/create path). Needed
+  before a real PGlite boots on sparse placeholders + intercept. Tractable;
+  mirror `OpfsAhpFS`'s node-mode handling or seed via `loadDataDir`.
+
+### Reproduce
+
+```
+node experiments/lazy-restore-spike/intercept-unit.mjs   # PASSES - the read-intercept proof
+node experiments/lazy-restore-spike/intercept-poc.mjs    # full boot - fails at postmaster.pid create (write-path VFS gap)
+```
+
