@@ -61,6 +61,20 @@ export function makeRng(seed = 1) {
   }
 }
 
+// Return a copy of a profile with the base first-byte latency overridden, and
+// the jitter/tail scaled proportionally so the distribution shape is preserved.
+// Used by the latency-sensitivity sweep (the dominant unknown until we have real
+// GCS/S3 numbers).
+export function withTTFB(profile, baseMs) {
+  const ratio = baseMs / profile.ttfbBaseMs
+  return {
+    ...profile,
+    ttfbBaseMs: baseMs,
+    ttfbJitterMs: profile.ttfbJitterMs * ratio,
+    ttfbTailMs: profile.ttfbTailMs * ratio,
+  }
+}
+
 // Sample one request's first-byte latency (ms) from a profile.
 export function sampleTTFB(profile, rng) {
   if (rng() < profile.tailProb) {

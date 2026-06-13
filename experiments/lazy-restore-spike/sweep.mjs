@@ -20,7 +20,7 @@
 import { dirname, join } from 'node:path'
 import { readFileSync, appendFileSync, writeFileSync, existsSync } from 'node:fs'
 import {
-  PROVIDER_PROFILES, makeRng, modelRequests, coalesceToGroups, transferMs, sampleTTFB,
+  PROVIDER_PROFILES, makeRng, modelRequests, coalesceToGroups, transferMs, sampleTTFB, withTTFB,
 } from './store-model.mjs'
 
 const HERE = dirname(new URL(import.meta.url).pathname)
@@ -42,6 +42,12 @@ const PROFILES = Object.keys(PROVIDER_PROFILES)
 // Prefetch modes: off (serial reactive faults) vs query-plan frontrunning
 // (all touched groups issued up front, bounded by parallelism).
 const PREFETCH = [false, true]
+
+// Latency-sensitivity axis: vary modeled first-byte latency (ms) for ONE
+// representative profile to see how far the crossover moves. This isolates the
+// single biggest unknown (real GCS/S3 first-byte latency).
+const LATENCY_SWEEP_MS = [5, 15, 30, 60, 120]
+const LATENCY_REF_PROFILE = 'gcs-same-region'
 
 function percentile(sorted, p) {
   if (sorted.length === 0) return 0
@@ -106,6 +112,8 @@ const meta = {
   groupSizes: GROUP_SIZES,
   profiles: PROFILES,
   prefetch: PREFETCH,
+  latencySweepMs: LATENCY_SWEEP_MS,
+  latencyRefProfile: LATENCY_REF_PROFILE,
   eagerSetBytes: EAGER_SET_BYTES,
   datadirOverhead: 1.15,
   note: 'object-store latency/bandwidth are ESTIMATES (store-model.mjs); replace with measured GCS/S3 numbers',
@@ -113,34 +121,18 @@ const meta = {
 }
 appendFileSync(outFile, JSON.stringify(meta) + '\n')
 
-const cells = []
-for (const fp of footprints) {
-  for (const profileName of PROFILES) {
-    for (const groupBytes of GROUP_SIZES) {
-      for (const prefetch of PREFETCH) {
-        cells.push({ fp, profileName, groupBytes, prefetch })
-      }
-    }
-  }
-}
-console.error(`${cells.length} cells x ${ITERS} iters = ${cells.length * ITERS} trials`)
-
-const tStart = Date.now()
-let done = 0
-for (const cell of cells) {
-  const { fp, profileName, groupBytes, prefetch } = cell
-  const profile = PROVIDER_PROFILES[profileName]
+// Evaluate one cell: returns the full result record. `profile` is the (possibly
+// latency-overridden) profile object; `profileName` is the label.
+function evalCell(fp, profile, profileName, groupBytes, prefetch, extra = {}) {
   const datadirBytes = Math.round(fp.relSizeBytes * 1.15)
-
-  // Coalesce the real touched blocks into page-groups for THIS group size.
   const groupSizes = coalesceToGroups(fp.touchedBlocks, groupBytes)
 
   const lazySamples = new Float64Array(ITERS)
   const eagerSamples = new Float64Array(ITERS)
   let lazyBytes = 0, lazyReqs = 0, eagerBytes = 0, eagerReqs = 0
-  // Deterministic but cell-specific seed.
   const rng = makeRng(
-    1 + (fp.sizeMB * 131) + profileName.length * 17 + groupBytes + (prefetch ? 7 : 0),
+    1 + (fp.sizeMB * 131) + profileName.length * 17 + groupBytes + (prefetch ? 7 : 0) +
+    Math.round((profile.ttfbBaseMs || 0) * 1000) + (fp.shape ? fp.shape.length * 3 : 0),
   )
   for (let i = 0; i < ITERS; i++) {
     const l = lazyTrialMs(groupSizes, profile, rng, prefetch)
@@ -156,14 +148,12 @@ for (const cell of cells) {
   const lazyP99 = percentile(lazySorted, 99)
   const eagerP50 = percentile(eagerSorted, 50)
   const eagerP99 = percentile(eagerSorted, 99)
-
   const winner = lazyP50 < eagerP50 ? 'lazy' : 'eager'
-  const margin = eagerP50 / lazyP50 // >1 means lazy faster
+  const margin = eagerP50 / lazyP50
 
-  const rec = {
+  return {
     sizeMB: fp.sizeMB,
     shape: fp.shape,
-    wsRatio: fp.wsRatio,
     profile: profileName,
     groupKB: groupBytes / 1024,
     prefetch,
@@ -171,7 +161,10 @@ for (const cell of cells) {
     datadirBytes,
     totalBlocks: fp.totalBlocks,
     touchedBlocks: fp.touchedCount,
-    touchedFrac: +(fp.touchedCount / fp.totalBlocks).toFixed(4),
+    touchedFrac: +(fp.touchedCount / fp.totalBlocks).toFixed(5),
+    relationsTouched: fp.relationsTouched,
+    relationsTotal: fp.relationsTotal,
+    touchStddev: fp.touchStddev,
     groupsFaulted: groupSizes.length,
     lazyBytes,
     lazyRequests: lazyReqs,
@@ -184,14 +177,54 @@ for (const cell of cells) {
     winner,
     speedup_lazy_vs_eager: +margin.toFixed(2),
     iters: ITERS,
+    ...extra,
   }
+}
+
+const cells = []
+for (const fp of footprints) {
+  for (const profileName of PROFILES) {
+    for (const groupBytes of GROUP_SIZES) {
+      for (const prefetch of PREFETCH) {
+        cells.push({ fp, profileName, groupBytes, prefetch })
+      }
+    }
+  }
+}
+console.error(`main sweep: ${cells.length} cells x ${ITERS} iters`)
+
+const tStart = Date.now()
+let done = 0
+for (const cell of cells) {
+  const { fp, profileName, groupBytes, prefetch } = cell
+  const profile = PROVIDER_PROFILES[profileName]
+  const rec = evalCell(fp, profile, profileName, groupBytes, prefetch, { pass: 'main' })
   appendFileSync(outFile, JSON.stringify(rec) + '\n')
   done++
   if (done % 25 === 0 || done === cells.length) {
-    console.error(`[${done}/${cells.length}] ${fp.sizeMB}MB ${fp.shape} ws=${fp.wsRatio} ` +
+    console.error(`[${done}/${cells.length}] ${fp.sizeMB}MB ${fp.shape} ` +
       `${profileName} grp=${groupBytes / 1024}KB pf=${prefetch} -> ` +
-      `lazy ${rec.lazyTTFQ_p50_ms}ms vs eager ${rec.eagerFull_p50_ms}ms = ${winner} (${margin.toFixed(1)}x) ` +
+      `lazy ${rec.lazyTTFQ_p50_ms}ms vs eager ${rec.eagerFull_p50_ms}ms = ${rec.winner} (${rec.speedup_lazy_vs_eager}x) ` +
       `[${((Date.now() - tStart) / 1000).toFixed(0)}s]`)
   }
 }
-console.error('sweep done ->', outFile, `(${((Date.now() - tStart) / 1000).toFixed(0)}s)`)
+console.error(`main sweep done (${((Date.now() - tStart) / 1000).toFixed(0)}s)`)
+
+// ---------------------------------------------------------------------------
+// Latency-sensitivity pass: vary modeled first-byte latency for one profile,
+// fixed at prefetch ON + 1MB groups (the recommended operating point), across
+// all footprints. Records carry pass:'latency' and a latencyMs field so analyze
+// can build the "crossover vs latency" table.
+// ---------------------------------------------------------------------------
+console.error(`latency sweep: ${LATENCY_SWEEP_MS.length} latencies x ${footprints.length} footprints`)
+const baseProfile = PROVIDER_PROFILES[LATENCY_REF_PROFILE]
+for (const latencyMs of LATENCY_SWEEP_MS) {
+  const profile = withTTFB(baseProfile, latencyMs)
+  for (const fp of footprints) {
+    const rec = evalCell(fp, profile, LATENCY_REF_PROFILE, 1024 * 1024, true, {
+      pass: 'latency', latencyMs,
+    })
+    appendFileSync(outFile, JSON.stringify(rec) + '\n')
+  }
+}
+console.error('sweep done ->', outFile, `(${((Date.now() - tStart) / 1000).toFixed(0)}s total)`)

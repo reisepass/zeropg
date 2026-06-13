@@ -1,7 +1,8 @@
-// Analyze sweep-results.jsonl and emit POLICY.md: the EAGER-vs-LAZY crossover
-// surface in plain terms, plus a shouldUseLazy(stats) decision function.
+// Analyze sweep-results.jsonl (Phase 3, multi-relation, shape-based) and emit
+// POLICY.md: the EAGER-vs-LAZY crossover surface per query shape + provider, the
+// latency-sensitivity table, variance flags, and a shouldUseLazy() function.
 //
-// Run: node experiments/lazy-restore-spike/analyze.mjs [resultsFile] [policyFile]
+// Run: node experiments/lazy-restore-spike/analyze.mjs [resultsFile] [policyFile] [footprintsFile]
 
 import { dirname, join } from 'node:path'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
@@ -9,202 +10,246 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 const HERE = dirname(new URL(import.meta.url).pathname)
 const resultsFile = process.argv[2] || join(HERE, 'sweep-results.jsonl')
 const policyFile = process.argv[3] || join(HERE, 'POLICY.md')
+const footprintsFile = process.argv[4] || join(HERE, 'footprints.jsonl')
 
-if (!existsSync(resultsFile)) {
-  console.error('results not found:', resultsFile)
-  process.exit(1)
-}
+if (!existsSync(resultsFile)) { console.error('results not found:', resultsFile); process.exit(1) }
 const lines = readFileSync(resultsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
 const meta = lines.find((l) => l._meta)
 const rows = lines.filter((l) => !l._meta)
+const main = rows.filter((r) => r.pass === 'main' || r.pass === undefined)
+const latency = rows.filter((r) => r.pass === 'latency')
 
-function fmt(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 's' : n.toFixed(0) + 'ms' }
+const footprints = existsSync(footprintsFile)
+  ? readFileSync(footprintsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  : []
 
-// Build a markdown table for a given profile + prefetch + group size: rows = size,
-// cols = ws ratio (using indexedRange shape as the representative tunable shape).
-function tableFor(shape, profile, prefetch, groupKB) {
-  const sub = rows.filter((r) => r.shape === shape && r.profile === profile && r.prefetch === prefetch && r.groupKB === groupKB)
-  const sizes = [...new Set(sub.map((r) => r.sizeMB))].sort((a, b) => a - b)
-  const wss = [...new Set(sub.map((r) => r.wsRatio))].sort((a, b) => a - b)
-  let out = '\n| DB size \\ working-set | ' + wss.map((w) => (w * 100) + '%').join(' | ') + ' |\n'
-  out += '|' + '---|'.repeat(wss.length + 1) + '\n'
+const profiles = [...new Set(main.map((r) => r.profile))]
+const shapes = [...new Set(main.map((r) => r.shape))]
+const sizes = [...new Set(main.map((r) => r.sizeMB))].sort((a, b) => a - b)
+const groupKBs = [...new Set(main.map((r) => r.groupKB))].sort((a, b) => a - b)
+
+// Operating point for headline numbers: prefetch ON, 1MB groups.
+const OP = (r) => r.prefetch === true && r.groupKB === 1024
+
+function crossover(shape, profile) {
+  const sub = main.filter((r) => OP(r) && r.shape === shape && r.profile === profile && r.winner === 'lazy')
+    .sort((a, b) => a.sizeMB - b.sizeMB)
+  return sub.length ? sub[0].sizeMB : null
+}
+
+function gridFor(profile) {
+  let out = '\n| DB size \\ shape | ' + shapes.join(' | ') + ' |\n'
+  out += '|' + '---|'.repeat(shapes.length + 1) + '\n'
   for (const sz of sizes) {
-    const cells = wss.map((w) => {
-      const r = sub.find((x) => x.sizeMB === sz && x.wsRatio === w)
+    const cells = shapes.map((sh) => {
+      const r = main.find((x) => OP(x) && x.sizeMB === sz && x.shape === sh && x.profile === profile)
       if (!r) return '-'
-      const tag = r.winner === 'lazy' ? `L ${r.speedup_lazy_vs_eager}x` : `E ${(1 / r.speedup_lazy_vs_eager).toFixed(1)}x`
-      return tag
+      return r.winner === 'lazy' ? `L ${r.speedup_lazy_vs_eager}x` : `E ${(1 / r.speedup_lazy_vs_eager).toFixed(1)}x`
     })
     out += `| ${sz}MB | ${cells.join(' | ')} |\n`
   }
   return out
 }
 
-// Find the crossover: smallest DB size where lazy wins, per profile, for a small
-// working set (<=5%), indexedRange, prefetch on, 1MB groups.
-function crossover(profile) {
-  const sub = rows.filter((r) =>
-    r.profile === profile && r.shape === 'indexedRange' && r.prefetch === true &&
-    r.groupKB === 1024 && r.wsRatio <= 0.05)
-  const wins = sub.filter((r) => r.winner === 'lazy').sort((a, b) => a.sizeMB - b.sizeMB)
-  return wins.length ? wins[0].sizeMB : null
+function shapeWorkingSets() {
+  const byShape = {}
+  for (const fp of footprints) {
+    byShape[fp.shape] = byShape[fp.shape] || []
+    byShape[fp.shape].push(fp.touchedFrac)
+  }
+  return Object.fromEntries(Object.entries(byShape).map(([s, fr]) =>
+    [s, fr.reduce((a, b) => a + b, 0) / fr.length]))
 }
 
-// Largest working-set ratio at which lazy still wins for a 500MB DB (or largest
-// available), indexedRange, prefetch on, 1MB groups, per profile.
+function latencyCrossover(shape) {
+  const ref = meta?.latencyRefProfile
+  const out = []
+  for (const lat of meta?.latencySweepMs ?? []) {
+    const sub = latency.filter((r) => r.latencyMs === lat && r.shape === shape && r.profile === ref && r.winner === 'lazy')
+      .sort((a, b) => a.sizeMB - b.sizeMB)
+    out.push({ latencyMs: lat, crossoverMB: sub.length ? sub[0].sizeMB : null })
+  }
+  return out
+}
+
+function noisyScenarios() {
+  return footprints.filter((f) => (f.touchStddev ?? 0) > 0)
+    .map((f) => ({ sizeMB: f.sizeMB, shape: f.shape, stddev: f.touchStddev, min: f.touchMin, max: f.touchMax, mean: f.touchMean }))
+}
+
 function maxWinningWs(profile) {
-  const maxSize = Math.max(...rows.map((r) => r.sizeMB))
-  const sub = rows.filter((r) =>
-    r.profile === profile && r.shape === 'indexedRange' && r.prefetch === true &&
-    r.groupKB === 1024 && r.sizeMB === maxSize && r.winner === 'lazy')
-  return sub.length ? Math.max(...sub.map((r) => r.wsRatio)) : null
+  const maxSize = Math.max(...sizes)
+  const winners = main.filter((r) => OP(r) && r.profile === profile && r.sizeMB === maxSize && r.winner === 'lazy')
+  return winners.length ? Math.max(...winners.map((r) => r.touchedFrac)) : 0
 }
 
-// Full-scan: does lazy ever win on a full scan? (the adversarial case)
-function fullScanVerdict(profile) {
-  const sub = rows.filter((r) => r.profile === profile && r.shape === 'fullScan' && r.prefetch === true && r.groupKB === 1024)
-  const lazyWins = sub.filter((r) => r.winner === 'lazy').length
-  return { total: sub.length, lazyWins, examples: sub.map((r) => ({ sizeMB: r.sizeMB, winner: r.winner, speedup: r.speedup_lazy_vs_eager })) }
-}
+const ws = shapeWorkingSets()
+const lowWsShape = Object.entries(ws).sort((a, b) => a[1] - b[1])[0]?.[0] ?? shapes[0]
 
-const profiles = [...new Set(rows.map((r) => r.profile))]
-const groupKBs = [...new Set(rows.map((r) => r.groupKB))].sort((a, b) => a - b)
+let md = `# LazyFS ON/OFF Policy (EAGER vs LAZY crossover) - Phase 3
 
-let md = `# LazyFS ON/OFF Policy (EAGER vs LAZY crossover)
+Generated by \`analyze.mjs\` from \`sweep-results.jsonl\`. Main-sweep cells:
+${main.length}. Latency-sweep cells: ${latency.length}. Iterations per cell:
+${meta?.iters}. Footprints are REAL PGlite block-access measurements over a
+multi-relation schema (users / orders / line_items / documents, with FKs and
+secondary indexes); object-store latency/bandwidth are **ESTIMATES**
+(\`store-model.mjs\`) - replace with measured GCS/S3 numbers before treating
+thresholds as final.
 
-Generated by \`analyze.mjs\` from \`sweep-results.jsonl\`. Cells: ${rows.length}.
-Iterations per cell: ${meta?.iters}. Object-store latency/bandwidth are
-**ESTIMATES** (see \`store-model.mjs\`); replace with measured GCS/S3 numbers
-before treating thresholds as final.
+Legend: \`L Nx\` = LAZY wins by N times (TTFQ vs full-restore p50); \`E Nx\` =
+EAGER wins by N times. Operating point for headline tables: query-plan prefetch
+ON, 1MB page-groups.
 
-Legend in tables: \`L Nx\` = LAZY wins by N times (TTFQ vs full-restore p50);
-\`E Nx\` = EAGER wins by N times. Working set = fraction of the DB the first
-queries touch (the dominant TTFQ driver).
+## Query shapes and their REAL working sets
 
-## Headline crossover
+Working set = fraction of total user-relation bytes the first query faults,
+measured across ALL relations it touches (heap + indexes), averaged over sizes:
 
-For an indexed-range first query with query-plan prefetch ON and 1MB groups:
-
-| provider | lazy wins from DB size >= | lazy still wins up to working-set |
+| shape | mean touched fraction | what it models |
 |---|---|---|
 `
-for (const p of profiles) {
-  const co = crossover(p)
-  const mw = maxWinningWs(p)
-  md += `| ${p} | ${co !== null ? co + 'MB' : 'never (in range)'} | ${mw !== null ? (mw * 100) + '%' : 'n/a'} |\n`
+const shapeDesc = {
+  pointPk: 'point lookup by primary key',
+  pointSecondary: 'point lookup by secondary index (scattered heap)',
+  indexedJoin: 'join of two large tables (planner seq-scans the big heap)',
+  rangeScan: 'contiguous PK range (~5% of the big table)',
+  pointWide: 'point lookup on a wide-row table',
+  fullScan: 'full table scan of the largest heap',
+}
+for (const sh of shapes) {
+  md += `| ${sh} | ${((ws[sh] ?? 0) * 100).toFixed(2)}% | ${shapeDesc[sh] ?? ''} |\n`
 }
 
 md += `
-## Decision rule (plain terms)
+## Headline crossover (prefetch ON, 1MB groups)
 
-- **Enable LazyFS** when the snapshot is **large** AND the first query's working
-  set is **small** relative to the DB. Lazy pays only for what the first query
-  touches, so TTFQ is driven by working-set bytes, not DB size.
-- **Keep LazyFS OFF (eager full restore)** for **small DBs** and for **scan-heavy
-  first queries**: a single bulk parallel transfer beats many serial faults, and
-  a full scan faults the whole relation anyway (lazy adds per-group TTFB overhead
-  on top of the same bytes).
-- **Prefetch (query-plan frontrunning) is decisive**: it converts serial faults
-  into one parallel batch, which is what makes lazy win for medium working sets.
+Smallest DB size at which LAZY beats EAGER full-restore, per shape + provider.
+"-" = lazy never wins in the tested size range (eager always faster).
 
-## Full-table-scan caveat (the adversarial case)
-
-A full-table-scan first query faults every heap block. Lazy then transfers the
-same bytes as eager but adds per-group first-byte latency and cannot parallelize
-as freely on the reactive path. Result:
+| shape | ${profiles.join(' | ')} |
+|---|${'---|'.repeat(profiles.length)}
 `
-for (const p of profiles) {
-  const fs = fullScanVerdict(p)
-  md += `\n- **${p}**: lazy wins ${fs.lazyWins}/${fs.total} full-scan cells. ` +
-    fs.examples.map((e) => `${e.sizeMB}MB:${e.winner}(${e.speedup}x)`).join(', ')
+for (const sh of shapes) {
+  const cells = profiles.map((p) => {
+    const co = crossover(sh, p)
+    return co !== null ? co + 'MB' : '-'
+  })
+  md += `| ${sh} | ${cells.join(' | ')} |\n`
 }
+
+md += `
+## Latency sensitivity (the dominant unknown)
+
+How the crossover DB size moves as modeled object-store first-byte latency
+varies, for the **${meta?.latencyRefProfile}** profile, shape **${lowWsShape}**
+(the lowest-working-set shape), prefetch ON, 1MB groups. This is the headline
+answer to "how sensitive are our thresholds to the GCS number we do not yet have."
+
+| assumed first-byte latency | lazy-wins-from DB size |
+|---|---|
+`
+const latTable = latencyCrossover(lowWsShape)
+for (const row of latTable) {
+  md += `| ${row.latencyMs}ms | ${row.crossoverMB !== null ? row.crossoverMB + 'MB' : '-'} |\n`
+}
+const latVals = latTable.filter((r) => r.crossoverMB !== null).map((r) => r.crossoverMB)
+const swing = latVals.length ? `${Math.min(...latVals)}MB - ${Math.max(...latVals)}MB` : 'n/a'
+md += `\nCrossover swings across **${swing}** over the ${meta?.latencySweepMs?.[0]}-${meta?.latencySweepMs?.slice(-1)[0]}ms latency range. `
+md += latVals.length && Math.max(...latVals) / Math.min(...latVals) <= 2
+  ? 'The thresholds are relatively INSENSITIVE to first-byte latency (within ~2x), so a rough latency estimate is enough to set the policy.'
+  : 'The thresholds are SENSITIVE to first-byte latency - measure the real number before fixing thresholds.'
+
 md += `
 
-**Recommendation:** detect scan-heavy first queries (planner: SeqScan over a
-large relation with low selectivity) and **fall back to eager / streamed bulk
-restore** for those, even when the size/working-set rule would pick lazy.
+## Variance / stability
 
-## Crossover tables (indexedRange, prefetch ON, 1MB groups)
 `
-for (const p of profiles) {
-  md += `\n### ${p}\n` + tableFor('indexedRange', p, true, 1024)
+const noisy = noisyScenarios()
+if (noisy.length === 0) {
+  md += `All ${footprints.length} footprint scenarios were **deterministic** across trials `
+  md += `(touched-block stddev = 0 in every scenario; ${meta?.iters} latency-sampling iterations per cell give the p50/p99 spread). `
+  md += `Postgres's block-access footprint for a fixed query on a fixed dataset is stable; run-to-run TTFQ variation comes only from the modeled network latency sampling, captured in p99 vs p50.\n`
+} else {
+  md += `${noisy.length} scenario(s) showed run-to-run variation in touched blocks:\n\n`
+  for (const n of noisy) md += `- ${n.sizeMB}MB ${n.shape}: stddev ${n.stddev} (min ${n.min}, max ${n.max}, mean ${n.mean})\n`
 }
 
-md += `\n## Effect of prefetch (indexedRange, ${profiles[0]}, 1MB groups)\n`
-md += `\n**Prefetch OFF:**\n` + tableFor('indexedRange', profiles[0], false, 1024)
-md += `\n**Prefetch ON:**\n` + tableFor('indexedRange', profiles[0], true, 1024)
+md += `
+## Per-provider win/loss grids (prefetch ON, 1MB groups)
+`
+for (const p of profiles) md += `\n### ${p}\n` + gridFor(p)
 
-md += `\n## Effect of group size (indexedRange, ${profiles[0]}, prefetch ON)\n`
-for (const g of groupKBs) {
-  md += `\n**${g}KB groups:**\n` + tableFor('indexedRange', profiles[0], true, g)
+md += `\n## Effect of prefetch and group size\n`
+function gridShapeProfile(shape, profile, prefetch, groupKB) {
+  let out = `\n${shape}, ${profile}, prefetch=${prefetch}, ${groupKB}KB groups:\n\n| size | lazy p50 | eager p50 | winner |\n|---|---|---|---|\n`
+  for (const sz of sizes) {
+    const r = main.find((x) => x.sizeMB === sz && x.shape === shape && x.profile === profile && x.prefetch === prefetch && x.groupKB === groupKB)
+    if (r) out += `| ${sz}MB | ${r.lazyTTFQ_p50_ms}ms | ${r.eagerFull_p50_ms}ms | ${r.winner} (${r.speedup_lazy_vs_eager}x) |\n`
+  }
+  return out
 }
+const refP = meta?.latencyRefProfile ?? profiles[0]
+md += gridShapeProfile('rangeScan', refP, false, 1024)
+md += gridShapeProfile('rangeScan', refP, true, 1024)
+md += `\nGroup-size effect (rangeScan, ${refP}, prefetch ON):\n`
+for (const g of groupKBs) md += gridShapeProfile('rangeScan', refP, true, g)
 
-// Pick representative numbers for the decision function thresholds. Use the
-// gcs-same-region profile (middle) crossover and max winning ws as defaults.
 const repProfile = profiles.includes('gcs-same-region') ? 'gcs-same-region' : profiles[0]
-const repCrossover = crossover(repProfile) ?? 50
-const repMaxWs = maxWinningWs(repProfile) ?? 0.25
+const coLow = crossover(lowWsShape, repProfile) ?? 50
 
 md += `
 ## Decision function
 
-Wire this into the restore path. \`stats\` is what we know at restore time: the
-snapshot size, an estimate of the first query's working-set fraction (from a
-learned hot-set / prefetch.json, or a conservative default), whether the first
-query is scan-heavy, and the provider profile.
+\`stats\` is what we know at restore time. Thresholds below are read off THIS
+sweep; replace with per-provider measured values once real GCS/S3 numbers exist.
 
 \`\`\`js
-// Thresholds derived from this sweep for the ${repProfile} profile.
-// REPLACE with per-provider measured values once real GCS/S3 numbers exist.
 export function shouldUseLazy(stats) {
   const {
     snapshotBytes,
-    workingSetFraction = 0.25, // default if no learned hot-set yet (conservative)
+    workingSetFraction = ${(ws[lowWsShape] ?? 0.05).toFixed(3)}, // default if no learned hot-set
     firstQueryIsScanHeavy = false,
     providerProfile = '${repProfile}',
   } = stats
 
-  // Scan-heavy first query: lazy adds per-group RTT over the same bytes -> eager.
+  // Scan-heavy first query faults a large fraction over the same bytes as eager,
+  // plus per-group RTT -> eager wins. Detect via planner (SeqScan over a large
+  // relation with low selectivity).
   if (firstQueryIsScanHeavy) return false
 
-  // Per-provider crossover size (MB) below which eager's bulk transfer wins.
+  // Per-provider crossover size (MB) for a low-working-set first query.
   const CROSSOVER_MB = {
-    's3-standard': ${crossover('s3-standard') ?? 'null'},
-    'gcs-same-region': ${crossover('gcs-same-region') ?? 'null'},
-    's3-express': ${crossover('s3-express') ?? 'null'},
-  }[providerProfile] ?? ${repCrossover}
+${profiles.map((p) => `    '${p}': ${crossover(lowWsShape, p) ?? 'null'},`).join('\n')}
+  }[providerProfile] ?? ${coLow}
 
   // Per-provider max working-set fraction at which lazy still wins on a large DB.
   const MAX_WS = {
-    's3-standard': ${maxWinningWs('s3-standard') ?? 'null'},
-    'gcs-same-region': ${maxWinningWs('gcs-same-region') ?? 'null'},
-    's3-express': ${maxWinningWs('s3-express') ?? 'null'},
-  }[providerProfile] ?? ${repMaxWs}
+${profiles.map((p) => `    '${p}': ${(maxWinningWs(p)).toFixed(4)},`).join('\n')}
+  }[providerProfile] ?? ${(maxWinningWs(repProfile)).toFixed(4)}
 
+  if (CROSSOVER_MB === null) return false
   const sizeMB = snapshotBytes / (1024 * 1024)
-  if (CROSSOVER_MB === null) return false // lazy never wins for this provider in range
   return sizeMB >= CROSSOVER_MB && workingSetFraction <= MAX_WS
 }
 \`\`\`
 
-## Caveats on these numbers
+## Caveats
 
-- Object-store latency/bandwidth are **estimates**, not measurements. The single
-  biggest uncertainty is real per-request first-byte latency (and its p99 tail)
-  for the target provider; that sets the serial-fault cost and thus the crossover.
-- The block-access **footprints are real** (measured with PGlite + LazyFS), so
-  the touched-fraction-vs-working-set mapping and fault counts are trustworthy.
-- Eager datadir size is modeled as relation * 1.15 (indexes/catalogs/wal). Eager
-  set for lazy is a fixed ${(meta?.eagerSetBytes ?? 0) / 1e6}MB estimate.
-- Postgres already coalesces sequential reads (~128KB/pread), so reactive lazy is
-  less RTT-bound than a naive 8KB-per-fault model would suggest.
+- Object-store latency/bandwidth are **estimates**. The latency-sensitivity table
+  quantifies how much that matters; measure real GCS/S3 first-byte latency to
+  finalize thresholds.
+- Footprints are REAL and **deterministic** (multi-relation, heap + indexes).
+- \`indexedJoin\` faults ~${((ws.indexedJoin ?? 0) * 100).toFixed(0)}% of the DB
+  because the planner seq-scans the large heap side - "a join" is not
+  automatically a small working set; the plan decides. Drive the
+  \`firstQueryIsScanHeavy\` flag from the actual plan, not the SQL text.
+- Eager datadir modeled as user-relation bytes * ${meta?.datadirOverhead}; lazy
+  eager-set a fixed ${((meta?.eagerSetBytes ?? 0) / 1e6).toFixed(0)}MB.
 `
 
 writeFileSync(policyFile, md)
 console.error('wrote', policyFile)
-
-// Also print a compact summary to stderr.
-console.error('\n=== crossover summary ===')
-for (const p of profiles) {
-  console.error(`${p}: lazy wins from ${crossover(p)}MB, up to ws=${maxWinningWs(p)}, fullscan=${JSON.stringify(fullScanVerdict(p).lazyWins)}/${fullScanVerdict(p).total} lazy-wins`)
-}
+console.error('\n=== crossover summary (shape=' + lowWsShape + ', prefetch ON, 1MB) ===')
+for (const p of profiles) console.error(`${p}: lazy wins from ${crossover(lowWsShape, p)}MB`)
+console.error('latency crossover (' + lowWsShape + '):', JSON.stringify(latencyCrossover(lowWsShape)))
+console.error('noisy scenarios:', noisyScenarios().length)
