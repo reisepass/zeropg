@@ -1,0 +1,2 @@
+{"ts":"2026-06-13T13:27:43.598Z","run":"2026-06-13T13-27-01-762Z-72408","backend":"gcs","casStrength":"generation","probes":{"createIfAbsent":"pass","compareAndSwap":"pass","race20way":"pass","fencingMonotonicity":"pass","readAfterWrite":"pass"},"totalFailures":0,"verdict":"PASS"}
+{"ts":"2026-06-13T13:27:43.599Z","run":"2026-06-13T13-27-01-762Z-72408","backend":"r2","verdict":"SKIPPED","reason":"no creds"}
