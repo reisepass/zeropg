@@ -9,3 +9,6 @@ _debug-*.mjs
 # secrets
 .env
 *.env
+
+# loadtest-service build artifacts (bundled at deploy)
+experiments/loadtest-service/dist/
