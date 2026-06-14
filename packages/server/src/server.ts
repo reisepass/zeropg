@@ -36,8 +36,13 @@ export interface ZeroPGServerOptions {
   store: BlobStore
   /** Public HTTP port (control face + /rest proxy). Default 8080 / $PORT. */
   port?: number
-  /** Local Postgres wire-protocol port (loopback). Default 5432. */
+  /** Local Postgres wire-protocol port. Default 5432. */
   wirePort?: number
+  /** Host the wire server binds to. Default 127.0.0.1 (loopback) — correct for
+   *  HTTP-only platforms (Cloud Run / Code Engine) where raw 5432 is never
+   *  exposed. Set to 0.0.0.0 on Fly.io where the proxy forwards a public TCP
+   *  port to it. */
+  wireHost?: string
   /** Local PostgREST port (loopback; reverse-proxied under /rest). Default 3000. */
   restPort?: number
   /** Lease holder id (instance identity). */
@@ -78,10 +83,19 @@ export class ZeroPGServer {
   private requestsServed = 0
   private bootTimings: BootTimings = { restoreMs: 0, wireMs: 0, postgrestMs: 0, totalMs: 0 }
 
+  // Raw-wire writes (psql / libpq over pglite-socket) hit PGlite directly and so
+  // NEVER pass through ZeroPG.query()/exec() — the dirty flag and the durable
+  // commit it triggers are bypassed. We persist them with a timer that watches
+  // Postgres' own row-modification counters and commits only when they advance,
+  // so an idle instance never churns the object store. lastWireWrites is the
+  // baseline (insert+update+delete tuples) at the last successful flush.
+  private wireFlushTimer: NodeJS.Timeout | null = null
+  private lastWireWrites = 0
+
   readonly opts: Required<
     Pick<
       ZeroPGServerOptions,
-      'port' | 'wirePort' | 'restPort' | 'postgrest' | 'postgrestBin' | 'restSchemas' | 'label'
+      'port' | 'wirePort' | 'wireHost' | 'restPort' | 'postgrest' | 'postgrestBin' | 'restSchemas' | 'label'
     >
   > &
     ZeroPGServerOptions
@@ -92,6 +106,7 @@ export class ZeroPGServer {
       ...opts,
       port: opts.port ?? Number(process.env.PORT ?? 8080),
       wirePort: opts.wirePort ?? Number(process.env.ZEROPG_WIRE_PORT ?? 5432),
+      wireHost: opts.wireHost ?? process.env.ZEROPG_WIRE_HOST ?? '127.0.0.1',
       restPort: opts.restPort ?? Number(process.env.ZEROPG_REST_PORT ?? 3000),
       postgrest: opts.postgrest ?? !/^(off|false|0)$/i.test(process.env.ZEROPG_POSTGREST ?? ''),
       postgrestBin: opts.postgrestBin ?? process.env.ZEROPG_POSTGREST_BIN ?? 'postgrest',
@@ -142,13 +157,22 @@ export class ZeroPGServer {
       this.wire = new PGLiteSocketServer({
         db: this.db.raw,
         port: o.wirePort,
-        host: '127.0.0.1',
+        host: o.wireHost,
         // PostgREST opens a small pool; allow several concurrent loopback conns.
         maxConnections: 10,
       })
       await this.wire.start()
       this.bootTimings.wireMs = performance.now() - tw
       this.log('wire-up', { port: o.wirePort, ms: Math.round(this.bootTimings.wireMs) })
+
+      // Persist raw-wire writes (which bypass ZeroPG's dirty/commit path). Baseline
+      // the write counter at the post-restore state, then poll on an interval.
+      this.lastWireWrites = await this.wireWriteCount()
+      const wireFlushMs = Number(process.env.ZEROPG_WIRE_FLUSH_MS ?? 5000)
+      if (wireFlushMs > 0) {
+        this.wireFlushTimer = setInterval(() => void this.flushWireWrites('timer').catch(() => {}), wireFlushMs)
+        this.wireFlushTimer.unref?.()
+      }
 
       // 3. PostgREST, default-on, pointed at the wire port.
       if (o.postgrest) {
@@ -175,6 +199,41 @@ export class ZeroPGServer {
       this.phase = 'error'
       this.bootError = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
       this.log('boot-error', { error: this.bootError })
+    }
+  }
+
+  // ---- Raw-wire durability ----
+
+  /** Cumulative row-modification count (insert+update+delete) the running
+   *  Postgres reports. Advances only on actual data changes — not on reads, and
+   *  not on this very query — so it is a clean "did the wire write anything?"
+   *  signal. Returns the last known value on error (treated as "no change"). */
+  private async wireWriteCount(): Promise<number> {
+    if (!this.db) return this.lastWireWrites
+    try {
+      const r = await this.db.raw.query<{ w: string }>(
+        'SELECT COALESCE(tup_inserted + tup_updated + tup_deleted, 0)::text AS w ' +
+          'FROM pg_stat_database WHERE datname = current_database()',
+      )
+      return Number(r.rows[0]?.w ?? this.lastWireWrites)
+    } catch {
+      return this.lastWireWrites
+    }
+  }
+
+  /** Commit if raw-wire writes have landed since the last flush. The wire path
+   *  bypasses ZeroPG.query(), so markDirty() arms the engine's commit explicitly. */
+  private async flushWireWrites(reason: string): Promise<void> {
+    if (!this.db || this.phase !== 'ready') return
+    const w = await this.wireWriteCount()
+    if (w <= this.lastWireWrites) return
+    try {
+      this.db.markDirty()
+      const commit = await this.db.commit()
+      this.lastWireWrites = w
+      this.log('wire-flush', { reason, writes: w, committed: !!commit })
+    } catch (e) {
+      this.log('wire-flush-failed', { reason, error: e instanceof Error ? e.message : String(e) })
     }
   }
 
@@ -374,13 +433,21 @@ later; this HTTP-only platform exposes the faces above.
 
   /** Flush + release lease + stop child/socket. Called on SIGTERM. */
   async shutdown(): Promise<void> {
+    if (this.wireFlushTimer) clearInterval(this.wireFlushTimer)
     try {
       await this.pgrest?.stop()
     } catch {
       /* ignore */
     }
+    // Stop accepting wire connections first, then capture any final wire writes
+    // (they bypass ZeroPG's dirty flag) so the graceful Fly auto-stop persists them.
     try {
       await this.wire?.stop()
+    } catch {
+      /* ignore */
+    }
+    try {
+      await this.flushWireWrites('shutdown')
     } catch {
       /* ignore */
     }
