@@ -292,7 +292,7 @@ export class ColdArchiver {
       } catch (e) {
         if (e instanceof PreconditionFailedError) {
           this.log({ event: 'zeropg-backup-exists', key, commitSeq: m.commitSeq })
-          return this.adoptExisting(key)
+          return this.adoptExisting(key, m, codec)
         }
         throw e
       }
@@ -358,14 +358,45 @@ export class ColdArchiver {
     throw new Error('backup index CAS failed after repeated races')
   }
 
-  /** A snapshot object already existed at `key` (a previous run wrote it but
-   * lost/never finished the index update). Return its index entry if present;
-   * otherwise the object is an orphan a later successful run will adopt. */
-  private async adoptExisting(key: string): Promise<BackupEntry | null> {
+  /**
+   * A snapshot object already existed at `key`. Two cases:
+   *   1. A previous run fully recorded it — its entry is in the index; return it
+   *      (the idempotent re-run path).
+   *   2. A previous run wrote the object but CRASHED before the index append —
+   *      the object is an orphan the index never names. The object IS a complete,
+   *      immutable snapshot of THIS committed point (same key => same commitSeq),
+   *      so we can finish what the dead run started: reconstruct the entry from
+   *      the manifest we are holding + the object's real stored size, and append
+   *      it. This is what makes "crash mid-backup, next backup succeeds" hold —
+   *      without it the orphan is un-adoptable and the backup is lost forever.
+   */
+  private async adoptExisting(
+    key: string,
+    m: ReturnType<typeof decodeManifest>,
+    codec: 'gzip' | 'none',
+  ): Promise<BackupEntry | null> {
     const cur = await this.secondary.get(INDEX_KEY)
-    if (!cur) return null
-    const idx = decodeBackupIndex(cur.bytes)
-    return idx.backups.find((b) => b.key === key) ?? null
+    if (cur) {
+      const existing = decodeBackupIndex(cur.bytes).backups.find((b) => b.key === key)
+      if (existing) return existing // case 1: already recorded
+    }
+    // Case 2: orphan from a crashed prior run. Confirm the object is really
+    // there, get its true stored size, and adopt it into the index.
+    const head = await this.secondary.head(key)
+    if (!head) return null // raced away (e.g. a concurrent retention sweep); skip
+    const entry: BackupEntry = {
+      key,
+      commitSeq: m.commitSeq,
+      committedAt: m.committedAt,
+      createdAt: new Date(this.now()).toISOString(),
+      sizeBytes: head.size,
+      codec,
+      sourceGeneration: m.generation,
+      fencingToken: m.fencingToken,
+    }
+    await this.appendToIndex(entry)
+    this.log({ event: 'zeropg-backup-adopted-orphan', key, commitSeq: m.commitSeq, sizeBytes: head.size })
+    return entry
   }
 
   /**
