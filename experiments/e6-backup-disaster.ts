@@ -451,7 +451,7 @@ async function scenarioRetentionSafety(root: string, iter: number) {
   let crashRestorable = 0
   for (let i = 0; i < iter; i++) {
     const cold = makeStore(`${root}/D/${i}/cold`)
-    const newestSum = await buildMultiBackupCold(cold, `${root}/D/${i}`, 5)
+    const newestSum = await buildMultiBackupCold(cold, `${root}/D/${i}`, 3)
 
     // Aggressive policies that, naively applied, would empty the store.
     const policies: RetentionPolicy[] = [
@@ -478,7 +478,7 @@ async function scenarioRetentionSafety(root: string, iter: number) {
 
     // D2: crash mid-GC. Inject a store that throws after deleting some objects.
     const cold2 = makeStore(`${root}/D/${i}/cold2`)
-    const newestSum2 = await buildMultiBackupCold(cold2, `${root}/D/${i}/2`, 5)
+    const newestSum2 = await buildMultiBackupCold(cold2, `${root}/D/${i}/2`, 3)
     const killAfter = 1 + (i % 3) // throw after 1..3 deletes
     const throwing = new ThrowStore(cold2, { throwOnDeleteAfter: killAfter })
     const archCrash = new ColdArchiver(makeStore(`${root}/D/${i}/recovery2`), throwing, { log: () => {} })
