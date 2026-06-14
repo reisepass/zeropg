@@ -1,0 +1,28 @@
+INTEGRITY VIOLATION at commitSeq 20
+[
+  {
+    "kind": "seq-gap",
+    "seq": 10,
+    "detail": "seq jumped 1 -> 10 (expected 2)"
+  },
+  {
+    "kind": "prev-mismatch",
+    "seq": 10,
+    "detail": "prev_hash 945e1b65e328… != actual previous 253597712c5e…"
+  },
+  {
+    "kind": "seq-gap",
+    "seq": 2,
+    "detail": "seq jumped 10 -> 2 (expected 11)"
+  },
+  {
+    "kind": "prev-mismatch",
+    "seq": 2,
+    "detail": "prev_hash 253597712c5e… != actual previous 41a749f26b7f…"
+  },
+  {
+    "kind": "fence-regression",
+    "seq": 2,
+    "detail": "fence 4 < previous 5 (writer writer-1-124287#2 after writer-3-124330#2)"
+  }
+]

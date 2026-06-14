@@ -423,10 +423,17 @@ export class ZeroPG {
       }
       // 3a) Restore: stream bucket -> gunzip -> untar -> scratch dir.
       await this.adoptManifest(m, fresh.etag)
-      // If we took the lease over, the previous holder may still be running.
-      // Stamp our fencing token into the manifest so its next commit fails
-      // the CAS immediately, instead of racing us for one final win (which
-      // would leave us serving a state it is about to replace).
+      // Token-floor freshness check: if we acquired the lease via clean
+      // create-if-absent (not a takeover) while the previous holder was still
+      // comitting, our tokenFloor came from the manifest we read BEFORE we
+      // queued, so freshToken = floor+1 can equal the previous holder's last
+      // committed token. Upgrade our lease token to strictly above the manifest
+      // AFTER the re-read so every future commit embeds a strictly higher value.
+      if (this.lease?.held && !this.lease.tookOver) {
+        await this.lease.upgradeToken(m.fencingToken)
+      }
+      // Takeover path: stamp our (already-higher) token into the manifest so
+      // the previous holder's next commit fails the CAS immediately.
       if (this.lease?.held && this.lease.tookOver) {
         await this.fenceStamp()
       }

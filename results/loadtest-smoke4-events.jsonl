@@ -1,0 +1,26 @@
+{"ts":"2026-06-14T08:11:47.254Z","ev":"acquired","life":"writer-1-127180#1","token":1,"waitedMs":25280}
+{"ts":"2026-06-14T08:11:48.061Z","ev":"fenced","life":"writer-1-127180#1","error":"FencedError: writer fenced: lease with token 1 is no longer ours (validate: lease changed)","expected":true,"whileZombie":false}
+{"ts":"2026-06-14T08:12:04.252Z","ev":"verifier-up"}
+{"ts":"2026-06-14T08:12:08.317Z","ev":"verify-error","error":"relation \"ledger\" does not exist"}
+{"ts":"2026-06-14T08:12:12.383Z","ev":"verify-error","error":"relation \"ledger\" does not exist"}
+{"ts":"2026-06-14T08:12:14.950Z","ev":"acquired","life":"writer-1-127180#2","token":3,"waitedMs":25868}
+{"ts":"2026-06-14T08:12:20.793Z","ev":"acquired","life":"writer-2-127213#1","token":2,"waitedMs":55460}
+{"ts":"2026-06-14T08:12:21.111Z","ev":"fenced","life":"writer-2-127213#1","error":"FencedError: writer fenced: lease with token 2 is no longer ours (validate: lease changed)","expected":true,"whileZombie":true}
+{"ts":"2026-06-14T08:12:23.409Z","ev":"verify","seq":1,"rows":1,"writers":1,"maxFence":3,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T08:12:29.111Z","ev":"verify","seq":5,"rows":5,"writers":1,"maxFence":3,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T08:12:34.632Z","ev":"verify","seq":7,"rows":7,"writers":1,"maxFence":3,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T08:12:36.786Z","ev":"life-end","life":"writer-1-127180#2","ending":"clean","rowsThisLife":9}
+{"ts":"2026-06-14T08:12:40.580Z","ev":"verify","seq":9,"rows":9,"writers":1,"maxFence":3,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T08:12:44.549Z","ev":"acquired","life":"writer-1-127180#3","token":4,"waitedMs":6871}
+{"ts":"2026-06-14T08:12:45.767Z","ev":"verify-error","error":"manifest references missing WAL segment generations/1cd237ff192ca514/wal/00000002-t3.seg"}
+{"ts":"2026-06-14T08:12:54.573Z","ev":"verify","seq":11,"rows":11,"writers":2,"maxFence":4,"handovers":1,"ok":true,"violations":0}
+{"ts":"2026-06-14T08:13:02.739Z","ev":"verify","seq":15,"rows":15,"writers":2,"maxFence":4,"handovers":1,"ok":true,"violations":0}
+{"ts":"2026-06-14T08:13:03.804Z","ev":"life-end","life":"writer-1-127180#3","ending":"clean","rowsThisLife":8}
+{"ts":"2026-06-14T08:13:04.182Z","ev":"writer-done","holder":"writer-1-127180","lives":3,"totalRows":17}
+{"ts":"2026-06-14T08:13:07.674Z","ev":"locked","life":"writer-3-127286#1","error":"LockedError: database is locked by writer \"writer-2-127213#2\" until 2026-06-14T08:13:24.034Z","expected":true,"whileZombie":false}
+{"ts":"2026-06-14T08:13:08.067Z","ev":"writer-done","holder":"writer-3-127286","lives":1,"totalRows":0}
+{"ts":"2026-06-14T08:13:09.557Z","ev":"acquired","life":"writer-2-127213#2","token":4,"waitedMs":47606}
+{"ts":"2026-06-14T08:13:09.607Z","ev":"life-end","life":"writer-2-127213#2","ending":"survived-zombie","rowsThisLife":0}
+{"ts":"2026-06-14T08:13:11.140Z","ev":"writer-done","holder":"writer-2-127213","lives":2,"totalRows":0}
+{"ts":"2026-06-14T08:13:15.101Z","ev":"verify","seq":17,"rows":17,"writers":2,"maxFence":4,"handovers":1,"ok":true,"violations":0}
+{"ts":"2026-06-14T08:13:15.252Z","ev":"verifier-done","checks":7}

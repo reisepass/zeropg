@@ -1,0 +1,14 @@
+{"ts":"2026-06-14T07:44:10.708Z","ev":"acquired","life":"writer-1-123352#1","token":1,"waitedMs":50234}
+{"ts":"2026-06-14T07:44:10.846Z","ev":"life-end","life":"writer-1-123352#1","ending":"survived-zombie","rowsThisLife":0}
+{"ts":"2026-06-14T07:44:19.943Z","ev":"acquired","life":"writer-1-123352#2","token":4,"waitedMs":8428}
+{"ts":"2026-06-14T07:44:21.624Z","ev":"life-end","life":"writer-1-123352#2","ending":"crash","rowsThisLife":1}
+{"ts":"2026-06-14T07:44:21.624Z","ev":"crash-exit","life":"writer-1-123352#2"}
+{"ts":"2026-06-14T07:44:22.732Z","ev":"verifier-up"}
+{"ts":"2026-06-14T07:44:28.723Z","ev":"acquired","life":"writer-2-123392#1","token":2,"waitedMs":66220}
+{"ts":"2026-06-14T07:44:28.731Z","ev":"life-end","life":"writer-2-123392#1","ending":"crash","rowsThisLife":0}
+{"ts":"2026-06-14T07:44:28.731Z","ev":"crash-exit","life":"writer-2-123392#1"}
+{"ts":"2026-06-14T07:44:33.067Z","ev":"acquired","life":"writer-3-123409#1","token":3,"waitedMs":69481}
+{"ts":"2026-06-14T07:44:33.077Z","ev":"life-end","life":"writer-3-123409#1","ending":"clean","rowsThisLife":0}
+{"ts":"2026-06-14T07:44:33.565Z","ev":"writer-done","holder":"writer-3-123409","lives":1,"totalRows":0}
+{"ts":"2026-06-14T07:44:34.372Z","ev":"verify","seq":1,"rows":1,"writers":1,"maxFence":4,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T07:44:34.517Z","ev":"verifier-done","checks":1}

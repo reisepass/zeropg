@@ -1,0 +1,273 @@
+INTEGRITY VIOLATION at commitSeq 252
+[
+  {
+    "kind": "fence-shared",
+    "seq": 20,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 21,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 22,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 23,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 24,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 25,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 26,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 27,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 28,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 29,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 30,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 31,
+    "detail": "fence 2 committed for both \"writer-4-134283#1\" and \"writer-2-134216#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-regression",
+    "seq": 70,
+    "detail": "fence 3 < previous 5 (writer writer-4-134283#2 after writer-1-134177#2)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 70,
+    "detail": "fence 3 committed for both \"writer-2-134216#3\" and \"writer-4-134283#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 71,
+    "detail": "fence 3 committed for both \"writer-2-134216#3\" and \"writer-4-134283#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 72,
+    "detail": "fence 3 committed for both \"writer-2-134216#3\" and \"writer-4-134283#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 73,
+    "detail": "fence 3 committed for both \"writer-2-134216#3\" and \"writer-4-134283#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 74,
+    "detail": "fence 3 committed for both \"writer-2-134216#3\" and \"writer-4-134283#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 75,
+    "detail": "fence 3 committed for both \"writer-2-134216#3\" and \"writer-4-134283#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 76,
+    "detail": "fence 3 committed for both \"writer-2-134216#3\" and \"writer-4-134283#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 77,
+    "detail": "fence 3 committed for both \"writer-2-134216#3\" and \"writer-4-134283#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 78,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 79,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 80,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 81,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 82,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 83,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 84,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 85,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 86,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 87,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 88,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 89,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 90,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 91,
+    "detail": "fence 4 committed for both \"writer-2-134216#4\" and \"writer-3-134236#1\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 92,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 93,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 94,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 95,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 96,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 97,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 98,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 99,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 100,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 101,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-2-134216#5\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-regression",
+    "seq": 119,
+    "detail": "fence 5 < previous 7 (writer writer-3-134236#2 after writer-4-134283#3)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 119,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-3-134236#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 120,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-3-134236#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 121,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-3-134236#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 122,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-3-134236#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 123,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-3-134236#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 124,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-3-134236#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 125,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-3-134236#2\" (two writers under one token)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 126,
+    "detail": "fence 5 committed for both \"writer-1-134177#2\" and \"writer-3-134236#2\" (two writers under one token)"
+  }
+]

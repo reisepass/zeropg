@@ -1,0 +1,4 @@
+{"ts":"2026-06-14T08:18:23.997Z","ev":"acquired","life":"writer-1-128761#1","token":1,"waitedMs":26658}
+{"ts":"2026-06-14T08:18:24.516Z","ev":"fenced","life":"writer-1-128761#1","error":"FencedError: writer fenced: lease with token 1 is no longer ours (validate: lease changed)","expected":true,"whileZombie":true}
+{"ts":"2026-06-14T08:19:41.622Z","ev":"verifier-up"}
+{"ts":"2026-06-14T08:21:50.964Z","ev":"verify-error","error":"relation \"ledger\" does not exist"}
