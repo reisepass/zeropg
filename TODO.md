@@ -8,6 +8,35 @@ bucket or the live Cloud Run demos. Background and ranking: [docs/ROADMAP.md](do
 
 ---
 
+## Track D — secondary cold-storage backups ✅ DONE (merged to main 2026-06-14)
+
+A database system cannot ship without proven backups. Track D is the "daily
+backups to a second, colder place, keep the last N / drop older than X days"
+feature, expressed in zeropg's object model. Design: [docs/D-COLD-BACKUP.md](docs/D-COLD-BACKUP.md).
+
+- **D1-D3 ✅** `ColdArchiver.backupOnce()` + CAS'd backup index; retention engine
+  (`keepLast` + `maxAgeDays` + GFS, union keep-set, never-delete-newest, cold-tier
+  min-storage-duration guard); `restoreFromBackup` + `scripts/backup.ts` /
+  `scripts/restore-backup.ts` + the store-less round-trip test
+  (`experiments/d-cold-backup.ts`).
+- **Default wiring ✅** `ZeroPGOptions.backup` (`BackupTarget`): every compaction
+  snapshot auto-takes a cold backup of that committed point + a retention sweep,
+  on a non-fatal background hook awaited by `close()`/`flush()`. Unset ⇒ no-op,
+  so single-bucket setups are unaffected.
+- **E6 disaster matrix ✅** `experiments/e6-backup-disaster.ts`, each fault x20
+  against real IBM COS: SIGKILL mid-backup, primary-snapshot loss, full primary
+  wipe → byte-identical rebuild that boots + serves SQL, retention never deletes
+  the last restorable backup, crash during retention GC, index CAS races, crash
+  during restore, 1/50/500MB round-trips. Results in `results/e6-disaster.jsonl`.
+- **Bug fixed (E6-caught):** a crash between the backup-object PUT and the index
+  append orphaned the object un-adoptably → nothing restorable. `adoptExisting`
+  now reconstructs the orphan's index entry from the manifest + a HEAD. See the
+  design doc's "Bug E6 caught" section.
+- **Deferred:** D4 (storage-class plumbing + cost rows for Archive/Glacier/IA),
+  D5 (incremental/PITR mode, after A2's numbered manifests).
+
+---
+
 ## Track B — Cloudflare R2 (do this in parallel, high priority)
 
 > **Status 2026-06-13 — landed (build + design); live-R2 gate pending creds.**
