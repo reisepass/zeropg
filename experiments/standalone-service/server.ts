@@ -22,6 +22,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 // S3/SigV4 R2BlobStore against the IBM COS endpoint; otherwise GCS. No new
 // transport code. Fresh bucket prefix for this demo (demo/standalone).
 const USE_COS = !!(process.env.COS_HMAC_ACCESS_KEY_ID && process.env.COS_HMAC_SECRET_ACCESS_KEY)
+// Tigris (Fly) / generic S3 / R2: AWS_*/R2_* creds + an S3 endpoint. This is the
+// raw-wire Fly demo's storage — same R2BlobStore (S3 + SigV4) as COS, just a
+// different endpoint. CAS is already verified through R2BlobStore (no new code).
+const USE_S3 = !USE_COS && !!(process.env.AWS_ENDPOINT_URL_S3 || process.env.R2_ENDPOINT)
 const DB_PREFIX = process.env.ZEROPG_PREFIX ?? 'demo/standalone'
 
 function selectStore(): BlobStore {
@@ -35,6 +39,27 @@ function selectStore(): BlobStore {
       bucket: process.env.COS_BUCKET ?? 'zeropg-cos',
       prefix: DB_PREFIX,
       region: process.env.IBM_COS_REGION ?? 'eu-de',
+    })
+  }
+  if (USE_S3) {
+    // Build the R2BlobStore directly from AWS_*/R2_* env. The bucket on Tigris
+    // arrives as TIGRIS_BUCKET (r2OptionsFromEnv would reject the config for the
+    // missing AWS_BUCKET/S3_BUCKET, so don't route through it here).
+    const endpoint = process.env.AWS_ENDPOINT_URL_S3 ?? process.env.R2_ENDPOINT
+    const accessKeyId = process.env.AWS_ACCESS_KEY_ID ?? process.env.R2_ACCESS_KEY_ID
+    const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY ?? process.env.R2_SECRET_ACCESS_KEY
+    const bucket =
+      process.env.TIGRIS_BUCKET ?? process.env.AWS_BUCKET ?? process.env.S3_BUCKET ?? process.env.R2_BUCKET
+    if (!endpoint || !accessKeyId || !secretAccessKey || !bucket) {
+      throw new Error('S3 endpoint set but missing creds/bucket (AWS_*/TIGRIS_BUCKET)')
+    }
+    return new R2BlobStore({
+      endpoint,
+      accessKeyId,
+      secretAccessKey,
+      bucket,
+      prefix: DB_PREFIX,
+      region: process.env.AWS_REGION ?? 'auto',
     })
   }
   return new GcsBlobStore({

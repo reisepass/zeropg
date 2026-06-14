@@ -6,16 +6,18 @@ Numbers below are from provider pricing pages as last reviewed (2026-06); they d
 
 ## Provider cost tables
 
-| | GCS Standard | S3 Standard | Cloudflare R2 |
-|---|---|---|---|
-| Storage /GB-month | ~$0.020 | $0.023 | $0.015 |
-| Write ops (PUT/list, Class A) | $0.005 | $0.005 | $0.0045 |
-| Read ops (GET, Class B) | $0.0004 | $0.0004 | $0.00036 |
-| DELETE | free | free | free |
-| Egress to own-cloud compute (same region) | free | free | free |
-| Egress to internet | ~$0.12/GB | ~$0.09/GB | **$0 (free)** |
-| Free tier (monthly) | 5GB + small ops (always-free) | none durable | **10GB + 1M writes + 10M reads** |
-| Conditional write | `ifGenerationMatch`, no surcharge | `If-Match`/`If-None-Match`, no surcharge | etag precondition, no surcharge |
+| | GCS Standard | S3 Standard | Cloudflare R2 | IBM COS Standard | Tigris |
+|---|---|---|---|---|---|
+| Storage /GB-month | ~$0.020 | $0.023 | $0.015 | ~$0.021 | $0.020 |
+| Write ops (PUT/list, Class A) | $0.005 | $0.005 | $0.0045 | $0.005 | $0.005 |
+| Read ops (GET, Class B) | $0.0004 | $0.0004 | $0.00036 | $0.0004 | $0.0005 |
+| DELETE | free | free | free | free | free |
+| Egress to own-cloud compute (same region) | free | free | free | free | free (all egress) |
+| Egress to internet | ~$0.12/GB | ~$0.09/GB | **$0 (free)** | ~$0.09/GB | **$0 (free)** |
+| Free tier (monthly) | 5GB + small ops (always-free) | none durable | **10GB + 1M writes + 10M reads** | **25GB always-free (Lite)** | **5GB + 10k writes + 100k reads** |
+| Conditional write | `ifGenerationMatch`, no surcharge | `If-Match`/`If-None-Match`, no surcharge | etag precondition, no surcharge | `If-Match`/`If-None-Match`, no surcharge (live) | `If-Match`/`If-None-Match`, no surcharge (live) |
+
+GCS, IBM COS, Tigris, and Cloudflare R2 are all live behind the **same** S3/conditional-PUT transport — the four See-it-live demos in the README (S3 proper is the same driver, untested only because it has no free tier). Two facts steer backend choice independent of the per-op noise: **IBM COS has the largest always-free storage (25 GB)**, and **R2 + Tigris are the only zero-egress options** — which is exactly what makes bucket-served read replicas / CDN hydration free rather than ~$0.09-0.12/GB. Tigris additionally prices the same in every geography (a EUR multi-region bucket costs what a US one does).
 
 ### Limits that shape the design (not just the bill)
 
@@ -116,6 +118,8 @@ Colder classes (Nearline $0.010, Coldline $0.004, Archive $0.0012 /GB-month) car
 
 - **R2**: the cost-optimal home overall. Free egress makes bucket-served read replicas / CDN seeding free; free tier (10GB, 1M writes/mo ≈ 23 commits/min sustained) covers the entire target use case. Pair with the Durable Object tier from DESIGN.md 4.7.
 - **S3**: no free tier, highest internet egress; fine intra-AWS (Lambda). No per-object write cap documented (manifest CAS serializes us anyway). S3 also supports multi-object concatenation only via multipart-copy (clunkier than GCS compose). S3 Express One Zone is a separate latency-oriented driver decision later - different pricing (per-GB request fees), single-AZ durability tradeoff.
+- **IBM COS**: the **largest free tier here — 25 GB always-free (Lite plan)** — plus full `If-Match`/`If-None-Match` CAS, confirmed live (Track C). Storage ~$0.021/GB-mo, ops priced like S3 ($0.005/1k Class A, $0.0004/1k Class B), internet egress ~$0.09/GB but **free to same-region IBM compute**. Pairs with IBM Code Engine (Cloud Run's analog) for an all-IBM scale-to-zero stack — the demo that runs at the IBM URL in the README. Reuses the S3/SigV4 driver verbatim; the only knobs are endpoint + region (`eu-de`).
+- **Tigris**: globally-distributed, S3-compatible, **zero egress fees in every geography** (like R2) at one worldwide price — $0.02/GB-mo storage, $0.005/1k Class A, $0.0005/1k Class B; 5 GB + 10k writes + 100k reads free. Same conditional-write CAS, same driver. The free-egress home when bucket-served read replicas / CDN hydration matter but committing to Cloudflare's compute ecosystem doesn't; the demo pairs it with Cloud Run (europe-west1).
 
 ## Experiment hooks
 

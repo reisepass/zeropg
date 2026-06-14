@@ -57,6 +57,27 @@ Adjustments:
 
 **GCP rule of thumb: zeropg wins below ~4-5 awake-hours/day (after free tier) or ~150k evenly-spaced writes/month; an app idle 80%+ of the day is 5-20x cheaper on zeropg.**
 
+## 3b. IBM Cloud: zeropg (Code Engine + COS) vs IBM Cloud Databases for PostgreSQL
+
+This is the stack the README's IBM demo runs (Track C): the same image on IBM Code Engine - a scale-to-zero container runtime, Cloud Run's direct analog - backed by IBM Cloud Object Storage.
+
+Baseline: **IBM Cloud Databases for PostgreSQL ≈ $82/month** for the smallest practical config (0.5 vCPU, 4 GB RAM, 5 GB disk). It is **HA-by-default (2 members)**, which is why the managed-Postgres floor is ~8x GCP's micro - there is no single-node bargain tier to undercut.
+
+Code Engine rates: **$0.00003431/vCPU-second + $0.00000356/GB-second** ⇒ at 1 vCPU / 2 GiB (the demo's tier) ≈ **$0.149/awake-hour**. Free grant: 100,000 vCPU-s + 200,000 GB-s/month ≈ ~28 awake-hours of this tier free.
+
+| DB size | tier | $/awake-hr | break-even vs $82 PG | as hr/day |
+|---|---|---|---|---|
+| ≤50 MB | 1 vCPU / 1 GiB | ~$0.136 | ~600 hr/mo | **~20 hr/day** |
+| ~500 MB | 1 vCPU / 2 GiB | ~$0.149 | ~550 hr/mo | **~18 hr/day** (+~1 hr/day free grant) |
+
+The twist vs GCP: because IBM's managed floor is so high, **zeropg wins on IBM for almost any intermittent workload** - the crossover sits near ~18-20 awake-hr/day, and even Code Engine running 24/7 (~$109/mo at 2 GiB) is in the same ballpark as the $82 floor while needing no HA pair, no provisioning, and 25 GB of free COS storage underneath. The migration trigger here is HA/throughput requirements or DB size, very rarely the bill.
+
+**IBM rule of thumb: zeropg on Code Engine + COS is cheaper than IBM Cloud Databases for PostgreSQL until ~18-20 awake-hr/day; the managed floor is high (HA-by-default) so the bill almost never forces migration.**
+
+### Storage backend (COS / Tigris / R2) does not move these numbers
+
+Break-even is compute-awake-hours, not storage (§1). Swapping the backend changes only the storage GB-rate (all ~$0.015-0.023/GB-mo) and the egress term, neither of which drives the crossover. The one place it matters: **R2 and Tigris bill zero egress**, so the bucket-served read-replica / CDN-hydration path is free on them, versus ~$0.09-0.12/GB to the internet on GCS / S3 / IBM COS (free to same-region compute on all). R2 pairs naturally with Cloudflare Workers/Durable Objects; Tigris with any compute (the demo uses Cloud Run). Pick the backend for free tier (IBM COS 25 GB) or free egress (R2/Tigris); pick the *compute* for the break-even.
+
 ## 4. AWS: zeropg (S3 + Lambda or Fargate) vs cheapest RDS
 
 Baseline: RDS Postgres db.t4g.micro ≈ $11.7/mo + 20GB gp3 ≈ $2.6 → **~$14.3/month** (single-AZ, on-demand).
@@ -95,6 +116,7 @@ Break-even: 16/0.10 ≈ 160 hr/mo ≈ **~5.3 hr/day** (≈ 6.9 hr/day counting t
 | GCP | Cloud SQL micro ~$10/mo | ~$0.10/hr | **~4-5 awake-hr/day** | internal tools, side projects, per-tenant DBs: zeropg. Steady all-day traffic: Cloud SQL |
 | AWS | RDS t4g.micro ~$14/mo | Fargate ~$0.015-0.019/hr (small tasks) | **cost: ~never below ~1GB DB** (smallest task 24/7 ≈ $10.7/mo < RDS) | migrate on size/throughput, never the bill; needs a scale-from-zero waker (no native one in ECS) |
 | Azure | Flexible B1ms ~$16/mo | ~$0.10/hr | **~5-7 awake-hr/day** | same shape as GCP, higher baseline floor |
+| IBM | Cloud Databases for PostgreSQL ~$82/mo (HA, 2 members) | Code Engine ~$0.15/hr (1vCPU/2GiB) | **~18-20 awake-hr/day** | managed floor is unusually high (HA-by-default) → zeropg wins for almost any intermittent workload; 25 GB free COS storage underneath |
 
 Secondary ceilings that bind before cost does:
 - **DB size**: ≳2-4GB → cold start (≈ linear, ~22s/GB measured) and memory tiers argue for migration regardless of $.
