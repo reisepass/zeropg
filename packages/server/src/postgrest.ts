@@ -80,15 +80,27 @@ export class PostgrestProcess {
     // (single-writer) database behind it.
     const env: NodeJS.ProcessEnv = {
       ...process.env,
-      PGRST_DB_URI: `postgres://${o.dbUser}@${o.wireHost}:${o.wirePort}/${o.dbName}`,
+      // sslmode=disable is REQUIRED: pglite-socket (0.2.x) does not implement the
+      // SSLRequest/GSSENCRequest negotiation, so a default libpq client (which
+      // probes for TLS first) sends an 8-byte SSLRequest the socket buffers as an
+      // "incomplete message" and the connection deadlocks. Disabling TLS makes
+      // libpq send the StartupMessage straight away. (Loopback only — no TLS loss.)
+      PGRST_DB_URI: `postgres://${o.dbUser}@${o.wireHost}:${o.wirePort}/${o.dbName}?sslmode=disable`,
       PGRST_DB_SCHEMAS: o.schemas,
       PGRST_DB_ANON_ROLE: o.anonRole,
       PGRST_SERVER_HOST: '127.0.0.1',
       PGRST_SERVER_PORT: String(o.restPort),
-      // The wire port comes up just before us, but PostgREST should survive a
-      // brief race and the writer's own restarts: keep retrying the connection.
-      PGRST_DB_POOL: '4',
+      // PGlite is a single in-process session multiplexed by pglite-socket. A pool
+      // of 1 matches that (PGlite runs one query at a time anyway) and avoids
+      // cross-connection session state surprises.
+      PGRST_DB_POOL: '1',
       PGRST_DB_POOL_ACQUISITION_TIMEOUT: '10',
+      // Prepared statements are keyed per session, but every pooled connection
+      // lands on the SAME PGlite session via the multiplexer, so libpq's auto
+      // prepared statements collide ("prepared statement \"0\" already exists",
+      // 42P05). Turn them off — exactly the connection-pooler-in-transaction-mode
+      // guidance PostgREST itself prints for this error.
+      PGRST_DB_PREPARED_STATEMENTS: 'false',
       PGRST_LOG_LEVEL: 'error',
     }
     this.child = spawn(o.bin, [], { env, stdio: ['ignore', 'pipe', 'pipe'] })
