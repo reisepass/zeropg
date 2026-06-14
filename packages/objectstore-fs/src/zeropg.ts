@@ -43,7 +43,7 @@ import {
   decodeManifest,
 } from './manifest.js'
 import { createTarStream, extractTarStream, largestFile } from './tar.js'
-import { ColdArchiver, type RetentionPolicy } from './archive.js'
+import { ColdArchiver, type RetentionPolicy, INDEX_KEY, decodeBackupIndex } from './archive.js'
 import {
   restoreSnapshotInto,
   applyWalSegments,
@@ -103,6 +103,39 @@ export interface BackupTarget {
   blocking?: boolean
   /** Local scratch dir for the archiver's temp restore. Default os.tmpdir(). */
   scratchDir?: string
+
+  // ---- Capture-frequency controls ----
+
+  /**
+   * FLOOR: minimum ms between consecutive cold backups. A compaction that fires
+   * while the newest backup is younger than this is silently skipped. The check
+   * reads the backup index from the secondary store (a single cheap GET) and
+   * compares the newest entry's createdAt against the current clock.
+   *
+   * Default 3 600 000 (1 hour). Set to 0 to disable the floor (back up on every
+   * compaction, which was the implicit pre-floor behaviour).
+   */
+  minIntervalMs?: number
+
+  /**
+   * CEILING: if the newest backup is older than this AND there have been writes
+   * since (i.e. a compaction is happening), a backup is forced regardless of
+   * minIntervalMs. Ensures an active database always has a reasonably recent
+   * cold backup even when compactions are infrequent.
+   *
+   * Default 86 400 000 (24 hours). Set to 0 to disable the ceiling.
+   */
+  maxBackupAgeMs?: number
+
+  /**
+   * Alternative trigger: only take a cold backup every Nth compaction. When set,
+   * this is evaluated AFTER minIntervalMs / maxBackupAgeMs (the ceiling still
+   * wins, forcing a backup when the newest is too old). Useful when operators
+   * think in "commits" rather than wall-clock time.
+   *
+   * Default unset (disabled). N must be >= 1; N=1 is equivalent to disabled.
+   */
+  everyNCompactions?: number
 }
 
 export interface ZeroPGOptions {
@@ -266,6 +299,8 @@ export class ZeroPG {
   /** In-flight background backup, awaited by close()/flush() so a clean
    * shutdown never abandons a backup mid-upload. */
   private backupInFlight: Promise<void> | null = null
+  /** How many compaction snapshots have fired this writer life (for everyNCompactions). */
+  private compactionCount = 0
 
   private manifest!: Manifest
   private manifestEtag: string | null = null
@@ -1126,6 +1161,7 @@ export class ZeroPG {
     }
     // Track D hook: the snapshot is now durable in the primary, so take a cold
     // backup of this committed point. One call, after compaction, never fatal.
+    this.compactionCount++
     await this.runBackup()
     return {
       commitSeq: nextSeq,
@@ -1151,16 +1187,68 @@ export class ZeroPG {
    * promise is parked in backupInFlight and always awaited by flush()/close().
    * blocking:true awaits inline (tests that assert the backup right after the
    * awaited commit).
+   *
+   * Capture-frequency gate (evaluated before spawning a backup run):
+   *   1. Read the backup index to find the newest entry's createdAt.
+   *   2. FLOOR (minIntervalMs, default 1h): skip if newest is younger.
+   *   3. CEILING (maxBackupAgeMs, default 24h): force if newest is older.
+   *   4. everyNCompactions: skip if this compaction is not on the Nth boundary.
+   *   The ceiling always wins over the floor and the N-gate.
+   *   An idle (scaled-to-zero) DB takes zero backups — correct, nothing changed.
    */
   private async runBackup(): Promise<void> {
     if (!this.archiver || !this.backup) return
     const archiver = this.archiver
-    const policy = this.backup.retention
+    const backup = this.backup
+    const policy = backup.retention
+    const minIntervalMs = backup.minIntervalMs ?? 3_600_000
+    const maxBackupAgeMs = backup.maxBackupAgeMs ?? 86_400_000
+    const everyN = backup.everyNCompactions ?? 1
+
     // A thunk, NOT an eagerly-started promise: when backgrounded it must not
     // begin until any previous backup finishes (one archiver, serial restore +
     // index CAS), else two runs race the index against themselves.
     const run = async (): Promise<void> => {
       try {
+        // Capture-frequency gate: cheap index read, in-memory comparison.
+        if (minIntervalMs > 0 || maxBackupAgeMs > 0 || everyN > 1) {
+          const nowMs = this.now()
+          const idxRaw = await backup.store.get(INDEX_KEY).catch(() => null)
+          const newest = idxRaw
+            ? decodeBackupIndex(idxRaw.bytes).backups.at(-1) ?? null
+            : null
+          const newestAgeMs = newest ? nowMs - Date.parse(newest.createdAt) : Infinity
+
+          // Ceiling wins first: if the newest backup is older than maxBackupAgeMs,
+          // always proceed regardless of the floor or the N-gate.
+          if (maxBackupAgeMs > 0 && newestAgeMs < maxBackupAgeMs) {
+            // Ceiling does NOT force — evaluate the floor and N-gate.
+            if (minIntervalMs > 0 && newestAgeMs < minIntervalMs) {
+              console.log(
+                JSON.stringify({
+                  event: 'zeropg-backup-skip',
+                  reason: 'min-interval',
+                  newestAgeMs: Math.round(newestAgeMs),
+                  minIntervalMs,
+                }),
+              )
+              return
+            }
+            if (everyN > 1 && this.compactionCount % everyN !== 0) {
+              console.log(
+                JSON.stringify({
+                  event: 'zeropg-backup-skip',
+                  reason: 'every-n-compactions',
+                  compactionCount: this.compactionCount,
+                  everyN,
+                }),
+              )
+              return
+            }
+          }
+          // else: ceiling forces the backup — skip floor and N-gate.
+        }
+
         const entry = await archiver.backupOnce()
         if (entry && policy) await archiver.applyRetention(policy)
       } catch (e) {
@@ -1173,7 +1261,7 @@ export class ZeroPG {
         )
       }
     }
-    if (this.backup.blocking) {
+    if (backup.blocking) {
       await run()
     } else {
       const prev = this.backupInFlight ?? Promise.resolve()
