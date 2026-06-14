@@ -1,4 +1,16 @@
-# Handoff: drive 500MB cold starts down + add a 1GB cold start
+# Lazy page-fault restore from object storage (cold-start handoff)
+
+**The lazy-loading algorithms this worker is testing:** instead of eagerly
+downloading the whole snapshot before opening Postgres, boot PGlite on a sparse
+datadir and **fault heap/index blocks on demand from the bucket**, via:
+(1) a custom PGlite `BaseFilesystem` that intercepts block reads
+(`stream_ops.read`); (2) an **Atomics + SharedArrayBuffer sync bridge** so the
+synchronous WASM read can block on an async object-store range-GET; (3)
+**page-group coalescing** (fault ~1MB aligned groups, not 8KB blocks); and (4)
+**query-plan frontrunning / prefetch** (pull the relations+indexes the plan will
+touch before executing) plus a learned hot-page set. The thesis: TTFQ is driven
+by the first query's working set, not the DB size, so a large DB with a small
+hot set cold-starts far faster than eager full restore.
 
 This is a handoff brief for a fresh session **running on the GCP VM**. It states
 the mission, the hard rules, where the existing code is, what is already proven
