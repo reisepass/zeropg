@@ -1,0 +1,58 @@
+# Fly.io deploy of the zeropg STANDALONE server as a RAW-WIRE Postgres: one
+# scale-to-zero Fly Machine holding the writer lease + PGlite, whose durable home
+# is a Tigris (S3) bucket, exposing the REAL Postgres wire protocol on public TCP
+# 5432 via @electric-sql/pglite-socket. This is the demo Cloud Run / Code Engine
+# could not do: any libpq client (psql, JDBC, asyncpg, ...) connects directly.
+#
+# Storage = Tigris via R2BlobStore (creds in flyctl secrets, see deploy-fly.sh).
+# Scale-to-zero: the Fly proxy STARTS the machine on an incoming connection
+# (auto_start_machines) and STOPS it when idle (auto_stop_machines), with no
+# machine kept running (min_machines_running = 0). A fresh connection wakes it.
+
+app = "zeropg-wire-demo"
+primary_region = "iad" # Tigris home region (low-latency to the bucket)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # Bind the wire server to all interfaces so the Fly proxy can forward public
+  # TCP 5432 to it (loopback-only is the default for the HTTP-only platforms).
+  ZEROPG_WIRE_HOST = "0.0.0.0"
+  ZEROPG_WIRE_PORT = "5432"
+  ZEROPG_PREFIX = "demo/standalone-fly"
+  ZEROPG_DURABILITY = "sleep"
+  # Off on Fly: the headline here is the raw wire, and skipping PostgREST trims
+  # ~2.5s of cold start + ~20-40MB RSS (see results/standalone-ram.jsonl). The
+  # HTTP control face (/wake, /ready, POST /sql, /metrics) still serves.
+  ZEROPG_POSTGREST = "off"
+  APP_LABEL = "zeropg standalone (raw Postgres wire) on Fly.io + Tigris"
+
+# Real Postgres wire protocol over public TCP 5432.
+[[services]]
+  protocol = "tcp"
+  internal_port = 5432
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [[services.ports]]
+    port = 5432
+
+# HTTP control face.
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
