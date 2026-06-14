@@ -184,6 +184,53 @@ with a 90-day minimum will incur early-deletion fees on every backup; raise
 maxAgeDays ≥ 90 or use a Standard/IA-class bucket"). Same place prices live, so
 it stays a measured-and-pinned number, not a hardcode.
 
+## Capture frequency
+
+The default wiring (`ZeroPGOptions.backup`) fires a cold backup after every
+compaction snapshot. Under rapid compaction (e.g. a bulk-load session that hits
+the WAL threshold repeatedly) this can produce far more backups than useful —
+every one requires a full restore read from the primary plus a re-tar and a PUT
+to the secondary, which is real I/O. Three knobs on `BackupTarget` control it:
+
+```ts
+interface BackupTarget {
+  // ... store / retention / blocking / scratchDir as before ...
+
+  // FLOOR: skip if the newest backup is younger than this. Default 1h (3_600_000).
+  // Set to 0 to disable (back up on every compaction — pre-knob behaviour).
+  minIntervalMs?: number
+
+  // CEILING: force a backup if the newest is older than this. Default 24h (86_400_000).
+  // Guarantees an active DB always has a recent cold copy even when compactions
+  // are rare. Set to 0 to disable the ceiling.
+  maxBackupAgeMs?: number
+
+  // Alternative trigger: back up only every Nth compaction (evaluated after
+  // floor/ceiling; ceiling still wins). Default unset (every compaction).
+  everyNCompactions?: number
+}
+```
+
+**Interaction rules:**
+
+- Ceiling wins over everything: if the newest backup is older than
+  `maxBackupAgeMs`, a backup is forced regardless of the floor or N-gate.
+- Floor: if the ceiling does not force, skip when the newest backup is younger
+  than `minIntervalMs`.
+- N-gate: if neither ceiling nor floor has decided, skip when this compaction
+  count is not a multiple of N.
+- No backup exists yet: treated as infinitely old, so the first compaction
+  always fires (ceiling is always tripped, floor is never applied).
+- An idle (scaled-to-zero) DB takes zero backups — nothing changed, so no
+  compaction fires and the gate is never evaluated. That is correct.
+
+**Sane out-of-the-box defaults** with no config: at most ~1 backup/hour while
+writing, at least ~1/day of active compaction. A bulk-load session that
+compacts 50 times in a row produces at most 1 backup per hour, not 50.
+
+The gate is a single cheap GET against the secondary store's index, compared
+in-memory against the current clock. It never touches Postgres.
+
 ## Restore
 
 `restoreFromBackup(seq?)`:
@@ -248,11 +295,16 @@ whichever store it's handed.
   compaction snapshot is followed by a cold backup of that committed point + a
   retention sweep, on a non-fatal background hook awaited by `close()`/`flush()`.
   Unset ⇒ no-op (single-bucket setups unaffected).
+- **Capture frequency ✅** `BackupTarget.minIntervalMs` / `maxBackupAgeMs` /
+  `everyNCompactions`: floor/ceiling/N-gate on the default-wiring hook. Defaults
+  (1h floor, 24h ceiling) give at most ~1 backup/hour while writing, at least
+  ~1/day of activity. Regression: E6 scenario H (N rapid compactions + floor
+  produces 1 backup; ceiling=1ms produces N).
 - **E6 disaster matrix ✅** `experiments/e6-backup-disaster.ts` against real COS:
   SIGKILL mid-backup (a real fix landed - see below), primary-snapshot loss,
   full primary wipe → byte-identical rebuild that boots + serves SQL, retention
   never deletes the last restorable backup, crash during retention GC, index CAS
-  races, crash during restore, 1/50/500MB round-trips.
+  races, crash during restore, 1/50/500MB round-trips + H capture-frequency gate.
 - **D4** *(deferred)* Storage-class support on `GcsBlobStore` / `R2BlobStore` +
   `CostModel.minStorageDurationDays`; cost rows for the cold tiers.
 - **D5** *(deferred, after A2)* optional incremental/PITR mode: mirror numbered
