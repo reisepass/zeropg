@@ -653,6 +653,106 @@ async function scenarioRoundTrip(root: string, sizesMb: number[]) {
 }
 
 // ===========================================================================
+// SCENARIO H: capture-frequency gate — N rapid compactions produce only the
+// interval-bounded number of cold backups (not N).
+// ===========================================================================
+async function scenarioCaptureFrequency(root: string, iter: number) {
+  section(`H. Capture-frequency gate: N rapid compactions -> bounded backups (x${iter})`)
+  const COMPACTIONS = 5
+  let gateWorks = 0
+  let ceilingWorks = 0
+  for (let i = 0; i < iter; i++) {
+    const primary = makeStore(`${root}/H/${i}/primary`)
+    const cold = makeStore(`${root}/H/${i}/cold`)
+
+    // minIntervalMs=Infinity effectively means "never back up again once one exists".
+    // We use a large value so the first backup passes but all subsequent ones are
+    // skipped (the clock doesn't advance in an in-process test).
+    const FLOOR_MS = 1_000 * 60 * 60 * 24 * 365 // 1 year
+    const db = await ZeroPG.open({
+      store: primary,
+      holder: 'h-seed',
+      noLease: true,
+      durability: 'sleep',
+      seedSnapshot: SEED_SNAPSHOT,
+      backup: {
+        store: cold,
+        blocking: true,
+        minIntervalMs: FLOOR_MS,
+        maxBackupAgeMs: 0, // disable ceiling so the floor is the only gate
+      },
+    })
+    await db.raw.exec('CREATE TABLE IF NOT EXISTS filler (id serial primary key, blob bytea not null)')
+    // Fire COMPACTIONS compactions in rapid succession.
+    for (let k = 0; k < COMPACTIONS; k++) {
+      const b = Buffer.alloc(512)
+      crypto.getRandomValues(b)
+      await db.raw.exec(`INSERT INTO filler (blob) VALUES ('\\x${b.toString('hex')}')`)
+      db.markDirty()
+      await db.compact()
+      await db.drainBackups()
+    }
+    await db.close()
+
+    const idxRaw = await cold.get(INDEX_KEY)
+    const idx = idxRaw ? decodeBackupIndex(idxRaw.bytes) : { backups: [] as unknown[] }
+    // With a 1-year floor and ceiling disabled, only the FIRST compaction fires a
+    // backup; all subsequent ones see a too-young newest entry and are skipped.
+    const backupCount = idx.backups.length
+    if (backupCount === 1) gateWorks++
+
+    // Now test the ceiling: a very short maxBackupAgeMs forces a backup even
+    // when minIntervalMs would suppress it.
+    const cold2 = makeStore(`${root}/H/${i}/cold2`)
+    const db2 = await ZeroPG.open({
+      store: makeStore(`${root}/H/${i}/primary2`),
+      holder: 'h-ceil',
+      noLease: true,
+      durability: 'sleep',
+      seedSnapshot: SEED_SNAPSHOT,
+      backup: {
+        store: cold2,
+        blocking: true,
+        minIntervalMs: FLOOR_MS, // floor says never
+        maxBackupAgeMs: 1,       // ceiling says always (1ms: always exceeded)
+      },
+    })
+    await db2.raw.exec('CREATE TABLE IF NOT EXISTS filler (id serial primary key, blob bytea not null)')
+    for (let k = 0; k < COMPACTIONS; k++) {
+      const b = Buffer.alloc(512)
+      crypto.getRandomValues(b)
+      await db2.raw.exec(`INSERT INTO filler (blob) VALUES ('\\x${b.toString('hex')}')`)
+      db2.markDirty()
+      await db2.compact()
+      await db2.drainBackups()
+    }
+    await db2.close()
+
+    const idx2Raw = await cold2.get(INDEX_KEY)
+    const idx2 = idx2Raw ? decodeBackupIndex(idx2Raw.bytes) : { backups: [] as unknown[] }
+    // With ceiling=1ms every compaction forces a backup (the newest is always
+    // older than 1ms relative to the running clock).
+    if (idx2.backups.length === COMPACTIONS) ceilingWorks++
+
+    logResult('e6-disaster.jsonl', {
+      scenario: 'capture-frequency',
+      i,
+      compactions: COMPACTIONS,
+      backupsWithFloor: backupCount,
+      backupsWithCeiling: idx2.backups.length,
+    })
+  }
+  assert(
+    gateWorks === iter,
+    `floor gate: ${COMPACTIONS} rapid compactions produce only 1 backup when interval is huge (${gateWorks}/${iter})`,
+  )
+  assert(
+    ceilingWorks === iter,
+    `ceiling override: ${COMPACTIONS} rapid compactions produce ${COMPACTIONS} backups when maxBackupAgeMs=1ms (${ceilingWorks}/${iter})`,
+  )
+}
+
+// ===========================================================================
 // PARENT HARNESS
 // ===========================================================================
 async function parentMain() {
@@ -684,6 +784,7 @@ async function parentMain() {
   await scenarioCasRace(root, ITER)
   await scenarioRestoreCrash(root, ITER)
   await scenarioRoundTrip(root, sizesMb)
+  await scenarioCaptureFrequency(root, ITER)
 
   // Cleanup everything under this run's root.
   section('Cleanup')
@@ -697,7 +798,7 @@ async function parentMain() {
   const fails = failureCount()
   section('Result')
   if (fails === 0) {
-    console.log('  ✅ E6 PASSED — backups survive SIGKILL, corruption, full wipe, retention GC crashes, CAS races, and restore crashes; every recovery is byte-identical.')
+    console.log('  ✅ E6 PASSED — backups survive SIGKILL, corruption, full wipe, retention GC crashes, CAS races, and restore crashes; every recovery is byte-identical. Capture-frequency gate verified.')
   } else {
     console.log(`  ❌ E6 FAILED — ${fails} assertion(s). A DB system cannot ship without proven backups. KILL CRITERION.`)
     process.exitCode = 1

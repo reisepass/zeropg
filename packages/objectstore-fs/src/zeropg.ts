@@ -1217,12 +1217,14 @@ export class ZeroPG {
           const newest = idxRaw
             ? decodeBackupIndex(idxRaw.bytes).backups.at(-1) ?? null
             : null
+          // Infinity when no backup exists yet — forces first backup regardless
+          // of the floor, and trips the ceiling (maxBackupAgeMs > 0 always).
           const newestAgeMs = newest ? nowMs - Date.parse(newest.createdAt) : Infinity
 
-          // Ceiling wins first: if the newest backup is older than maxBackupAgeMs,
-          // always proceed regardless of the floor or the N-gate.
-          if (maxBackupAgeMs > 0 && newestAgeMs < maxBackupAgeMs) {
-            // Ceiling does NOT force — evaluate the floor and N-gate.
+          // Ceiling: newest older than maxBackupAgeMs -> force backup, skip all other gates.
+          const ceilingForces = maxBackupAgeMs > 0 && newestAgeMs >= maxBackupAgeMs
+          if (!ceilingForces) {
+            // Floor: newest younger than minIntervalMs -> skip.
             if (minIntervalMs > 0 && newestAgeMs < minIntervalMs) {
               console.log(
                 JSON.stringify({
@@ -1234,6 +1236,7 @@ export class ZeroPG {
               )
               return
             }
+            // N-gate: not on the Nth compaction -> skip.
             if (everyN > 1 && this.compactionCount % everyN !== 0) {
               console.log(
                 JSON.stringify({
@@ -1246,7 +1249,6 @@ export class ZeroPG {
               return
             }
           }
-          // else: ceiling forces the backup — skip floor and N-gate.
         }
 
         const entry = await archiver.backupOnce()

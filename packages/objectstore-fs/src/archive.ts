@@ -20,6 +20,18 @@
 // BlobStore. zeropg ships the mechanism (backupOnce + retention), not the
 // scheduler: cadence is the operator's cron line (scripts/backup.ts).
 //
+// Capture frequency (BackupTarget on ZeroPGOptions.backup):
+//   minIntervalMs   FLOOR: skip a backup if the newest is younger than this.
+//                   Default 1h. Prevents over-producing backups under rapid
+//                   compaction (e.g. a bulk-load scenario with frequent
+//                   threshold hits).
+//   maxBackupAgeMs  CEILING: force a backup if the newest is older than this.
+//                   Default 24h. Guarantees an active DB always has a recent
+//                   cold copy even when compactions are infrequent.
+//   everyNCompactions  Only fire every Nth compaction. Evaluated after the
+//                   floor/ceiling (ceiling still wins). Default disabled.
+// Idle (scaled-to-zero) DBs take zero backups: nothing changed, nothing to do.
+//
 // It reuses, not forks: restore.ts (restoreSnapshotInto / applyWalSegments),
 // tar.ts (createTarStream / extractTarStream / largestFile), and gc.ts's
 // keep-set-first discipline. The only strong primitive remains conditional PUT.
