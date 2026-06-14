@@ -11,7 +11,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { GcsBlobStore, R2BlobStore } from '@zeropg/blobstore'
+import { GcsBlobStore, R2BlobStore, r2OptionsFromEnv } from '@zeropg/blobstore'
 import type { BlobStore } from '@zeropg/blobstore'
 import type { Durability } from '@zeropg/objectstore-fs'
 import { ZeroPGServer } from '@zeropg/server'
@@ -22,6 +22,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 // S3/SigV4 R2BlobStore against the IBM COS endpoint; otherwise GCS. No new
 // transport code. Fresh bucket prefix for this demo (demo/standalone).
 const USE_COS = !!(process.env.COS_HMAC_ACCESS_KEY_ID && process.env.COS_HMAC_SECRET_ACCESS_KEY)
+// Tigris (Fly) / generic S3 / R2: AWS_*/R2_* creds + an S3 endpoint. This is the
+// raw-wire Fly demo's storage — same R2BlobStore (S3 + SigV4) as COS, just a
+// different endpoint. CAS is already verified through R2BlobStore (no new code).
+const USE_S3 = !USE_COS && !!(process.env.AWS_ENDPOINT_URL_S3 || process.env.R2_ENDPOINT)
 const DB_PREFIX = process.env.ZEROPG_PREFIX ?? 'demo/standalone'
 
 function selectStore(): BlobStore {
@@ -36,6 +40,14 @@ function selectStore(): BlobStore {
       prefix: DB_PREFIX,
       region: process.env.IBM_COS_REGION ?? 'eu-de',
     })
+  }
+  if (USE_S3) {
+    // r2OptionsFromEnv reads AWS_*/R2_*; the bucket on Tigris arrives as
+    // TIGRIS_BUCKET, so fall back to it when AWS_BUCKET/S3_BUCKET is unset.
+    const opts = r2OptionsFromEnv(DB_PREFIX)
+    const bucket = opts?.bucket ?? process.env.TIGRIS_BUCKET
+    if (!opts || !bucket) throw new Error('S3 endpoint set but missing creds/bucket (AWS_*/TIGRIS_BUCKET)')
+    return new R2BlobStore({ ...opts, bucket })
   }
   return new GcsBlobStore({
     bucket: process.env.ZEROPG_BUCKET ?? 'zeropg-experiments-euw1',
