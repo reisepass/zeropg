@@ -1,0 +1,18 @@
+INTEGRITY VIOLATION at commitSeq 66
+[
+  {
+    "kind": "fence-regression",
+    "seq": 8,
+    "detail": "fence 9 < previous 10 (writer writer-1-129833#3 after writer-2-129855#2)"
+  },
+  {
+    "kind": "fence-regression",
+    "seq": 19,
+    "detail": "fence 2 < previous 9 (writer writer-4-129922#1 after writer-1-129833#3)"
+  },
+  {
+    "kind": "fence-shared",
+    "seq": 33,
+    "detail": "fence 10 committed for both \"writer-2-129855#2\" and \"writer-1-129833#4\" (two writers under one token)"
+  }
+]

@@ -201,6 +201,39 @@ export class Lease {
   }
 
   /**
+   * Bump our held token to strictly above `minToken` if it isn't already.
+   * Called right after acquiring when the caller re-reads the manifest and finds
+   * the manifest's fencingToken >= our issued token (which happens on the
+   * clean-release path: the previous holder released, we created a fresh lease
+   * with floor+1, but the manifest still carries the previous holder's last
+   * commit token — same value). CASes our own lease object in-place so that any
+   * concurrent reader of the lease sees the update atomically; throws FencedError
+   * if we were already taken over between acquire() and this call.
+   */
+  async upgradeToken(minToken: number): Promise<void> {
+    if (!this.body || !this.etag) throw new Error('lease not held; call acquire first')
+    if (this.body.fencingToken > minToken) return // already strictly above — nothing to do
+    const newToken = minToken + 1
+    const body = this.makeBody(newToken)
+    try {
+      const { etag } = await this.store.put(this.key, this.encode(body), {
+        ifMatch: this.etag,
+        contentType: 'application/json',
+      })
+      this.etag = etag
+      this.body = body
+    } catch (e) {
+      if (e instanceof PreconditionFailedError) {
+        const token = this.body.fencingToken
+        this.body = null
+        this.etag = null
+        throw new FencedError(token, 'upgradeToken CAS failed: taken over before upgrade')
+      }
+      throw e
+    }
+  }
+
+  /**
    * Renew (heartbeat) the lease, extending expiry. CAS on our own version; if
    * it fails we were taken over => FencedError. Becoming a zombie is defined as
    * failing to renew, so this is where a zombie learns the truth.

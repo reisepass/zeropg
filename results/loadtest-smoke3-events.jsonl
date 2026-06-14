@@ -1,0 +1,41 @@
+{"ts":"2026-06-14T07:54:01.042Z","ev":"acquired","life":"writer-2-125483#1","token":1,"waitedMs":13062}
+{"ts":"2026-06-14T07:54:01.412Z","ev":"fenced","life":"writer-2-125483#1","error":"FencedError: writer fenced: lease with token 1 is no longer ours (validate: lease changed)","expected":false}
+{"ts":"2026-06-14T07:54:14.089Z","ev":"verifier-up"}
+{"ts":"2026-06-14T07:54:15.577Z","ev":"acquired","life":"writer-2-125483#2","token":3,"waitedMs":12991}
+{"ts":"2026-06-14T07:54:15.869Z","ev":"fenced","life":"writer-2-125483#2","error":"FencedError: writer fenced: lease with token 3 is no longer ours (validate: lease changed)","expected":false}
+{"ts":"2026-06-14T07:54:26.882Z","ev":"acquired","life":"writer-3-125530#1","token":2,"waitedMs":36057}
+{"ts":"2026-06-14T07:54:27.158Z","ev":"fenced","life":"writer-3-125530#1","error":"FencedError: writer fenced: lease with token 2 is no longer ours (validate: lease changed)","expected":true}
+{"ts":"2026-06-14T07:54:31.182Z","ev":"verify-error","error":"relation \"ledger\" does not exist"}
+{"ts":"2026-06-14T07:54:31.342Z","ev":"acquired","life":"writer-2-125483#3","token":5,"waitedMs":14785}
+{"ts":"2026-06-14T07:54:31.643Z","ev":"fenced","life":"writer-2-125483#3","error":"FencedError: writer fenced: lease with token 5 is no longer ours (validate: lease changed)","expected":false}
+{"ts":"2026-06-14T07:54:40.766Z","ev":"acquired","life":"writer-1-125507#1","token":4,"waitedMs":51849}
+{"ts":"2026-06-14T07:54:41.271Z","ev":"fenced","life":"writer-1-125507#1","error":"FencedError: writer fenced: lease with token 4 is no longer ours (validate: lease changed)","expected":false}
+{"ts":"2026-06-14T07:54:43.056Z","ev":"verify-error","error":"relation \"ledger\" does not exist"}
+{"ts":"2026-06-14T07:54:45.218Z","ev":"acquired","life":"writer-2-125483#4","token":7,"waitedMs":12863}
+{"ts":"2026-06-14T07:54:45.421Z","ev":"fenced","life":"writer-2-125483#4","error":"FencedError: writer fenced: lease with token 7 is no longer ours (validate: lease changed)","expected":true}
+{"ts":"2026-06-14T07:54:54.023Z","ev":"verify-error","error":"relation \"ledger\" does not exist"}
+{"ts":"2026-06-14T07:54:56.581Z","ev":"acquired","life":"writer-3-125530#2","token":6,"waitedMs":28381}
+{"ts":"2026-06-14T07:54:56.812Z","ev":"fenced","life":"writer-3-125530#2","error":"FencedError: writer fenced: lease with token 6 is no longer ours (validate: lease changed)","expected":true}
+{"ts":"2026-06-14T07:55:06.964Z","ev":"acquired","life":"writer-3-125530#3","token":10,"waitedMs":9453}
+{"ts":"2026-06-14T07:55:07.863Z","ev":"verify-error","error":"relation \"ledger\" does not exist"}
+{"ts":"2026-06-14T07:55:19.054Z","ev":"error","life":"writer-1-125507#2","error":"Error: fence-stamp failed after repeated manifest races","expected":false}
+{"ts":"2026-06-14T07:55:21.842Z","ev":"verify","seq":4,"rows":4,"writers":1,"maxFence":10,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T07:55:25.913Z","ev":"error","life":"writer-2-125483#5","error":"Error: fence-stamp failed after repeated manifest races","expected":false}
+{"ts":"2026-06-14T07:55:29.292Z","ev":"verify","seq":15,"rows":15,"writers":1,"maxFence":10,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T07:55:35.037Z","ev":"verify","seq":19,"rows":19,"writers":1,"maxFence":10,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T07:55:38.392Z","ev":"progress","life":"writer-3-125530#3","token":10,"tipSeq":25}
+{"ts":"2026-06-14T07:55:41.745Z","ev":"life-end","life":"writer-3-125530#3","ending":"clean","rowsThisLife":27}
+{"ts":"2026-06-14T07:55:42.456Z","ev":"verify","seq":25,"rows":25,"writers":1,"maxFence":10,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T07:55:49.002Z","ev":"acquired","life":"writer-1-125507#3","token":11,"waitedMs":28477}
+{"ts":"2026-06-14T07:55:49.008Z","ev":"life-end","life":"writer-1-125507#3","ending":"clean","rowsThisLife":0}
+{"ts":"2026-06-14T07:55:50.056Z","ev":"writer-done","holder":"writer-1-125507","lives":3,"totalRows":0}
+{"ts":"2026-06-14T07:55:52.259Z","ev":"verify","seq":27,"rows":27,"writers":1,"maxFence":10,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T07:55:56.354Z","ev":"verify","seq":27,"rows":27,"writers":1,"maxFence":10,"handovers":0,"ok":true,"violations":0}
+{"ts":"2026-06-14T07:55:56.361Z","ev":"verify-stalled","tipSeq":27,"lastSeq":27}
+{"ts":"2026-06-14T07:55:57.294Z","ev":"verifier-done","checks":6}
+{"ts":"2026-06-14T07:55:58.949Z","ev":"acquired","life":"writer-3-125530#4","token":11,"waitedMs":16058}
+{"ts":"2026-06-14T07:55:58.972Z","ev":"life-end","life":"writer-3-125530#4","ending":"clean","rowsThisLife":0}
+{"ts":"2026-06-14T07:55:59.259Z","ev":"acquired","life":"writer-2-125483#6","token":12,"waitedMs":31769}
+{"ts":"2026-06-14T07:55:59.287Z","ev":"life-end","life":"writer-2-125483#6","ending":"crash","rowsThisLife":0}
+{"ts":"2026-06-14T07:55:59.287Z","ev":"crash-exit","life":"writer-2-125483#6"}
+{"ts":"2026-06-14T07:56:00.014Z","ev":"writer-done","holder":"writer-3-125530","lives":4,"totalRows":27}
