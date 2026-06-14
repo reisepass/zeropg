@@ -1,6 +1,12 @@
-# D: Secondary cold-storage backups — design (NOT YET IMPLEMENTED)
+# D: Secondary cold-storage backups — design + status
 
-Status: **DESIGN ONLY** (2026-06-13). Implementation spec for TODO Track D.
+Status: **IMPLEMENTED AND DISASTER-TESTED** (2026-06-14). D1-D3 shipped, wired
+into ZeroPG as a default backup target, and validated by the E6 disaster matrix
+against real IBM COS (SIGKILL mid-backup, primary corruption, full primary wipe,
+retention-GC crash, index CAS races, restore crash, 1/50/500MB round-trips - all
+byte-identical). D4 (storage-class plumbing) and D5 (PITR) remain deferred. See
+the Phasing section and `experiments/e6-backup-disaster.ts`.
+
 This is the user-facing "give me daily backups to a second, colder place, and
 keep only the last N / drop anything older than X days" feature that mature
 production databases ship as standard. It is deliberately designed to live
@@ -232,16 +238,40 @@ whichever store it's handed.
 
 ## Phasing (see TODO Track D)
 
-- **D1** `ColdArchiver.backupOnce()` + backup index; secondary = any existing
+- **D1 ✅** `ColdArchiver.backupOnce()` + backup index; secondary = any existing
   `BlobStore`. Consistency from the committed manifest.
-- **D2** Retention engine: `keepLast` + `maxAgeDays` first, GFS next; union
+- **D2 ✅** Retention engine: `keepLast` + `maxAgeDays` first, GFS next; union
   keep-set; never-delete-newest invariant; min-storage-duration guard.
-- **D3** `restoreFromBackup` + `scripts/restore-backup.ts` + the round-trip
+- **D3 ✅** `restoreFromBackup` + `scripts/restore-backup.ts` + the round-trip
   test (backup → wipe → restore → assert).
-- **D4** Storage-class support on `GcsBlobStore` / `R2BlobStore` +
+- **Default wiring ✅** `ZeroPGOptions.backup` (a `BackupTarget`): every
+  compaction snapshot is followed by a cold backup of that committed point + a
+  retention sweep, on a non-fatal background hook awaited by `close()`/`flush()`.
+  Unset ⇒ no-op (single-bucket setups unaffected).
+- **E6 disaster matrix ✅** `experiments/e6-backup-disaster.ts` against real COS:
+  SIGKILL mid-backup (a real fix landed - see below), primary-snapshot loss,
+  full primary wipe → byte-identical rebuild that boots + serves SQL, retention
+  never deletes the last restorable backup, crash during retention GC, index CAS
+  races, crash during restore, 1/50/500MB round-trips.
+- **D4** *(deferred)* Storage-class support on `GcsBlobStore` / `R2BlobStore` +
   `CostModel.minStorageDurationDays`; cost rows for the cold tiers.
-- **D5** *(after A2)* optional incremental/PITR mode: mirror numbered manifests
-  + WAL for point-in-time restore, layered over the snapshot archive.
+- **D5** *(deferred, after A2)* optional incremental/PITR mode: mirror numbered
+  manifests + WAL for point-in-time restore, layered over the snapshot archive.
+
+## Bug E6 caught (fixed, now a regression probe)
+
+**Orphaned backup object after a crash mid-backup.** `backupOnce` writes the
+snapshot object (create-if-absent) and then appends to the CAS'd index. A crash
+in that window left the object written but unreferenced. The retry recomputed
+the same key (same committed point), the create-if-absent failed with
+`PreconditionFailed`, and `adoptExisting` only consulted the index - found
+nothing - and returned `null`. The good backup was un-adoptable and **nothing
+was restorable**. Fixed: `adoptExisting` now distinguishes "already in the index"
+(idempotent re-run) from "orphan the index never named", and for the orphan it
+reconstructs the index entry from the manifest being backed up (same key ⇒ same
+commit point) plus a `HEAD` for the true stored size, then appends it. This is
+what makes the E6 `kill-before-object` / `kill-after-object` columns pass:
+partial backup is ignorable, the next backup succeeds and is restorable.
 
 ## Risks / watch-items
 
