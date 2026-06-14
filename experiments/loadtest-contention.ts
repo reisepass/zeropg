@@ -54,7 +54,16 @@ const HERE = fileURLToPath(import.meta.url)
 
 // ---- config ----
 const BUCKET = process.env.ZEROPG_BUCKET ?? 'zeropg-experiments-euw1'
-const PREFIX = process.env.ZEROPG_PREFIX ?? 'demo/loadtest-stress'
+// The prefix children actually use. The orchestrator resolves a UNIQUE prefix
+// per run (base + run id) and pins it into the child env as ZEROPG_PREFIX_RESOLVED
+// so writers + verifier all agree on it. Why unique-per-run matters: reusing a
+// prefix across a hard-killed run leaves a half-committed manifest + a second
+// generation + a stale lease on it; the next run then races TWO manifest
+// lineages and the verifier (correctly) reports fence regressions that are an
+// artifact of the polluted prefix, not the lease. A fresh prefix per run makes
+// every run start from a coherent empty state. Set LOADTEST_REUSE_PREFIX=1 to
+// opt out (e.g. the cross-host run that must target a service's live prefix).
+const PREFIX_BASE = process.env.ZEROPG_PREFIX ?? 'demo/loadtest-stress'
 const N_WRITERS = Number(process.env.LOADTEST_WRITERS ?? 4)
 const DURATION_S = Number(process.env.LOADTEST_SECONDS ?? 900)
 const TTL_MS = Number(process.env.LOADTEST_TTL_MS ?? 8000)
@@ -62,6 +71,13 @@ const COMMIT_MS = Number(process.env.LOADTEST_COMMIT_MS ?? 350)
 const RUN_ID = process.env.LOADTEST_RUN_ID ?? new Date().toISOString().replace(/[:.]/g, '-')
 const EVENTS = `results/loadtest-${RUN_ID}-events.jsonl`
 const FAIL_MARKER = `results/loadtest-${RUN_ID}-FAIL.txt`
+const REUSE_PREFIX = /^(1|true|on)$/i.test(process.env.LOADTEST_REUSE_PREFIX ?? '')
+
+// Children receive the orchestrator's already-resolved prefix; the orchestrator
+// computes it once (unique per run unless reuse is requested).
+const PREFIX =
+  process.env.ZEROPG_PREFIX_RESOLVED ??
+  (REUSE_PREFIX ? PREFIX_BASE : `${PREFIX_BASE}-${RUN_ID}`)
 
 function store(): GcsBlobStore {
   return new GcsBlobStore({ bucket: BUCKET, prefix: PREFIX })
@@ -298,7 +314,12 @@ async function runOrchestrator(): Promise<void> {
   console.log('  building empty-datadir seed snapshot…')
   writeFileSync(seedPath, await ZeroPG.buildEmptySnapshot())
 
-  const childEnv = { ...process.env, LOADTEST_RUN_ID: RUN_ID, LOADTEST_SEED_PATH: seedPath }
+  const childEnv = {
+    ...process.env,
+    LOADTEST_RUN_ID: RUN_ID,
+    LOADTEST_SEED_PATH: seedPath,
+    ZEROPG_PREFIX_RESOLVED: PREFIX, // pin the resolved prefix so all children agree
+  }
   const fork = (role: string, ...args: string[]): ChildProcess => {
     const c = spawn('npx', ['tsx', HERE, role, ...args], {
       env: childEnv,
