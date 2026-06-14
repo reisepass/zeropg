@@ -171,12 +171,21 @@ async function runWriter(id: string): Promise<void> {
 
       emit({ ev: 'life-end', life, ending: ending === 'zombie' ? 'survived-zombie' : ending, rowsThisLife })
       if (ending === 'crash') {
-        // Hard exit: no flush, no release. The lease object is left behind; a
-        // sibling must wait it out and take over. (In strict mode nothing is
-        // pending, so this loses no committed rows — it tests the takeover, not
-        // durability.)
+        // Simulate a crash: ABANDON the engine without flush or lease release.
+        // The lease object is left behind in the bucket; a sibling must wait it
+        // out (TTL) and take over via CAS, incrementing the fencing token —
+        // exactly the crash-takeover path. We do NOT process.exit() here: that
+        // would permanently remove this writer from contention (a writer that
+        // drew 'crash' on its first life would never contend again, quietly
+        // draining the run), whereas a real fleet keeps replacing crashed
+        // instances. So this process loops into a NEW life and re-contends,
+        // while the orphaned lease + leaked scratch dir reproduce the crash's
+        // externally-visible state. (In strict mode nothing is pending, so no
+        // committed row is lost; this tests the takeover, not durability.)
         emit({ ev: 'crash-exit', life })
-        process.exit(137)
+        db = null // drop the ref WITHOUT close(): lease dangles until TTL expiry
+        await sleep(jitter(500, 1500))
+        continue
       }
       await db.close() // clean release -> next writer acquires fresh
       db = null
