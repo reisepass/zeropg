@@ -36,8 +36,13 @@ export interface ZeroPGServerOptions {
   store: BlobStore
   /** Public HTTP port (control face + /rest proxy). Default 8080 / $PORT. */
   port?: number
-  /** Local Postgres wire-protocol port (loopback). Default 5432. */
+  /** Local Postgres wire-protocol port. Default 5432. */
   wirePort?: number
+  /** Host the wire server binds to. Default 127.0.0.1 (loopback) — correct for
+   *  HTTP-only platforms (Cloud Run / Code Engine) where raw 5432 is never
+   *  exposed. Set to 0.0.0.0 on Fly.io where the proxy forwards a public TCP
+   *  port to it. */
+  wireHost?: string
   /** Local PostgREST port (loopback; reverse-proxied under /rest). Default 3000. */
   restPort?: number
   /** Lease holder id (instance identity). */
@@ -81,7 +86,7 @@ export class ZeroPGServer {
   readonly opts: Required<
     Pick<
       ZeroPGServerOptions,
-      'port' | 'wirePort' | 'restPort' | 'postgrest' | 'postgrestBin' | 'restSchemas' | 'label'
+      'port' | 'wirePort' | 'wireHost' | 'restPort' | 'postgrest' | 'postgrestBin' | 'restSchemas' | 'label'
     >
   > &
     ZeroPGServerOptions
@@ -92,6 +97,7 @@ export class ZeroPGServer {
       ...opts,
       port: opts.port ?? Number(process.env.PORT ?? 8080),
       wirePort: opts.wirePort ?? Number(process.env.ZEROPG_WIRE_PORT ?? 5432),
+      wireHost: opts.wireHost ?? process.env.ZEROPG_WIRE_HOST ?? '127.0.0.1',
       restPort: opts.restPort ?? Number(process.env.ZEROPG_REST_PORT ?? 3000),
       postgrest: opts.postgrest ?? !/^(off|false|0)$/i.test(process.env.ZEROPG_POSTGREST ?? ''),
       postgrestBin: opts.postgrestBin ?? process.env.ZEROPG_POSTGREST_BIN ?? 'postgrest',
@@ -142,7 +148,7 @@ export class ZeroPGServer {
       this.wire = new PGLiteSocketServer({
         db: this.db.raw,
         port: o.wirePort,
-        host: '127.0.0.1',
+        host: o.wireHost,
         // PostgREST opens a small pool; allow several concurrent loopback conns.
         maxConnections: 10,
       })
