@@ -167,23 +167,28 @@ async function runWriter(id: string): Promise<void> {
     } catch (e) {
       const fenced = e instanceof FencedError
       const locked = e instanceof LockedError
+      const io = isTransientIo(e)
       emit({
-        ev: fenced ? 'fenced' : locked ? 'locked' : 'error',
+        // Three distinct classes, only the last of which is a real problem:
+        //  · fenced/locked : the single-writer guarantee WORKING — this writer
+        //    lost (or never got) the lease and was correctly refused. Expected
+        //    on every churn path (clean handoff, crash takeover, zombie wakeup).
+        //  · io-error      : a transport blip to the object store (fetch failed,
+        //    reset, 5xx, timeout). Orthogonal to the lease guarantee — the
+        //    bucket is the source of truth and the chain on it is unaffected;
+        //    the writer just retries from a fresh open. Reported, not fatal.
+        //  · error         : a non-fenced, non-locked, non-IO throw. The only
+        //    genuinely unexpected kind; it fails the run.
+        ev: fenced ? 'fenced' : locked ? 'locked' : io ? 'io-error' : 'error',
         life,
         error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
-        // A FencedError or LockedError is the single-writer guarantee WORKING:
-        // this writer lost (or never got) the lease and was correctly refused.
-        // It is the expected, safe outcome under contention — every churn path
-        // (clean handoff, crash takeover, zombie wakeup) can produce one. Only a
-        // non-fenced, non-locked throw is unexpected.
         expected: fenced || locked,
         whileZombie: ending === 'zombie',
       })
-      // A FencedError is the CORRECT outcome of the zombie path: discard the
-      // stale local state and re-open from the bucket (never blind-retry).
+      // Discard stale local state and re-open from the bucket (never blind-retry).
       if (db) await db.close().catch(() => {})
       db = null
-      if (!fenced && !locked) await sleep(1000) // unexpected: back off before retry
+      if (!fenced && !locked) await sleep(io ? 1500 : 1000) // back off before retry
     }
     await sleep(jitter(200, 600))
   }
@@ -195,6 +200,22 @@ function pickEnding(): 'clean' | 'crash' | 'zombie' {
   if (r < 0.25) return 'crash'
   if (r < 0.5) return 'zombie'
   return 'clean'
+}
+
+/** A transport-layer blip talking to the object store, NOT a lease/logic fault.
+ * These are operational noise on a real network and say nothing about the
+ * single-writer guarantee: the bucket is authoritative and the committed chain
+ * on it is untouched, so the writer just re-opens. Classified apart from a real
+ * unexpected error so a dropped TCP connection can't masquerade as an integrity
+ * failure (and a real integrity failure can't hide as "just a network blip"). */
+function isTransientIo(e: unknown): boolean {
+  const msg = (e instanceof Error ? `${e.name}: ${e.message}` : String(e)).toLowerCase()
+  const cause = e instanceof Error && e.cause ? String((e.cause as { code?: string }).code ?? e.cause).toLowerCase() : ''
+  return (
+    /fetch failed|network|socket|econnreset|econnrefused|etimedout|enotfound|eai_again|terminated|aborted|503|502|500|429|tls|und_err/.test(
+      msg,
+    ) || /econnreset|econnrefused|etimedout|enotfound|eai_again|und_err/.test(cause)
+  )
 }
 
 // ======================================================================
@@ -354,7 +375,8 @@ interface Summary {
   fencedExpected: number // zombie woke and was correctly fenced
   fencedUnexpected: number
   lockedEvents: number
-  errors: number // non-fenced, non-locked throws (the only unexpected kind)
+  errors: number // non-fenced, non-locked, non-IO throws (the only fatal kind)
+  ioErrors: number // transient transport blips (reported, not fatal)
   maxToken: number
   tokensSortMonotonic: boolean // issued tokens, sorted, strictly increase
   fenceSharedCommits: number // committed rows sharing a token across writers
@@ -392,8 +414,11 @@ function summarize(final: ChainVerdict): Summary {
   for (let i = 1; i < distinctSorted.length; i++) {
     if (distinctSorted[i] <= distinctSorted[i - 1]) sortMonotonic = false
   }
-  // Unexpected = a throw that was neither a FencedError nor a LockedError.
+  // Fatal = a throw that was neither fenced, locked, nor a transient transport
+  // blip. io-errors are reported separately and never fail the run (they say
+  // nothing about the single-writer guarantee — the bucket chain is untouched).
   const errors = evs.filter((e) => e.ev === 'error').length
+  const ioErrors = evs.filter((e) => e.ev === 'io-error').length
   const fenced = evs.filter((e) => e.ev === 'fenced').length
   const locked = evs.filter((e) => e.ev === 'locked').length
   const verifyChecks = evs.filter((e) => e.ev === 'verify')
@@ -409,6 +434,7 @@ function summarize(final: ChainVerdict): Summary {
     fencedUnexpected: errors, // non-fenced/non-locked throws
     lockedEvents: locked,
     errors,
+    ioErrors,
     maxToken: tokens.length ? Math.max(...tokens) : 0,
     tokensSortMonotonic: sortMonotonic,
     fenceSharedCommits: final.violations.filter((v) => v.kind === 'fence-shared').length,
@@ -442,6 +468,7 @@ function renderReport(s: Summary, final: ChainVerdict): string {
     `    simulated crashes (takeover)${s.crashes}\n` +
     `    zombie stalls               ${s.zombieStalls}\n` +
     `    losers fenced/locked (OK)   ${s.fencedExpected + s.lockedEvents}\n` +
+    `    transient IO blips (non-fatal) ${s.ioErrors}\n` +
     `    unexpected errors           ${s.errors}\n` +
     `\n  sustained ledger writes/sec   ${s.writesPerSec}\n` +
     `═════════════════════════════════════════════════════════════════\n` +
