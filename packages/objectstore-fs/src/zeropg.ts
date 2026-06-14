@@ -43,6 +43,7 @@ import {
   decodeManifest,
 } from './manifest.js'
 import { createTarStream, extractTarStream, largestFile } from './tar.js'
+import { ColdArchiver, type RetentionPolicy } from './archive.js'
 import {
   restoreSnapshotInto,
   applyWalSegments,
@@ -73,6 +74,36 @@ import { join } from 'node:path'
  *                last flush" if the instance dies without grace.
  */
 export type Durability = 'strict' | 'interval' | 'sleep'
+
+/**
+ * Secondary cold-storage backup target (Track D). When set, ZeroPG runs a
+ * ColdArchiver against this store automatically after each compaction snapshot,
+ * giving a second blast radius + retention without an external cron line. When
+ * unset, backups are a no-op — single-bucket setups are unaffected.
+ *
+ * The archiver consumes the primary bucket leaselessly (like a replica), so the
+ * hook never blocks or contends with the commit path: backupOnce runs after the
+ * snapshot is durable, and a failure is logged, never fatal to the commit.
+ */
+export interface BackupTarget {
+  /** The SECONDARY BlobStore (distinct bucket, or a prefixed view of one). */
+  store: BlobStore
+  /**
+   * Retention applied after each successful backup. Omit to keep every backup.
+   * The newest backup is ALWAYS kept regardless of policy (retain() invariant).
+   */
+  retention?: RetentionPolicy
+  /**
+   * Run the backup synchronously inside the commit (true) or fire-and-forget in
+   * the background (false, default). Background keeps commit latency flat; the
+   * in-flight backup is always awaited by close()/flush() so nothing is lost on
+   * a clean shutdown. Set true when a test needs the backup observable
+   * immediately after the awaited commit.
+   */
+  blocking?: boolean
+  /** Local scratch dir for the archiver's temp restore. Default os.tmpdir(). */
+  scratchDir?: string
+}
 
 export interface ZeroPGOptions {
   store: BlobStore
@@ -140,6 +171,13 @@ export interface ZeroPGOptions {
    * at boot; unsupported values are ignored, non-fatally).
    */
   walCompression?: 'off' | 'pglz' | 'lz4' | 'zstd'
+  /**
+   * Secondary cold-storage backup target (Track D). When set, every compaction
+   * snapshot is followed by a ColdArchiver backup of the freshly-committed point
+   * to this second store, with optional retention. Unset => no-op (single-bucket
+   * setups still work). See BackupTarget.
+   */
+  backup?: BackupTarget
 }
 
 export interface CommitInfo {
@@ -222,6 +260,13 @@ export class ZeroPG {
   private fullPageWrites: boolean
   private walCompression?: string
 
+  // ---- Track D: secondary cold-storage backup ----
+  private backup: BackupTarget | null = null
+  private archiver: ColdArchiver | null = null
+  /** In-flight background backup, awaited by close()/flush() so a clean
+   * shutdown never abandons a backup mid-upload. */
+  private backupInFlight: Promise<void> | null = null
+
   private manifest!: Manifest
   private manifestEtag: string | null = null
   private generation!: string
@@ -265,6 +310,13 @@ export class ZeroPG {
       process.env.ZEROPG_FULL_PAGE_WRITES ?? '',
     )
     this.walCompression = opts.walCompression ?? process.env.ZEROPG_WAL_COMPRESSION
+    if (opts.backup) {
+      this.backup = opts.backup
+      this.archiver = new ColdArchiver(opts.store, opts.backup.store, {
+        scratchDir: opts.backup.scratchDir,
+        now: this.now,
+      })
+    }
   }
 
   private commitIntervalMs: number
@@ -1065,6 +1117,9 @@ export class ZeroPG {
     for (const seg of oldSegments) {
       void this.store.delete(seg.key).catch(() => {})
     }
+    // Track D hook: the snapshot is now durable in the primary, so take a cold
+    // backup of this committed point. One call, after compaction, never fatal.
+    await this.runBackup()
     return {
       commitSeq: nextSeq,
       generation: this.generation,
@@ -1075,6 +1130,47 @@ export class ZeroPG {
       dumpMs,
       uploadMs,
       manifestMs,
+    }
+  }
+
+  /**
+   * Track D backup hook. Called after a compaction snapshot is durable in the
+   * primary. No-op when no backup target is configured. The archiver reads the
+   * primary leaselessly (no contention) and writes to the secondary, then
+   * applies retention. A failure here is LOGGED, never fatal: a backup that
+   * could not be taken must not fail an already-committed write.
+   *
+   * Default is background (fire-and-forget) so commit latency stays flat; the
+   * promise is parked in backupInFlight and always awaited by flush()/close().
+   * blocking:true awaits inline (tests that assert the backup right after the
+   * awaited commit).
+   */
+  private async runBackup(): Promise<void> {
+    if (!this.archiver || !this.backup) return
+    const archiver = this.archiver
+    const policy = this.backup.retention
+    // A thunk, NOT an eagerly-started promise: when backgrounded it must not
+    // begin until any previous backup finishes (one archiver, serial restore +
+    // index CAS), else two runs race the index against themselves.
+    const run = async (): Promise<void> => {
+      try {
+        const entry = await archiver.backupOnce()
+        if (entry && policy) await archiver.applyRetention(policy)
+      } catch (e) {
+        // Never fatal to the commit: log and move on.
+        console.log(
+          JSON.stringify({
+            event: 'zeropg-backup-error',
+            error: e instanceof Error ? e.message : String(e),
+          }),
+        )
+      }
+    }
+    if (this.backup.blocking) {
+      await run()
+    } else {
+      const prev = this.backupInFlight ?? Promise.resolve()
+      this.backupInFlight = prev.then(run)
     }
   }
 
@@ -1186,11 +1282,20 @@ export class ZeroPG {
         // Bypass commit()'s closed-check; this is the sleep-mode flush.
         await (this.commitInFlight ?? this.doCommit())
       }
+      // Never abandon a background backup mid-upload on a clean shutdown.
+      if (this.backupInFlight) await this.backupInFlight.catch(() => {})
     } finally {
       if (this.lease) await this.lease.release().catch(() => {})
       await this.pg.close()
       await this.cleanupScratch().catch(() => {})
     }
+  }
+
+  /** Await any in-flight background cold backup (Track D). Tests / graceful
+   * shutdown use this to observe the backup that a non-blocking commit kicked
+   * off. No-op when no backup target is configured. */
+  async drainBackups(): Promise<void> {
+    if (this.backupInFlight) await this.backupInFlight.catch(() => {})
   }
 
   private async cleanupScratch(): Promise<void> {

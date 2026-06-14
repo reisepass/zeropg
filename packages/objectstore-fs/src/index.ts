@@ -1,6 +1,25 @@
-export { ZeroPG, type ZeroPGOptions, type CommitInfo, type Durability } from './zeropg.js'
+export {
+  ZeroPG,
+  type ZeroPGOptions,
+  type BackupTarget,
+  type CommitInfo,
+  type Durability,
+} from './zeropg.js'
 export { ZeroPGReplica, type ZeroPGReplicaOptions } from './replica.js'
 export { collectGarbage, type GcOptions, type GcResult } from './gc.js'
+export {
+  ColdArchiver,
+  type ColdArchiverOptions,
+  type BackupEntry,
+  type BackupIndex,
+  type RetentionPolicy,
+  type RetentionResult,
+  INDEX_KEY,
+  encodeBackupIndex,
+  decodeBackupIndex,
+  backupKey,
+  retain,
+} from './archive.js'
 export {
   type Manifest,
   type WalSegment,
