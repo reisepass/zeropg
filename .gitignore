@@ -1,10 +1,17 @@
 node_modules/
 results/*.log
 ._*
+.DS_Store
+.claude/
 .claude-command-log.jsonl
 _waltest.mjs
-.claude/worktrees/
 _debug-*.mjs
+
+# internal prompt/command history (not public)
+prompt_history.txt
+
+# internal research (not public)
+SELFHOST-CANDIDATES.md
 
 # secrets
 .env
