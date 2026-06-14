@@ -1,0 +1,4 @@
+{"ts":"2026-06-14T07:04:50.680Z","label":"ibm-code-engine","postgrest":"on","scenario":"idle","serverRssMB":388,"postgrestRssMB":21,"totalRssMB":409,"dbBytes":"7708795","readyMs":5783}
+{"ts":"2026-06-14T07:04:52.318Z","label":"ibm-code-engine","postgrest":"on","scenario":"load","serverRssMB":398,"postgrestRssMB":39,"totalRssMB":437}
+{"ts":"2026-06-14T07:07:08.109Z","label":"ibm-code-engine","postgrest":"off","scenario":"idle","serverRssMB":381,"postgrestRssMB":0,"totalRssMB":381,"dbBytes":"7725179","readyMs":3316}
+{"ts":"2026-06-14T07:07:09.677Z","label":"ibm-code-engine","postgrest":"off","scenario":"load","serverRssMB":391,"postgrestRssMB":0,"totalRssMB":391}
