@@ -1,6 +1,6 @@
 # zeropg
 
-##Not production ready, currently a set of experiments to find the most monimal way to run production postgres with scale to zero. 
+## Not production ready, currently a set of experiments to find the most monimal way to run production postgres with scale to zero. 
 
 **Postgres that costs zero when nobody's using it.**
 
