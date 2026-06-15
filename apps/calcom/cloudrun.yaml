@@ -1,0 +1,162 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: zeropg-calcom
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        # Single writer — zeropg holds one lease; no concurrent writers.
+        autoscaling.knative.dev/maxScale: "1"
+        autoscaling.knative.dev/minScale: "0"
+        run.googleapis.com/startup-cpu-boost: "true"
+        # App container must wait for the sidecar's startup probe to pass
+        # before Cal.com's start.sh runs prisma migrate deploy + Next.js boot.
+        run.googleapis.com/container-dependencies: '{"calcom":["zeropg-sidecar"]}'
+    spec:
+      # Single-writer; one request at a time is fine for the demo.
+      containerConcurrency: 80
+      # Allow 15 min for cold start: bucket restore + prisma migrate + Next.js build
+      timeoutSeconds: 900
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containers:
+
+      # ── zeropg sidecar ──────────────────────────────────────────────────────
+      - name: zeropg-sidecar
+        image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/service:latest
+        resources:
+          limits:
+            cpu: "1"
+            memory: 512Mi
+        env:
+        - name: ZEROPG_BUCKET
+          value: zeropg-experiments-euw1
+        - name: ZEROPG_PREFIX
+          value: demo/calcom
+        - name: ZEROPG_DURABILITY
+          value: sleep
+        - name: ZEROPG_POSTGREST
+          value: "off"
+        # Wire port on loopback only (default); HTTP health face on 8080.
+        - name: ZEROPG_WIRE_HOST
+          value: "127.0.0.1"
+        - name: ZEROPG_WIRE_PORT
+          value: "5432"
+        # Cal.com's wait-for-it uses DATABASE_HOST for host:port check.
+        # We expose the sidecar's HTTP control face — not the wire port —
+        # as the Cloud Run container port (CR only proxies one HTTP port).
+        ports:
+        - name: h2c
+          containerPort: 8080
+        # Startup probe: wait for PGlite to restore + be ready (up to 10 min).
+        # periodSeconds × failureThreshold = max wait before CR kills the instance.
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 60
+          timeoutSeconds: 5
+        # Liveness: sidecar must stay responsive.
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          periodSeconds: 30
+          failureThreshold: 3
+          timeoutSeconds: 5
+
+      # ── Cal.com app ──────────────────────────────────────────────────────────
+      - name: calcom
+        image: calcom/cal.com:latest
+        resources:
+          limits:
+            cpu: "2"
+            memory: 2Gi
+        ports:
+        - name: http1
+          containerPort: 3000
+        env:
+        # ── Database ────────────────────────────────────────────────────────
+        # DATABASE_HOST is used by wait-for-it.sh in start.sh.
+        # We don't actually need to wait (container-dependencies handles
+        # sidecar readiness), but the script requires this var; set it to
+        # a reachable address so it exits immediately.
+        - name: DATABASE_HOST
+          value: "localhost:5432"
+        - name: DATABASE_URL
+          value: "postgresql://postgres:postgres@localhost:5432/calcom?connect_timeout=30&sslmode=disable"
+        # DATABASE_DIRECT_URL = DATABASE_URL when there is no pooler.
+        - name: DATABASE_DIRECT_URL
+          value: "postgresql://postgres:postgres@localhost:5432/calcom?connect_timeout=30&sslmode=disable"
+
+        # ── Auth / encryption ────────────────────────────────────────────────
+        - name: NEXTAUTH_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: calcom-nextauth-secret
+              key: latest
+        - name: CALENDSO_ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: calcom-encryption-key
+              key: latest
+
+        # ── App URLs ─────────────────────────────────────────────────────────
+        # Set at deploy time via scripts/replace-placeholder.sh + runtime env.
+        - name: NEXT_PUBLIC_WEBAPP_URL
+          value: "https://zeropg-calcom-71428757273.europe-west1.run.app"
+        - name: NEXTAUTH_URL
+          value: "https://zeropg-calcom-71428757273.europe-west1.run.app"
+
+        # ── License consent (OSS) ────────────────────────────────────────────
+        - name: NEXT_PUBLIC_LICENSE_CONSENT
+          value: "agree"
+
+        # ── Google OAuth (host configures once for calendar integration) ──────
+        # GOOGLE_API_CREDENTIALS is a JSON blob with client_id + client_secret.
+        # Leave empty to disable Google Calendar; operators set this in Secret
+        # Manager and reference it here.
+        # - name: GOOGLE_API_CREDENTIALS
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: calcom-google-api-credentials
+        #       key: latest
+        - name: GOOGLE_LOGIN_ENABLED
+          value: "false"
+
+        # ── Email (optional for v1 — skip SMTP so signups still work) ────────
+        # Cal.com works without email; verification links are logged.
+        - name: EMAIL_FROM
+          value: "noreply@example.com"
+
+        # ── Disable telemetry ─────────────────────────────────────────────────
+        - name: NEXT_TELEMETRY_DISABLED
+          value: "1"
+
+        # The app boots only after the sidecar startup probe passes
+        # (enforced by container-dependencies), but Cal.com's start.sh also
+        # runs wait-for-it against DATABASE_HOST. With localhost:5432 already
+        # listening the check passes in < 1 s.
+        startupProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          # Give Next.js + prisma migrate up to 10 min after sidecar ready.
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          failureThreshold: 40
+          timeoutSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          periodSeconds: 30
+          failureThreshold: 3
+          timeoutSeconds: 10
+  traffic:
+  - latestRevision: true
+    percent: 100
