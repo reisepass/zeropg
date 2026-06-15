@@ -1,0 +1,106 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: privatebin-zeropg
+  labels:
+    cloud.googleapis.com/location: europe-west1
+  annotations:
+    run.googleapis.com/ingress: all
+    run.googleapis.com/launch-stage: BETA
+spec:
+  template:
+    metadata:
+      annotations:
+        # Scale to zero; only one writer (zeropg is single-writer).
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "1"
+        run.googleapis.com/startup-cpu-boost: "true"
+        # App container waits until the zeropg-sidecar startup probe passes.
+        run.googleapis.com/container-dependencies: '{"privatebin":["zeropg-sidecar"]}'
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      # Cold-start budget: sidecar restore (GCS download + PGlite init) can take
+      # 20–30 s; app boot is fast (nginx/php-fpm). 300 s gives comfortable margin.
+      timeoutSeconds: 300
+      containers:
+
+        # ── 1. zeropg sidecar ───────────────────────────────────────────────
+        # Built by the foundation agent. Runs the zeropg standalone server:
+        # PGlite + pglite-socket on localhost:5432, backed by GCS.
+        - name: zeropg-sidecar
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/zeropg-sidecar:latest
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          env:
+            - name: ZEROPG_BUCKET
+              value: zeropg-experiments-euw1
+            - name: ZEROPG_PREFIX
+              value: demo/privatebin
+            - name: ZEROPG_DURABILITY
+              value: sleep
+            # PostgREST is unnecessary when the app connects via wire protocol.
+            - name: ZEROPG_POSTGREST
+              value: "off"
+            # Wire protocol on all interfaces within the service network (loopback
+            # suffices on Cloud Run where containers share network namespace).
+            - name: ZEROPG_WIRE_HOST
+              value: "127.0.0.1"
+            - name: APP_LABEL
+              value: "zeropg — PrivateBin"
+          ports:
+            - name: h2c
+              containerPort: 8080
+          # Startup probe: Cloud Run gates the app container on this.
+          # TCP-check on port 5432 confirms pglite-socket is accepting connections.
+          # The sidecar opens the wire port only after DB restore completes, so
+          # this naturally waits for the full cold-start restore.
+          startupProbe:
+            tcpSocket:
+              port: 5432
+            # Poll every 5 s; allow up to 120 s total (24 × 5 s) for GCS restore.
+            periodSeconds: 5
+            failureThreshold: 24
+            timeoutSeconds: 3
+
+        # ── 2. PrivateBin app (official unmodified image) ───────────────────
+        - name: privatebin
+          image: privatebin/nginx-fpm-alpine:latest
+          resources:
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          # Receive public HTTPS traffic on port 8080.
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            # Point to the directory where our conf.php secret is mounted.
+            - name: CONFIG_PATH
+              value: /run/secrets/privatebin-cfg
+            # Ensure PHP errors go to stderr (Cloud Run captures it as logs).
+            - name: PHP_ERRORS_STDERR
+              value: "1"
+          volumeMounts:
+            - name: privatebin-cfg
+              mountPath: /run/secrets/privatebin-cfg
+              readOnly: true
+          # Startup probe: wait for nginx to accept connections (port 8080).
+          startupProbe:
+            httpGet:
+              path: /
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 12
+            timeoutSeconds: 5
+
+      volumes:
+        # conf.php is stored as a Secret Manager secret and mounted as a file.
+        # The secret name is "privatebin-conf-php"; version "latest".
+        - name: privatebin-cfg
+          secret:
+            secretName: privatebin-conf-php
+            items:
+              - key: latest
+                path: conf.php
