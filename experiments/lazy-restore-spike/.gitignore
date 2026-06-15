@@ -1,3 +1,6 @@
 # Throwaway scratch/debug scripts (probes, smoke tests, size checks). Kept on
 # disk for reference but not part of the deliverable.
 _*.mjs
+
+# esbuild output for the bridge worker (rebuilt on demand from the .mjs source)
+*.bundle.mjs

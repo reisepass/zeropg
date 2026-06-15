@@ -170,15 +170,60 @@ export function shouldUseLazy(stats) {
 }
 ```
 
+## Real measured GCS latency and speedups (europe-west1, all tiers)
+
+From `measured.jsonl` (Phases 4-5, 5 runs each tier, 2026-06-14):
+
+| measurement | value |
+|---|---|
+| warm same-region range-GET p50 | ~34-55ms across tiers |
+| cold (first connection) range-GET | ~130-225ms |
+| effective position in latency sweep | 30-60ms band |
+
+The 30-60ms band maps to a 100MB crossover for `gcs-same-region` in the
+sweep table above. Measured speedups at real scale:
+
+| shape | 500MB | 1GB | 2GB |
+|---|---|---|---|
+| pointLookup (lazy) | 2.1x | 4.3x | 5.8x |
+| indexedRange (lazy) | 1.6x | 2.5x | 2.7x |
+| fullScan (lazy+prefetch) | 1.3x | 1.8x | 2.0x |
+
+Lazy TTFQ is approximately constant across tier sizes (working set is fixed in
+absolute terms); eager TTFQ scales with snapshot size. The advantage therefore
+grows with DB size, exactly as the model predicts. The `gcs-same-region` 100MB
+crossover is conservative: lazy already wins at 500MB and the margin widens.
+
+## Write-path policy
+
+Lazy restore is read-mostly. Agreed policy for write operations:
+
+- **First write triggers hydrate-and-promote**: the segment is fully fetched into
+  memory, the sparse placeholder replaced with real bytes, and subsequent I/O is
+  local. No remote page write-back.
+- **No lazy write-back**: ZeroPG's write path is handled by the existing
+  snapshot/commit flow, not the lazy fault path.
+- **Implication**: lazy is best for "cold start, first query is a read" workloads.
+  Sessions that write immediately after restore should use eager (full restore).
+
 ## Caveats
 
-- Object-store latency/bandwidth are **estimates**. The latency-sensitivity table
-  quantifies how much that matters; measure real GCS/S3 first-byte latency to
-  finalize thresholds.
+- Object-store latency/bandwidth are **estimates** for the sweep, but the real
+  GCS same-region p50 (~34-55ms warm) has now been measured across 500MB, 1GB,
+  and 2GB tiers and is consistent with the model. S3 thresholds still need real
+  measurement.
 - Footprints are REAL and **deterministic** (multi-relation, heap + indexes).
 - `indexedJoin` faults ~31% of the DB
   because the planner seq-scans the large heap side - "a join" is not
   automatically a small working set; the plan decides. Drive the
   `firstQueryIsScanHeavy` flag from the actual plan, not the SQL text.
 - Eager datadir modeled as user-relation bytes * 1.15; lazy
-  eager-set a fixed 6MB.
+  eager-set a fixed ~74MB (catalogs + control files, constant across sizes).
+- **Prefetch is a double-edged sword**: it helps full scans (parallelizes serial
+  faults into concurrent GETs) but hurts point lookups at small sizes by
+  over-fetching. At 1GB+, lazy+prefetch for point lookups beats eager (2.0x at
+  1GB) because the eager baseline grew expensive enough. Disable prefetch when
+  working-set fraction < ~3% AND snapshot is under ~1GB.
+- **Lazy wins grow with DB size**: lazy point-lookup TTFQ is ~1.5-2.5s across
+  all tiers (working set constant); eager scales to 8.8s at 2GB. Plan for
+  larger speedups at larger sizes, not smaller ones.

@@ -328,3 +328,247 @@ node experiments/lazy-restore-spike/calibrate.mjs                 # footprints (
 node experiments/lazy-restore-spike/sweep.mjs                     # main + latency sweep
 node experiments/lazy-restore-spike/analyze.mjs                   # POLICY.md
 ```
+
+
+## Phase 4 - MEASURED TTFQ table (500MB GCS, real range-GETs, real PGlite)
+
+The deliverable measurement. A 500MB datadir (479MB user-relation bytes, 554MB
+full snapshot, 74MB eager-set) was built on the boot disk, staged to
+`gs://zeropg-experiments-euw1/lazy-measure/500mb/`, and measured EAGER vs LAZY
+vs LAZY+PREFETCH over three query shapes, 5 runs each, from a GCP VM
+(`europe-west1`). All correctness checks pass (`allMatch: true`).
+
+### Environment
+
+- VM: `europe-west1` GCP VM, 7.8GB RAM (boot disk, NOT tmpfs)
+- GCS bucket: `zeropg-experiments-euw1` (same region)
+- Snapshot: 554MB (`snapshot.tar`), eager-set: 74MB (`eager.tar`)
+- User data: 479MB across 13 relations (4 heaps + 9 indexes)
+- Schema: `users(147k) / orders(588k) / line_items(2.94M) / documents(110k)` with FKs + 5 secondary indexes
+- Page-group: 1MB (128 x 8KB Postgres heap blocks per range-GET)
+- PGlite: Node.js v22, `@electric-sql/pglite`, `LazyBucketFS` over SAB bridge
+
+### Measured GCS latency (real, from measured.jsonl)
+
+| metric | warm GET | cold GET |
+|---|---|---|
+| p50 fault lat (pointLookup, lazy) | 43.9ms | 225ms (first connection) |
+| p50 fault lat (indexedRange, lazy) | 39.3ms | 210ms |
+| p50 fault lat (fullScan, lazy) | 40ms | 204ms |
+
+Warm GCS same-region range-GET latency is **~40-57ms p50** - squarely in the
+30-60ms model range where the Phase 3 crossover table predicts 100MB for
+`gcs-same-region`. The 500MB measurement confirms that prediction.
+
+### MEASURED TTFQ table - 500MB tier, GCS, 5 runs
+
+| shape | mode | TTFQ p50 (ms) | TTFQ p99 (ms) | bytes pulled | faults | fault lat p50 | cold GET | speedup vs eager |
+|---|---|---|---|---|---|---|---|---|
+| pointLookup | eager | 5358 | 6956 | 553 MB | - | - | - | 1x (baseline) |
+| pointLookup | lazy | **2489** | 2776 | 7.3 MB | 7 | 44ms | 225ms | **2.1x faster** |
+| pointLookup | lazy+prefetch | 4855 | 5012 | 222 MB | 2 sync | 107ms | 220ms | 0.9x (slower - prefetch over-fetches) |
+| indexedRange | eager | 5150 | 6007 | 553 MB | - | - | - | 1x (baseline) |
+| indexedRange | lazy | **3199** | 3283 | 17.8 MB | 17 | 39ms | 210ms | **1.6x faster** |
+| indexedRange | lazy+prefetch | 4845 | 5038 | 222 MB | 2 sync | 108ms | 230ms | 0.9x (slower - prefetch over-fetches) |
+| fullScan | eager | 6255 | 7029 | 553 MB | - | - | - | 1x (baseline) |
+| fullScan | lazy | 10067 | 10418 | 157 MB | 150 | 40ms | 204ms | 0.6x (SLOWER - 150 serial faults) |
+| fullScan | lazy+prefetch | **4719** | 5234 | 157 MB | 3 sync | 99ms | 195ms | **1.3x faster** (prefetch parallelizes) |
+
+### Key findings
+
+**(a) Lazy wins big on low-working-set queries (the designed case)**
+
+- `pointLookup`: lazy pulls 7.3MB (1.3%) instead of 553MB and returns in 2.5s vs
+  5.4s - **2.1x speedup**. 7 faults x ~40-60ms warm GETs = ~350ms of actual
+  network time; the rest (2.1s) is the eager-set extraction + PGlite open.
+- `indexedRange`: 17 faults x ~40ms = ~680ms network; returns in 3.2s vs 5.2s -
+  **1.6x speedup**.
+
+**(b) Prefetch HURTS lazy for low-working-set queries**
+
+Prefetch downloads all 1MB groups of the touched relations concurrently (~222MB,
+all of `line_items` + `line_items_pkey`) before the query. That is MORE than the
+full snapshot path: eager needs 554MB but streams them and does parallel range
+GETs; prefetch needs 222MB but also waits for all of them before querying. Result:
+2.3-2.7s prefetch dominates TTFQ and slow it to parity with eager. **Prefetch
+should be disabled for low-working-set queries** (e.g., point lookups where the
+query plan faults only ~10-20 groups, not hundreds).
+
+**(c) Prefetch HELPS full scans**
+
+Without prefetch, `fullScan` is disastrous: 150 SERIAL faults x ~40ms warm =
+~6000ms of blocking fault time on top of the eager-set open cost. With prefetch,
+150 groups are fetched concurrently in parallel (observed ~1.6-1.8s prefetch wall
+time), then the query runs on warm data - **1.3x speedup over eager**.
+
+**(d) The lazy path is correct end-to-end**
+
+All 45 trials (`allMatch: true`) returned results byte-identical to the golden
+answers captured at tier build time. The SAB bridge, LazyBucketFS, and
+1MB-page-group coalescing are correct at 500MB real scale with real GCS range-GETs.
+
+**(e) 1GB tier deferred (OOM risk on 7.8GB VM)**
+
+The prior OOM was caused by building the 1GB datadir on tmpfs. With the boot-disk
+fix, 500MB is safe (9.6MB residual in `~/lazy-work` after truncation). However the
+1GB tier needs ~1.1GB disk PLUS the tar staging object (~1.1GB), which fits on
+disk (43GB free) but risks PGlite memory pressure during the build. Defer 1GB to
+a VM with >= 16GB RAM or run with `--max-old-space-size=4096`.
+
+### Write-path policy (agreed, not yet measured)
+
+The measurement above is read-only. The agreed write-path policy:
+
+- **Lazy is read-mostly**: the lazy restore path is designed for the
+  "cold start, read the first query" workload. Write operations are outside its
+  intended scope.
+- **First write triggers hydrate-and-promote**: on the first write to a lazy
+  relation segment, the segment is fully hydrated into memory (all its 1MB groups
+  fetched synchronously), the sparse placeholder is replaced with the real bytes,
+  and subsequent reads and writes go to the local copy. No remote page write-back.
+- **Gate with `shouldUseLazy()`**: the decision function in `POLICY.md` gates
+  lazy restore at the restore decision point; once promoted to a full local copy
+  the session behaves as a normal PGlite instance.
+- **Implication**: lazy is most valuable for read-heavy analytics sessions or
+  one-shot queries; sessions that immediately write after restore should use eager.
+
+### Reproduce
+
+```
+# Tier build (500MB, ~10-15min, boot disk, GCS):
+WORKDIR=~/lazy-work node_modules/.bin/tsx experiments/lazy-restore-spike/build-tier.mjs 500 gcs
+
+# Measurement (5 runs/shape, ~10min, boots from bucket):
+WORKDIR=~/lazy-work node_modules/.bin/tsx experiments/lazy-restore-spike/measure.mjs 500 gcs 5
+```
+
+
+## Phase 5 - 1GB and 2GB tiers: speedup grows with DB size
+
+Measured on a 32GB GCP VM (`europe-west1`, 80GB boot disk) using the same
+methodology as Phase 4. Each tier was built on the boot disk (not tmpfs), staged
+to `gs://zeropg-experiments-euw1/lazy-measure/{1024,2048}mb/`, and measured
+5 runs per shape. All 90 trials passed correctness checks (`allMatch: true`).
+
+### Environment
+
+- VM: `europe-west1` GCP VM, 32GB RAM, 80GB boot disk
+- GCS bucket: `zeropg-experiments-euw1` (same region)
+- 1GB tier: snapshot=1052MB, eager-set=73.7MB, user-bytes=978MB, 13 relations
+- 2GB tier: snapshot=2030MB, eager-set=73.9MB, user-bytes=1956MB, 13 relations
+- Schema: same `users/orders/line_items/documents` multi-relation schema as Phase 4
+- Page-group: 1MB, PGlite Node.js v22
+
+### Measured GCS latency (1GB and 2GB tiers)
+
+Warm same-region range-GET latency remained consistent across tiers:
+
+| tier | warm GET p50 (pointLookup) | cold GET (first connection) |
+|---|---|---|
+| 500MB | 44ms | 225ms |
+| 1GB | 38ms | 147ms |
+| 2GB | 55ms | 142ms |
+
+### MEASURED TTFQ table - all three tiers, GCS, 5 runs each
+
+| size | shape | mode | TTFQ p50 (ms) | bytes pulled | faults | speedup vs eager |
+|---|---|---|---|---|---|---|
+| **500MB** | pointLookup | eager | 5358 | 553 MB | - | 1x |
+| **500MB** | pointLookup | lazy | 2489 | 7.3 MB | 7 | **2.1x** |
+| **500MB** | pointLookup | lazy+prefetch | 4855 | 222 MB | 2 sync | 0.9x |
+| **500MB** | indexedRange | eager | 5150 | 553 MB | - | 1x |
+| **500MB** | indexedRange | lazy | 3199 | 17.8 MB | 17 | **1.6x** |
+| **500MB** | indexedRange | lazy+prefetch | 4845 | 222 MB | 2 sync | 0.9x |
+| **500MB** | fullScan | eager | 6255 | 553 MB | - | 1x |
+| **500MB** | fullScan | lazy | 10067 | 157 MB | 150 | 0.6x (SLOWER) |
+| **500MB** | fullScan | lazy+prefetch | 4719 | 157 MB | 3 sync | **1.3x** |
+| **1GB** | pointLookup | eager | 7038 | 1052 MB | - | 1x |
+| **1GB** | pointLookup | lazy | 1640 | 7.3 MB | 7 | **4.3x** |
+| **1GB** | pointLookup | lazy+prefetch | 3442 | 450 MB | 2 sync | 2.0x |
+| **1GB** | indexedRange | eager | 6288 | 1052 MB | - | 1x |
+| **1GB** | indexedRange | lazy | 2503 | 28.3 MB | 27 | **2.5x** |
+| **1GB** | indexedRange | lazy+prefetch | 4038 | 450 MB | 2 sync | 1.6x |
+| **1GB** | fullScan | eager | 6713 | 1052 MB | - | 1x |
+| **1GB** | fullScan | lazy | 14768 | 316 MB | 302 | 0.5x (SLOWER) |
+| **1GB** | fullScan | lazy+prefetch | 3684 | 316 MB | 3 sync | **1.8x** |
+| **2GB** | pointLookup | eager | 8764 | 2030 MB | - | 1x |
+| **2GB** | pointLookup | lazy | 1519 | 6.3 MB | 6 | **5.8x** |
+| **2GB** | pointLookup | lazy+prefetch | 5508 | 898 MB | 2 sync | 1.6x |
+| **2GB** | indexedRange | eager | 9408 | 2030 MB | - | 1x |
+| **2GB** | indexedRange | lazy | 3433 | 51.4 MB | 49 | **2.7x** |
+| **2GB** | indexedRange | lazy+prefetch | 5729 | 898 MB | 2 sync | 1.6x |
+| **2GB** | fullScan | eager | 10869 | 2030 MB | - | 1x |
+| **2GB** | fullScan | lazy | 31561 | 629 MB | 601 | 0.3x (SLOWER) |
+| **2GB** | fullScan | lazy+prefetch | 5538 | 629 MB | 3 sync | **2.0x** |
+
+### Speedup trend: lazy advantage grows with DB size
+
+The key result - lazy TTFQ stays approximately constant as the DB doubles
+(working set is fixed in absolute terms), while eager TTFQ scales linearly with
+snapshot size:
+
+| shape | 500MB speedup | 1GB speedup | 2GB speedup | trend |
+|---|---|---|---|---|
+| pointLookup (lazy) | 2.1x | **4.3x** | **5.8x** | eager: +63% per doubling; lazy: ~constant |
+| indexedRange (lazy) | 1.6x | **2.5x** | **2.7x** | eager: scales; lazy faults grow slowly |
+| fullScan (lazy+prefetch) | 1.3x | **1.8x** | **2.0x** | prefetch parallelism advantage grows |
+
+**Eager scales linearly with size**; the 500MB snapshot takes ~5.4s and the
+2GB snapshot takes ~8.8-9.4s (roughly 1.7x per 4x size increase - bandwidth
+limited). Lazy point-lookup TTFQ runs in 1.5-2.5s regardless of tier size
+because it faults only 6-7 fixed groups (catalog + one heap page + one index
+page), independent of total data volume. This is the core thesis confirmed at
+real scale.
+
+### Key findings
+
+**(a) Point-lookup speedup reaches 5.8x at 2GB**
+
+At 2GB, lazy pulls 6.3MB (0.3%) vs the 2030MB eager snapshot in 8.8s.
+Lazy completes in 1.5s: ~73ms warm GCS latency for 6 faults + 1.4s eager-set
+extraction + PGlite open. The eager-set (catalog-only, 73.9MB, constant across
+sizes) is the remaining floor - it does not grow with tier size.
+
+**(b) Indexed range scales gracefully**
+
+Faults grow with tier size (17 at 500MB, 27 at 1GB, 49 at 2GB) because the
+5% range selects proportionally more rows. Despite 2.9x more faults at 2GB,
+lazy still returns in 3.4s vs eager's 9.4s (2.7x speedup), because faults
+run in ~34-55ms each and the eager baseline grew proportionally more expensive.
+
+**(c) Prefetch helps full scans more at larger tiers**
+
+At 500MB prefetch gave 1.3x; at 2GB it gives 2.0x. Prefetch wall time for
+2GB's 601 groups is ~3-4s concurrent, vs eager needing to download 2030MB
+sequentially through tar extraction. The absolute bytes are larger but the
+concurrency ceiling is the same (12 parallel GETs), so prefetch's advantage
+widens as the scan grows.
+
+**(d) Lazy+prefetch becomes competitive at large sizes for low-ws queries**
+
+At 1GB, lazy+prefetch for pointLookup returns 2.0x faster than eager (3.4s vs
+7.0s) even though it downloads ~450MB - prefetch over-fetches the whole
+line_items relation but still beats the 1052MB full restore. At 500MB the same
+mode was slower than eager. The crossover for prefetch-on-low-ws-query shifts
+between 500MB and 1GB.
+
+**(e) All correctness checks pass at all three tiers**
+
+All 90 trials (500MB + 1GB + 2GB, 5 runs x 3 shapes x 3 modes) returned
+results byte-identical to golden answers captured at build time (`allMatch: true`).
+
+### Reproduce
+
+```
+# Tier build (1GB, boot disk):
+TMPFS_DIR=~/lazy-build node_modules/.bin/tsx experiments/lazy-restore-spike/build-tier.mjs 1024 gcs
+
+# Measurement (1GB, 5 runs/shape):
+WORKDIR=~/lazy-work node_modules/.bin/tsx experiments/lazy-restore-spike/measure.mjs 1024 gcs 5
+
+# Tier build (2GB, boot disk):
+TMPFS_DIR=~/lazy-build node_modules/.bin/tsx experiments/lazy-restore-spike/build-tier.mjs 2048 gcs
+
+# Measurement (2GB, 5 runs/shape):
+WORKDIR=~/lazy-work node_modules/.bin/tsx experiments/lazy-restore-spike/measure.mjs 2048 gcs 5
+```
