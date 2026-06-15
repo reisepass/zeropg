@@ -3,7 +3,7 @@ import { createRequire } from 'module'; const require = createRequire(import.met
 // experiments/standalone-service/server.ts
 import { readFileSync as readFileSync2, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join as join4 } from "node:path";
+import { dirname, join as join5 } from "node:path";
 
 // packages/blobstore/src/types.ts
 var PreconditionFailedError = class extends Error {
@@ -742,7 +742,7 @@ async function r2Error(res, op, key) {
 import { createServer } from "node:http";
 
 // packages/objectstore-fs/src/zeropg.ts
-import { PGlite } from "@electric-sql/pglite";
+import { PGlite as PGlite2 } from "@electric-sql/pglite";
 
 // packages/lease/src/index.ts
 var LockedError = class extends Error {
@@ -879,6 +879,38 @@ var Lease = class {
       }
     }
     throw new Error(`failed to acquire lease after ${this.maxRetries} takeover attempts (contention)`);
+  }
+  /**
+   * Bump our held token to strictly above `minToken` if it isn't already.
+   * Called right after acquiring when the caller re-reads the manifest and finds
+   * the manifest's fencingToken >= our issued token (which happens on the
+   * clean-release path: the previous holder released, we created a fresh lease
+   * with floor+1, but the manifest still carries the previous holder's last
+   * commit token — same value). CASes our own lease object in-place so that any
+   * concurrent reader of the lease sees the update atomically; throws FencedError
+   * if we were already taken over between acquire() and this call.
+   */
+  async upgradeToken(minToken) {
+    if (!this.body || !this.etag) throw new Error("lease not held; call acquire first");
+    if (this.body.fencingToken > minToken) return;
+    const newToken = minToken + 1;
+    const body = this.makeBody(newToken);
+    try {
+      const { etag } = await this.store.put(this.key, this.encode(body), {
+        ifMatch: this.etag,
+        contentType: "application/json"
+      });
+      this.etag = etag;
+      this.body = body;
+    } catch (e) {
+      if (e instanceof PreconditionFailedError) {
+        const token = this.body.fencingToken;
+        this.body = null;
+        this.etag = null;
+        throw new FencedError(token, "upgradeToken CAS failed: taken over before upgrade");
+      }
+      throw e;
+    }
   }
   /**
    * Renew (heartbeat) the lease, extending expiry. CAS on our own version; if
@@ -1141,6 +1173,9 @@ async function largestFile(rootDir) {
   return best;
 }
 
+// packages/objectstore-fs/src/archive.ts
+import { PGlite } from "@electric-sql/pglite";
+
 // packages/objectstore-fs/src/restore.ts
 import { createGunzip, crc32 } from "node:zlib";
 import { Readable as Readable2 } from "node:stream";
@@ -1231,14 +1266,369 @@ async function applyWalSegments(store, dir, m) {
   }
 }
 
-// packages/objectstore-fs/src/zeropg.ts
-import { createGunzip as createGunzip2, createGzip, gzipSync, crc32 as crc322 } from "node:zlib";
+// packages/objectstore-fs/src/archive.ts
+import { createGzip, gzipSync } from "node:zlib";
 import { Readable as Readable3 } from "node:stream";
 import * as nodeStream2 from "node:stream";
-import { mkdir as mkdir2, rm, open as open2 } from "node:fs/promises";
+import { mkdtemp, mkdir as mkdir2, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join as join3 } from "node:path";
 var compose4 = nodeStream2.compose;
+var INDEX_KEY = "backups/index.json";
+function encodeBackupIndex(idx) {
+  return new TextEncoder().encode(JSON.stringify(idx, null, 2));
+}
+function decodeBackupIndex(bytes) {
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+function backupKey(commitSeq, committedAt, codec) {
+  const seq = String(commitSeq).padStart(20, "0");
+  const stamp = committedAt.replace(/\.\d+Z$/, "Z").replace(/:/g, "-");
+  return `backups/${seq}-${stamp}.tar${codec === "gzip" ? ".gz" : ""}`;
+}
+var DAY_MS = 864e5;
+function utcDayKey(d) {
+  return d.toISOString().slice(0, 10);
+}
+function utcMonthKey(d) {
+  return d.toISOString().slice(0, 7);
+}
+function isoWeekKey(d) {
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dayNum = (t.getUTCDay() + 6) % 7;
+  t.setUTCDate(t.getUTCDate() - dayNum + 3);
+  const firstThursday = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
+  const firstDayNum = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - firstDayNum + 3);
+  const week = 1 + Math.round((t.getTime() - firstThursday.getTime()) / (7 * DAY_MS));
+  return `${t.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+function gfsKeep(sorted, gfs) {
+  const keep = /* @__PURE__ */ new Set();
+  const pick = (keyOf, limit) => {
+    if (!limit || limit <= 0) return;
+    const newestPerBucket = /* @__PURE__ */ new Map();
+    for (const b of sorted) newestPerBucket.set(keyOf(new Date(b.committedAt)), b);
+    const bucketKeys = [...newestPerBucket.keys()].sort();
+    for (const bk of bucketKeys.slice(-limit)) keep.add(newestPerBucket.get(bk).key);
+  };
+  pick(utcDayKey, gfs.daily);
+  pick(isoWeekKey, gfs.weekly);
+  pick(utcMonthKey, gfs.monthly);
+  return keep;
+}
+function retain(backups, policy, nowMs) {
+  if (backups.length === 0) return [];
+  const sorted = [...backups].sort(
+    (a, b) => Date.parse(a.committedAt) - Date.parse(b.committedAt) || a.commitSeq - b.commitSeq
+  );
+  const keep = /* @__PURE__ */ new Set();
+  keep.add(sorted[sorted.length - 1].key);
+  if (policy.keepLast && policy.keepLast > 0) {
+    for (const b of sorted.slice(-policy.keepLast)) keep.add(b.key);
+  }
+  if (policy.maxAgeDays && policy.maxAgeDays > 0) {
+    const cutoff = nowMs - policy.maxAgeDays * DAY_MS;
+    for (const b of sorted) if (Date.parse(b.committedAt) >= cutoff) keep.add(b.key);
+  }
+  if (policy.gfs) {
+    for (const k of gfsKeep(sorted, policy.gfs)) keep.add(k);
+  }
+  return sorted.filter((b) => keep.has(b.key));
+}
+var ColdArchiver = class {
+  primary;
+  secondary;
+  scratchBase;
+  now;
+  log;
+  constructor(primary, secondary, opts = {}) {
+    this.primary = primary;
+    this.secondary = secondary;
+    this.scratchBase = opts.scratchDir ?? tmpdir();
+    this.now = opts.now ?? Date.now;
+    this.log = opts.log ?? ((e) => console.log(JSON.stringify(e)));
+  }
+  /**
+   * Take one self-contained backup of the primary's current committed point
+   * and append it to the cold-store index. Returns the new entry, or null when
+   * there is nothing to back up (empty/migrated primary) — a logged no-op,
+   * never an error (cf. gc.ts returning empty on no manifest).
+   *
+   * Algorithm (design doc "out-of-process archiver"):
+   *   1. GET the current manifest from the PRIMARY (pins the committed point).
+   *   2. Restore it into a temp datadir (restoreSnapshotInto + applyWalSegments,
+   *      the exact existing restore path).
+   *   3. CHECKPOINT and re-tar a clean, WAL-folded full snapshot.
+   *   4. putStream to the SECONDARY at an immutable backups/<seq>-<at> key
+   *      (ifNoneMatch: backup keys are never reused).
+   *   5. Append to the CAS'd backup index.
+   */
+  async backupOnce() {
+    const cur = await this.primary.get(MANIFEST_KEY);
+    if (!cur) {
+      this.log({ event: "zeropg-backup-skip", reason: "no manifest at primary (empty bucket)" });
+      return null;
+    }
+    const m = decodeManifest(cur.bytes);
+    if (m.movedTo) {
+      this.log({ event: "zeropg-backup-skip", reason: "primary migrated out", movedTo: m.movedTo });
+      return null;
+    }
+    const dir = await mkdtemp(join3(this.scratchBase, "zpg-backup-"));
+    try {
+      await restoreSnapshotInto(this.primary, dir, m.snapshot);
+      await applyWalSegments(this.primary, dir, m);
+      const pg = await PGlite.create({ dataDir: dir });
+      await pg.waitReady;
+      try {
+        await pg.exec("CHECKPOINT");
+        await pg.exec("CHECKPOINT");
+      } catch {
+      }
+      await pg.syncToFs().catch(() => {
+      });
+      await pg.close();
+      const codec = await this.chooseCodec(dir);
+      const key = backupKey(m.commitSeq, m.committedAt, codec);
+      let sizeBytes = 0;
+      const tar = Readable3.from(createTarStream(dir));
+      const body = codec === "gzip" ? compose4(tar, createGzip({ level: 1 })) : tar;
+      const counted = async function* () {
+        for await (const chunk of body) {
+          sizeBytes += chunk.length;
+          yield chunk;
+        }
+      };
+      try {
+        await this.secondary.putStream(key, counted(), {
+          ifNoneMatch: true,
+          contentType: codec === "gzip" ? "application/gzip" : "application/x-tar"
+        });
+      } catch (e) {
+        if (e instanceof PreconditionFailedError) {
+          this.log({ event: "zeropg-backup-exists", key, commitSeq: m.commitSeq });
+          return this.adoptExisting(key, m, codec);
+        }
+        throw e;
+      }
+      const entry = {
+        key,
+        commitSeq: m.commitSeq,
+        committedAt: m.committedAt,
+        createdAt: new Date(this.now()).toISOString(),
+        sizeBytes,
+        codec,
+        sourceGeneration: m.generation,
+        fencingToken: m.fencingToken
+      };
+      await this.appendToIndex(entry);
+      this.log({
+        event: "zeropg-backup-ok",
+        key,
+        commitSeq: entry.commitSeq,
+        sizeBytes: entry.sizeBytes,
+        codec: entry.codec
+      });
+      return entry;
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => {
+      });
+    }
+  }
+  /** Append an entry to the CAS'd backup index, retrying on a lost race exactly
+   * as the manifest commit does. Idempotent: an entry whose key already exists
+   * is left as-is (a re-run that adopted a pre-existing snapshot object). */
+  async appendToIndex(entry) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const cur = await this.secondary.get(INDEX_KEY);
+      if (!cur) {
+        const idx2 = { version: 1, backups: [entry] };
+        try {
+          await this.secondary.put(INDEX_KEY, encodeBackupIndex(idx2), {
+            ifNoneMatch: true,
+            contentType: "application/json"
+          });
+          return;
+        } catch (e) {
+          if (e instanceof PreconditionFailedError) continue;
+          throw e;
+        }
+      }
+      const idx = decodeBackupIndex(cur.bytes);
+      if (idx.backups.some((b) => b.key === entry.key)) return;
+      idx.backups.push(entry);
+      idx.backups.sort((a, b) => a.commitSeq - b.commitSeq);
+      try {
+        await this.secondary.put(INDEX_KEY, encodeBackupIndex(idx), {
+          ifMatch: cur.etag,
+          contentType: "application/json"
+        });
+        return;
+      } catch (e) {
+        if (e instanceof PreconditionFailedError) continue;
+        throw e;
+      }
+    }
+    throw new Error("backup index CAS failed after repeated races");
+  }
+  /**
+   * A snapshot object already existed at `key`. Two cases:
+   *   1. A previous run fully recorded it — its entry is in the index; return it
+   *      (the idempotent re-run path).
+   *   2. A previous run wrote the object but CRASHED before the index append —
+   *      the object is an orphan the index never names. The object IS a complete,
+   *      immutable snapshot of THIS committed point (same key => same commitSeq),
+   *      so we can finish what the dead run started: reconstruct the entry from
+   *      the manifest we are holding + the object's real stored size, and append
+   *      it. This is what makes "crash mid-backup, next backup succeeds" hold —
+   *      without it the orphan is un-adoptable and the backup is lost forever.
+   */
+  async adoptExisting(key, m, codec) {
+    const cur = await this.secondary.get(INDEX_KEY);
+    if (cur) {
+      const existing = decodeBackupIndex(cur.bytes).backups.find((b) => b.key === key);
+      if (existing) return existing;
+    }
+    const head = await this.secondary.head(key);
+    if (!head) return null;
+    const entry = {
+      key,
+      commitSeq: m.commitSeq,
+      committedAt: m.committedAt,
+      createdAt: new Date(this.now()).toISOString(),
+      sizeBytes: head.size,
+      codec,
+      sourceGeneration: m.generation,
+      fencingToken: m.fencingToken
+    };
+    await this.appendToIndex(entry);
+    this.log({ event: "zeropg-backup-adopted-orphan", key, commitSeq: m.commitSeq, sizeBytes: head.size });
+    return entry;
+  }
+  /**
+   * Restore a backup from the cold store into a datadir. Picks the entry by
+   * `commitSeq` if given, else the newest. A backup is already a clean,
+   * WAL-folded snapshot, so this is the snapshot half of the restore path with
+   * NO WAL overlay (restoreSnapshotInto handles the .tar / .tar.gz codecs).
+   *
+   * Returns the chosen entry + the datadir it was materialized into; the caller
+   * boots a ZeroPG/PGlite on it directly, or seeds a fresh primary bucket from
+   * it for disaster recovery into a new home.
+   */
+  async restoreFromBackup(seq, into) {
+    const cur = await this.secondary.get(INDEX_KEY);
+    if (!cur) throw new Error("no backup index at secondary (nothing to restore)");
+    const idx = decodeBackupIndex(cur.bytes);
+    if (idx.backups.length === 0) throw new Error("backup index is empty");
+    const entry = seq === void 0 ? idx.backups[idx.backups.length - 1] : idx.backups.find((b) => b.commitSeq === seq);
+    if (!entry) throw new Error(`no backup with commitSeq ${seq}`);
+    const dir = into ?? await mkdtemp(join3(this.scratchBase, "zpg-restore-"));
+    await mkdir2(dir, { recursive: true, mode: 448 });
+    const bytes = await restoreSnapshotInto(this.secondary, dir, entry.key);
+    this.log({ event: "zeropg-restore-ok", key: entry.key, commitSeq: entry.commitSeq, dir, bytes });
+    return { entry, dir, bytes };
+  }
+  /**
+   * Apply a retention policy to the cold store: compute the keep-set with the
+   * pure `retain`, delete everything outside it from the secondary, and rewrite
+   * the index — mirroring gc.ts's keep-set-first discipline (never delete
+   * outside the computed set).
+   *
+   * Cold-tier guard: when respectMinStorageDuration is set (default) and the
+   * destination's CostModel declares a minStorageDurationDays, an object younger
+   * than that minimum is NOT deleted (deleting early still pays the floored
+   * price — the opposite of the savings the cold tier is for); it is reported as
+   * `blocked` and survives in the index. A policy that would routinely churn
+   * under the minimum (e.g. maxAgeDays below it) is warned about.
+   */
+  async applyRetention(policy, opts = {}) {
+    const cur = await this.secondary.get(INDEX_KEY);
+    if (!cur) {
+      this.log({ event: "zeropg-retention-skip", reason: "no backup index" });
+      return { kept: [], deleted: [], blocked: [], bytesFreed: 0 };
+    }
+    const dryRun = opts.dryRun ?? false;
+    const idx = decodeBackupIndex(cur.bytes);
+    const nowMs = this.now();
+    const keepKeys = new Set(retain(idx.backups, policy, nowMs).map((b) => b.key));
+    const minDays = this.secondary.cost?.minStorageDurationDays;
+    const respectMin = policy.respectMinStorageDuration ?? true;
+    if (respectMin && minDays && policy.maxAgeDays && policy.maxAgeDays < minDays) {
+      this.log({
+        event: "zeropg-retention-warn",
+        reason: `maxAgeDays ${policy.maxAgeDays} on a tier with a ${minDays}-day minimum storage duration will incur early-deletion fees on every backup; raise maxAgeDays >= ${minDays} or use a Standard/IA-class bucket`
+      });
+    }
+    const deleted = [];
+    const blocked = [];
+    let bytesFreed = 0;
+    for (const b of idx.backups) {
+      if (keepKeys.has(b.key)) continue;
+      if (respectMin && minDays) {
+        const ageDays = (nowMs - Date.parse(b.createdAt)) / DAY_MS;
+        if (ageDays < minDays) {
+          blocked.push(b);
+          this.log({ event: "zeropg-retention-blocked", key: b.key, ageDays: Math.floor(ageDays), minDays });
+          continue;
+        }
+      }
+      if (!dryRun) await this.secondary.delete(b.key);
+      deleted.push(b);
+      bytesFreed += b.sizeBytes;
+    }
+    const deletedKeys = new Set(deleted.map((b) => b.key));
+    const kept = idx.backups.filter((b) => !deletedKeys.has(b.key));
+    if (!dryRun && deleted.length > 0) {
+      const newIdx = { version: 1, backups: kept };
+      await this.secondary.put(INDEX_KEY, encodeBackupIndex(newIdx), {
+        ifMatch: cur.etag,
+        contentType: "application/json"
+      });
+    }
+    this.log({
+      event: "zeropg-retention-ok",
+      dryRun,
+      kept: kept.length,
+      deleted: deleted.length,
+      blocked: blocked.length,
+      bytesFreed
+    });
+    return { kept, deleted, blocked, bytesFreed };
+  }
+  /**
+   * Decide the snapshot codec by test-compressing a slice of the largest heap
+   * file (mirrors ZeroPG.chooseCodec): incompressible data makes gzip pure CPU
+   * waste, so ship raw tar and let the NIC do the work.
+   */
+  async chooseCodec(dir) {
+    try {
+      const big = await largestFile(dir);
+      if (!big || big.size < 1024 * 1024) return "gzip";
+      const { open: open3 } = await import("node:fs/promises");
+      const sample = Buffer.alloc(Math.min(big.size, 4 * 1024 * 1024));
+      const f = await open3(big.path, "r");
+      try {
+        await f.read(sample, 0, sample.length, 0);
+      } finally {
+        await f.close();
+      }
+      const ratio = gzipSync(sample, { level: 1 }).length / sample.length;
+      return ratio > 0.65 ? "none" : "gzip";
+    } catch {
+      return "gzip";
+    }
+  }
+};
+
+// packages/objectstore-fs/src/zeropg.ts
+import { createGunzip as createGunzip2, createGzip as createGzip2, gzipSync as gzipSync2, crc32 as crc322 } from "node:zlib";
+import { Readable as Readable4 } from "node:stream";
+import * as nodeStream3 from "node:stream";
+import { mkdir as mkdir3, rm as rm2, open as open2 } from "node:fs/promises";
+import { tmpdir as tmpdir2 } from "node:os";
+import { join as join4 } from "node:path";
+var compose6 = nodeStream3.compose;
 var SQL_WRITE = /^\s*(insert|update|delete|create|alter|drop|truncate|comment|grant|revoke|with[\s\S]*\b(insert|update|delete)\b|copy)/i;
 var WAL_GUCS = [
   ["max_wal_size", "'64MB'"],
@@ -1269,6 +1659,12 @@ var ZeroPG = class _ZeroPG {
   dataDir;
   fullPageWrites;
   walCompression;
+  // ---- Track D: secondary cold-storage backup ----
+  backup = null;
+  archiver = null;
+  /** In-flight background backup, awaited by close()/flush() so a clean
+   * shutdown never abandons a backup mid-upload. */
+  backupInFlight = null;
   manifest;
   manifestEtag = null;
   generation;
@@ -1304,11 +1700,18 @@ var ZeroPG = class _ZeroPG {
     const capPerSec = opts.store.cost?.maxWritesPerObjectPerSec;
     this.commitIntervalMs = opts.commitIntervalMs ?? (capPerSec ? Math.ceil(1e3 / capPerSec) : 0);
     this.now = opts.now ?? Date.now;
-    this.scratchBase = opts.scratchDir ?? join3(tmpdir(), "zeropg");
+    this.scratchBase = opts.scratchDir ?? join4(tmpdir2(), "zeropg");
     this.fullPageWrites = opts.fullPageWrites ?? !/^(off|false|0)$/i.test(
       process.env.ZEROPG_FULL_PAGE_WRITES ?? ""
     );
     this.walCompression = opts.walCompression ?? process.env.ZEROPG_WAL_COMPRESSION;
+    if (opts.backup) {
+      this.backup = opts.backup;
+      this.archiver = new ColdArchiver(opts.store, opts.backup.store, {
+        scratchDir: opts.backup.scratchDir,
+        now: this.now
+      });
+    }
   }
   commitIntervalMs;
   lastCasAt = 0;
@@ -1353,8 +1756,8 @@ var ZeroPG = class _ZeroPG {
   async boot(opts) {
     const bootStart = performance.now();
     const holder = opts.holder ?? `${process.env.HOSTNAME ?? "host"}:${process.pid}`;
-    this.dataDir = join3(this.scratchBase, `data-${process.pid}-${randomGeneration()}`);
-    await mkdir2(this.dataDir, { recursive: true, mode: 448 });
+    this.dataDir = join4(this.scratchBase, `data-${process.pid}-${randomGeneration()}`);
+    await mkdir3(this.dataDir, { recursive: true, mode: 448 });
     const tMan = performance.now();
     const existing = await this.store.get(MANIFEST_KEY);
     this.bootTimings.manifestGetMs = performance.now() - tMan;
@@ -1388,6 +1791,9 @@ var ZeroPG = class _ZeroPG {
         );
       }
       await this.adoptManifest(m, fresh.etag);
+      if (this.lease?.held && !this.lease.tookOver) {
+        await this.lease.upgradeToken(m.fencingToken);
+      }
       if (this.lease?.held && this.lease.tookOver) {
         await this.fenceStamp();
       }
@@ -1397,11 +1803,11 @@ var ZeroPG = class _ZeroPG {
       const tPg = performance.now();
       if (opts.seedSnapshot) {
         await extractTarStream(
-          compose4(Readable3.from([Buffer.from(opts.seedSnapshot)]), createGunzip2()),
+          compose6(Readable4.from([Buffer.from(opts.seedSnapshot)]), createGunzip2()),
           this.dataDir
         );
       }
-      this.pg = await PGlite.create({ dataDir: this.dataDir });
+      this.pg = await PGlite2.create({ dataDir: this.dataDir });
       await this.pg.waitReady;
       this.bootTimings.pgliteCreateMs = performance.now() - tPg;
       await this.ensureWalConfig();
@@ -1425,8 +1831,8 @@ var ZeroPG = class _ZeroPG {
     this.generation = m.generation;
     if (this.pg) {
       await this.pg.close();
-      await rm(this.dataDir, { recursive: true, force: true });
-      await mkdir2(this.dataDir, { recursive: true, mode: 448 });
+      await rm2(this.dataDir, { recursive: true, force: true });
+      await mkdir3(this.dataDir, { recursive: true, mode: 448 });
     }
     const tRestore = performance.now();
     this.bootTimings.snapshotBytes = await restoreSnapshotInto(this.store, this.dataDir, m.snapshot);
@@ -1441,7 +1847,7 @@ var ZeroPG = class _ZeroPG {
     );
     this.bootTimings.restoreMs = performance.now() - tRestore;
     const tPg = performance.now();
-    this.pg = await PGlite.create({ dataDir: this.dataDir });
+    this.pg = await PGlite2.create({ dataDir: this.dataDir });
     await this.pg.waitReady;
     this.bootTimings.pgliteCreateMs = performance.now() - tPg;
     await this.ensureWalConfig();
@@ -1522,7 +1928,7 @@ var ZeroPG = class _ZeroPG {
     while (pos < end) {
       const offInFile = Number(pos % BigInt(this.walSegBytes));
       const take = Math.min(Number(end - pos), this.walSegBytes - offInFile);
-      const path = join3(this.dataDir, "pg_wal", walFileName(this.walTli, pos, this.walSegBytes));
+      const path = join4(this.dataDir, "pg_wal", walFileName(this.walTli, pos, this.walSegBytes));
       const fh = await open2(path, "r");
       try {
         const { bytesRead } = await fh.read(out, outOff, take, offInFile);
@@ -1577,7 +1983,7 @@ var ZeroPG = class _ZeroPG {
       } finally {
         await f.close();
       }
-      const ratio = gzipSync(sample, { level: 1 }).length / sample.length;
+      const ratio = gzipSync2(sample, { level: 1 }).length / sample.length;
       return ratio > 0.65 ? "none" : "gzip";
     } catch {
       return "gzip";
@@ -1620,7 +2026,7 @@ var ZeroPG = class _ZeroPG {
       const walcMismatch = walcApplied && liveWalc !== this.walCompression;
       if (fpwMismatch || walcMismatch) {
         await this.pg.close();
-        this.pg = await PGlite.create({ dataDir: this.dataDir });
+        this.pg = await PGlite2.create({ dataDir: this.dataDir });
         await this.pg.waitReady;
       }
     } catch {
@@ -1671,8 +2077,8 @@ var ZeroPG = class _ZeroPG {
   async uploadSnapshot(key, codec, dumpMs) {
     const tUp = performance.now();
     let snapshotBytes = 0;
-    const tar = Readable3.from(createTarStream(this.dataDir));
-    const body = codec === "gzip" ? compose4(tar, createGzip({ level: 1 })) : tar;
+    const tar = Readable4.from(createTarStream(this.dataDir));
+    const body = codec === "gzip" ? compose6(tar, createGzip2({ level: 1 })) : tar;
     const counted = async function* () {
       for await (const chunk of body) {
         snapshotBytes += chunk.length;
@@ -1963,6 +2369,7 @@ var ZeroPG = class _ZeroPG {
       void this.store.delete(seg.key).catch(() => {
       });
     }
+    await this.runBackup();
     return {
       commitSeq: nextSeq,
       generation: this.generation,
@@ -1974,6 +2381,42 @@ var ZeroPG = class _ZeroPG {
       uploadMs,
       manifestMs
     };
+  }
+  /**
+   * Track D backup hook. Called after a compaction snapshot is durable in the
+   * primary. No-op when no backup target is configured. The archiver reads the
+   * primary leaselessly (no contention) and writes to the secondary, then
+   * applies retention. A failure here is LOGGED, never fatal: a backup that
+   * could not be taken must not fail an already-committed write.
+   *
+   * Default is background (fire-and-forget) so commit latency stays flat; the
+   * promise is parked in backupInFlight and always awaited by flush()/close().
+   * blocking:true awaits inline (tests that assert the backup right after the
+   * awaited commit).
+   */
+  async runBackup() {
+    if (!this.archiver || !this.backup) return;
+    const archiver = this.archiver;
+    const policy = this.backup.retention;
+    const run = async () => {
+      try {
+        const entry = await archiver.backupOnce();
+        if (entry && policy) await archiver.applyRetention(policy);
+      } catch (e) {
+        console.log(
+          JSON.stringify({
+            event: "zeropg-backup-error",
+            error: e instanceof Error ? e.message : String(e)
+          })
+        );
+      }
+    };
+    if (this.backup.blocking) {
+      await run();
+    } else {
+      const prev = this.backupInFlight ?? Promise.resolve();
+      this.backupInFlight = prev.then(run);
+    }
   }
   /** Conditional manifest swap — the one operation that IS a commit. */
   async casManifest(m, token) {
@@ -2064,6 +2507,8 @@ var ZeroPG = class _ZeroPG {
       if (this.dirty) {
         await (this.commitInFlight ?? this.doCommit());
       }
+      if (this.backupInFlight) await this.backupInFlight.catch(() => {
+      });
     } finally {
       if (this.lease) await this.lease.release().catch(() => {
       });
@@ -2072,14 +2517,21 @@ var ZeroPG = class _ZeroPG {
       });
     }
   }
+  /** Await any in-flight background cold backup (Track D). Tests / graceful
+   * shutdown use this to observe the backup that a non-blocking commit kicked
+   * off. No-op when no backup target is configured. */
+  async drainBackups() {
+    if (this.backupInFlight) await this.backupInFlight.catch(() => {
+    });
+  }
   async cleanupScratch() {
-    if (this.dataDir) await rm(this.dataDir, { recursive: true, force: true });
+    if (this.dataDir) await rm2(this.dataDir, { recursive: true, force: true });
   }
   // ---- Helpers ----
   /** Build a reusable empty-datadir snapshot (gzipped) to seed fresh DBs fast.
    * The WAL GUCs are baked in so databases born from it never bloat. */
   static async buildEmptySnapshot() {
-    const pg = new PGlite();
+    const pg = new PGlite2();
     await pg.waitReady;
     for (const [k, v] of WAL_GUCS) {
       await pg.exec(`ALTER SYSTEM SET ${k} = ${v}`);
@@ -2087,12 +2539,12 @@ var ZeroPG = class _ZeroPG {
     const file = await pg.dumpDataDir("none");
     const raw = new Uint8Array(await file.arrayBuffer());
     await pg.close();
-    return gzipSync(raw, { level: 1 });
+    return gzipSync2(raw, { level: 1 });
   }
 };
 
 // packages/objectstore-fs/src/replica.ts
-import { PGlite as PGlite2 } from "@electric-sql/pglite";
+import { PGlite as PGlite3 } from "@electric-sql/pglite";
 
 // packages/server/src/postgrest.ts
 import { spawn } from "node:child_process";
@@ -2602,7 +3054,7 @@ function selectStore() {
 }
 var DURABILITY = ["strict", "interval", "sleep"].includes(process.env.ZEROPG_DURABILITY ?? "") ? process.env.ZEROPG_DURABILITY : "sleep";
 function loadSeed() {
-  const p = join4(__dirname, "seed.tar.gz");
+  const p = join5(__dirname, "seed.tar.gz");
   return existsSync(p) ? new Uint8Array(readFileSync2(p)) : void 0;
 }
 var server = await ZeroPGServer.start({
