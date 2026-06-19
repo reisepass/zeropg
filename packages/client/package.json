@@ -1,0 +1,41 @@
+{
+  "name": "@zeropg/client",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "description": "The unified zeropg client (Track E): one connect(DATABASE_URL) factory and one node-postgres-shaped interface over four engines (in-process PGlite for memory://, file:// with a cross-process lockfile, bucket-backed scale-to-zero zeropg over HTTP, and a graduated postgres:// passthrough). Only the connection string changes from laptop to bucket to always-on server.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reisepass/zeropg.git",
+    "directory": "packages/client"
+  },
+  "keywords": [
+    "postgres",
+    "pglite",
+    "connection-string",
+    "scale-to-zero",
+    "serverless",
+    "node-postgres"
+  ],
+  "dependencies": {
+    "@zeropg/blobstore": "*",
+    "@zeropg/objectstore-fs": "*",
+    "@zeropg/server": "*"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": "*",
+    "pg": "*"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

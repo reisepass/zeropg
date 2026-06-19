@@ -238,7 +238,21 @@ scale-to-zero prod — through **one package with one interface**, where the onl
 thing that changes from laptop to bucket to always-on server is the connection
 string. This is DESIGN.md §5 made literal. Three core pieces:
 
-### E1. Local lockfile mechanism — prevent file corruption from concurrent processes
+> **Status 2026-06-19 — E1 + E2 (local/remote/postgres) landed in `packages/client`
+> (`@zeropg/client`).** `connect(url?, opts?)` returns a node-postgres-shaped
+> `Client` (`query`/`exec`/`transaction`/`ensureReady`/`end`, `{rows,rowCount,fields}`)
+> over four engines routed by scheme: `memory://` (in-process PGlite), `file://`
+> (PGlite + the E1 cross-process `O_EXCL` lock with dead-PID reclaim / live-holder
+> wait-out + the `globalThis` HMR instance pin), `http(s)://` (the bucket-backed
+> scale-to-zero server over `/sql`, with `ensureReady()` surfacing E3 pre-warm),
+> and `postgres://` (graduated, real `pg` as an optional peer dep). 17/17
+> assertions in `packages/client/test/client.test.ts` (incl. lock reclaim/reject
+> and HMR-reuse, which caught a shared-instance double-close bug). **Remaining:
+> bucket-scheme `gs|r2|s3|cos://` → an embedded ObjectStoreFS instance (today
+> they throw an actionable "use the http(s):// URL" error), the `file://` socket
+> vs in-process default decision, and a CLI `prewarm` verb.**
+
+### E1. Local lockfile mechanism — prevent file corruption from concurrent processes ✅ DONE
 
 PGlite is single-connection/single-process and the NodeFS backend has no
 cross-process guard, so hot-reloading dev servers (Next.js, `tsx watch`,
