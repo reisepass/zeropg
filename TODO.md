@@ -257,9 +257,27 @@ string. This is DESIGN.md §5 made literal. Three core pieces:
 PGlite is single-connection/single-process and the NodeFS backend has no
 cross-process guard, so hot-reloading dev servers (Next.js, `tsx watch`,
 nodemon) routinely overlap an old + new process on one datadir and tear the
-files. **We own this in our client wrapper — no PGlite fork** (DESIGN §7: a fork
-inherits the WASM build burden for zero benefit here). Two layers, both
-fork-free, both in our `connect()` layer around the PGlite open/close:
+files.
+
+> **Reconciliation 2026-06-19:** the canonical, stress-tested version of this
+> lock now lives INSIDE PGlite's NodeFS in the fork `reisepass/pglite-kill-dash-9`
+> (= upstream PR #892), whose stress lab (~210 child procs/run) found three
+> protocol bugs naive lockfile code hits (read-then-rename TOCTOU, empty-lock
+> window, constructor mkdir race) and a `takeover:true` HMR option. zeropg
+> currently consumes a STOCK PGlite (0.5.x ships no dataDir lock), so
+> `@zeropg/client` keeps a wrapper-level lock — but it now MIRRORS that
+> protocol's fixes (reclaim under a `<lock>.claim` mkdir mutex; a `pending`
+> classification for unparseable-but-recent locks) rather than the original
+> naive read-then-unlink. Verified by real multi-process race tests
+> (`packages/client/test/lock-multiprocess.test.ts`: fresh N-way race, stale
+> stampede, reclaim-after-SIGKILL, live-holder rejection — O_EXCL sentinel probe
+> detects any double-grant). The end state is to consume the fork (or upstream
+> once #892 lands) and drop the wrapper lock in favor of PGlite's NodeFS lock +
+> `takeover`. So the original "no PGlite fork" stance below is SUPERSEDED for the
+> lock specifically.
+
+**We own this in our client wrapper** today (mirroring the fork's protocol).
+Two layers, both in our `connect()` layer around the PGlite open/close:
 
 1. **Cross-process**: a sibling `.lock` file created with `O_EXCL` (`'wx'`)
    holding the owner PID; on `EEXIST`, reclaim if the holder PID is dead

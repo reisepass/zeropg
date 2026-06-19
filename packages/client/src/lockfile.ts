@@ -7,15 +7,27 @@
 // file created with O_EXCL ('wx') holding the owner PID. This is the local
 // analog of the remote single-writer lease (DESIGN §7) — `O_EXCL` and
 // `If-None-Match: *` are the same atomic create-if-absent primitive in two
-// media. We replicate upstream PGlite PR #892's `.lock` + takeover externally
-// (no fork) and do not depend on it landing.
+// media.
 //
-// Reclaim semantics mirror the lease's stale-holder takeover: if the recorded
-// PID is dead (process.kill(pid, 0) -> ESRCH), the lock is stale and we take it
-// over; if it is alive, we wait it out up to acquireTimeoutMs (the same boot-wait
-// the Cloud Run revision-switch double-instance window already uses).
+// The canonical, battle-tested version of this protocol lives INSIDE PGlite's
+// NodeFS in the fork at reisepass/pglite-kill-dash-9 (upstream PR #892), whose
+// stress lab found three protocol bugs that naive lockfile code hits. This
+// module is the wrapper-level guard for as long as zeropg consumes a stock
+// PGlite (0.5.x ships no dataDir lock); it deliberately mirrors that protocol's
+// two non-obvious fixes:
+//
+//   1. RECLAIM UNDER A CLAIM MUTEX, not read-then-unlink. Two processes that both
+//      observe the same dead-holder record and each unlink+recreate can deadlock
+//      into two owners (the loser unlinks the winner's FRESH lock). Reclaim is
+//      serialized by an exclusive `mkdir(<lock>.claim)`; only the mutex holder
+//      removes the stale lock, after re-validating it under the mutex.
+//   2. A 'pending' CLASSIFICATION for an unparseable-but-recent lock. `wx` open
+//      and the token write are two steps; a reader in between sees an empty file.
+//      Treating "empty/garbage" as stale would steal a lock that is being born.
+//      Recent-and-unparseable => pending (wait); old-and-unparseable => corrupt
+//      (reclaimable).
 
-import { open, readFile, unlink, mkdir } from 'node:fs/promises'
+import { open, readFile, unlink, mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { hostname } from 'node:os'
 
@@ -36,7 +48,7 @@ interface LockRecord {
 export interface AcquireOptions {
   /** How long to wait out a live holder before giving up. Default 10s. */
   acquireTimeoutMs?: number
-  /** Poll cadence while waiting out a live holder. Default 100ms. */
+  /** Poll cadence while waiting out a live holder / a pending writer. Default 50ms. */
   pollIntervalMs?: number
   /** Injectable clock (tests). */
   now?: () => number
@@ -46,14 +58,18 @@ export interface AcquireOptions {
 
 /** Thrown when a live holder did not release within acquireTimeoutMs. */
 export class LockTimeoutError extends Error {
-  constructor(path: string, holder: LockRecord, waitedMs: number) {
-    super(
-      `datadir lock ${path} held by live pid ${holder.pid} on ${holder.host} ` +
-        `(since ${holder.acquiredAt}); waited ${waitedMs}ms`,
-    )
+  constructor(path: string, detail: string, waitedMs: number) {
+    super(`datadir lock ${path}: ${detail}; waited ${waitedMs}ms`)
     this.name = 'LockTimeoutError'
   }
 }
+
+// An unparseable lock younger than this is a writer mid-birth (between its `wx`
+// open and its token write), not a corpse — wait for it, never steal it.
+const PENDING_MS = 10_000
+// A claim mutex (`<lock>.claim` dir) older than this belongs to a crashed
+// claimer; the next reclaimer may remove it and proceed.
+const CLAIM_STALE_MS = 5_000
 
 const sameHost = (rec: LockRecord): boolean => rec.host === hostname()
 
@@ -71,15 +87,80 @@ function defaultIsAlive(rec: LockRecord): boolean {
   }
 }
 
-async function readHolder(path: string): Promise<LockRecord | null> {
+type Inspection =
+  | { state: 'gone' } // the lock vanished (released) — try to create it
+  | { state: 'pending' } // unparseable but recent — a writer mid-birth; wait
+  | { state: 'live'; rec: LockRecord } // a living holder — wait it out
+  | { state: 'reclaimable'; rec: LockRecord | null } // dead holder or old corrupt — reclaim
+
+async function inspect(
+  path: string,
+  now: () => number,
+  isAlive: (rec: LockRecord) => boolean,
+): Promise<Inspection> {
+  let raw: string
   try {
-    const raw = await readFile(path, 'utf8')
-    const rec = JSON.parse(raw) as LockRecord
-    if (typeof rec.pid === 'number' && typeof rec.host === 'string') return rec
-    return null // unparseable contents — treat as a stale/corrupt lock
+    raw = await readFile(path, 'utf8')
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { state: 'gone' }
     throw e
+  }
+  let rec: LockRecord | null = null
+  try {
+    const parsed = JSON.parse(raw) as LockRecord
+    if (typeof parsed.pid === 'number' && typeof parsed.host === 'string') rec = parsed
+  } catch {
+    /* unparseable — fall through to the age check below */
+  }
+  if (rec) return isAlive(rec) ? { state: 'live', rec } : { state: 'reclaimable', rec }
+
+  // Unparseable (empty mid-write, or garbage). Age decides pending vs corrupt.
+  let mtimeMs: number
+  try {
+    mtimeMs = (await stat(path)).mtimeMs
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { state: 'gone' }
+    throw e
+  }
+  if (now() - mtimeMs < PENDING_MS) return { state: 'pending' }
+  return { state: 'reclaimable', rec: null }
+}
+
+/** Remove a stale lock under an exclusive claim mutex so two reclaimers can
+ * never both delete and recreate (the read-then-rename TOCTOU). Returns true if
+ * THIS caller cleared the lock; false if it should just retry (someone else is
+ * claiming, or the lock changed under us). */
+async function tryReclaim(
+  lockPath: string,
+  now: () => number,
+  isAlive: (rec: LockRecord) => boolean,
+): Promise<boolean> {
+  const claimPath = `${lockPath}.claim`
+  try {
+    await mkdir(claimPath) // atomic-exclusive: fails EEXIST if another claimer holds it
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+    // Someone is claiming. If their mutex is stale (crashed mid-claim), clear it.
+    try {
+      const age = now() - (await stat(claimPath)).mtimeMs
+      if (age > CLAIM_STALE_MS) await rmdir(claimPath).catch(() => {})
+    } catch {
+      /* claim dir vanished — fine, retry */
+    }
+    return false
+  }
+  try {
+    // Re-validate UNDER the mutex: the lock may have been recreated by a live
+    // owner between our inspect() and acquiring the claim. Only remove it if it
+    // is still genuinely reclaimable.
+    const again = await inspect(lockPath, now, isAlive)
+    if (again.state === 'reclaimable') {
+      await unlink(lockPath).catch(() => {})
+      return true
+    }
+    return false
+  } finally {
+    await rmdir(claimPath).catch(() => {})
   }
 }
 
@@ -92,24 +173,25 @@ export async function acquireDatadirLock(
 ): Promise<DatadirLock> {
   const lockPath = `${dataDir.replace(/[/\\]+$/, '')}.lock`
   const timeoutMs = opts.acquireTimeoutMs ?? 10_000
-  const pollMs = opts.pollIntervalMs ?? 100
+  const pollMs = opts.pollIntervalMs ?? 50
   const now = opts.now ?? (() => Date.now())
   const isAlive = opts.isAlive ?? defaultIsAlive
 
   await mkdir(dirname(lockPath), { recursive: true })
 
-  const record: LockRecord = {
+  const token = JSON.stringify({
     pid: process.pid,
     host: hostname(),
     acquiredAt: new Date(now()).toISOString(),
-  }
+  } satisfies LockRecord)
 
   const deadline = now() + timeoutMs
+  let lastLive: LockRecord | null = null
   for (;;) {
     try {
       const fh = await open(lockPath, 'wx')
       try {
-        await fh.writeFile(JSON.stringify(record))
+        await fh.writeFile(token)
       } finally {
         await fh.close()
       }
@@ -118,21 +200,26 @@ export async function acquireDatadirLock(
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
     }
 
-    // The lock exists. Inspect the holder.
-    const holder = await readHolder(lockPath)
-    if (holder === null) {
-      // Vanished between create and read (released), or corrupt — retry create.
-      continue
+    const seen = await inspect(lockPath, now, isAlive)
+    switch (seen.state) {
+      case 'gone':
+        continue // released between our create and inspect — retry immediately
+      case 'reclaimable':
+        await tryReclaim(lockPath, now, isAlive)
+        continue // whether or not we won the claim, retry the create
+      case 'live':
+        lastLive = seen.rec
+        break
+      case 'pending':
+        break // a writer is mid-birth — just wait and retry
     }
-    if (!isAlive(holder)) {
-      // Stale: holder is dead. Take it over. unlink then re-race the create;
-      // a concurrent reclaimer that wins the create just sends us back to the
-      // "lock exists, holder now live" branch, which waits correctly.
-      await unlink(lockPath).catch(() => {})
-      continue
+
+    if (now() >= deadline) {
+      const detail = lastLive
+        ? `held by live pid ${lastLive.pid} on ${lastLive.host} (since ${lastLive.acquiredAt})`
+        : 'a writer is still initializing it'
+      throw new LockTimeoutError(lockPath, detail, timeoutMs)
     }
-    // Live holder — wait it out (the hot-reload overlap / revision-switch window).
-    if (now() >= deadline) throw new LockTimeoutError(lockPath, holder, timeoutMs)
     await sleep(pollMs)
   }
 }
@@ -144,11 +231,14 @@ function makeLock(path: string): DatadirLock {
     async release() {
       if (released) return
       released = true
-      // Only unlink if we still own it (defensive: a reclaimer may have stolen a
-      // lock we thought was ours if our process stalled past the holder's view of
-      // liveness). Best-effort; a stray lock is reclaimed by the next acquirer.
-      const holder = await readHolder(path)
-      if (holder && holder.pid === process.pid && holder.host === hostname()) {
+      // Only unlink if we still own it — a reclaimer may have taken a lock we
+      // believed was ours if our process stalled past the holder's liveness view.
+      const seen = await inspect(path, () => Date.now(), defaultIsAlive)
+      if (
+        seen.state === 'live' &&
+        seen.rec.pid === process.pid &&
+        seen.rec.host === hostname()
+      ) {
         await unlink(path).catch(() => {})
       }
     },
