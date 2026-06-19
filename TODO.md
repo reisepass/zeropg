@@ -230,6 +230,82 @@ false` per-query opt-out. Doesn't touch the durability model — pure latency.
 
 ---
 
+## Track E — unified client / DX package (the "default Postgres everywhere" story)
+
+The product thesis (see chat + future `docs/DX.md`/`docs/POSITIONING.md`): zeropg
+should be someone's *default* way to use Postgres — in local dev AND in
+scale-to-zero prod — through **one package with one interface**, where the only
+thing that changes from laptop to bucket to always-on server is the connection
+string. This is DESIGN.md §5 made literal. Three core pieces:
+
+### E1. Local lockfile mechanism — prevent file corruption from concurrent processes
+
+PGlite is single-connection/single-process and the NodeFS backend has no
+cross-process guard, so hot-reloading dev servers (Next.js, `tsx watch`,
+nodemon) routinely overlap an old + new process on one datadir and tear the
+files. **We own this in our client wrapper — no PGlite fork** (DESIGN §7: a fork
+inherits the WASM build burden for zero benefit here). Two layers, both
+fork-free, both in our `connect()` layer around the PGlite open/close:
+
+1. **Cross-process**: a sibling `.lock` file created with `O_EXCL` (`'wx'`)
+   holding the owner PID; on `EEXIST`, reclaim if the holder PID is dead
+   (`process.kill(pid,0)`), else wait out the live holder (reuse the existing
+   `acquireTimeoutMs` boot-wait — the hot-reload overlap is the *same* problem
+   as the Cloud Run revision-switch double-instance window we already solved).
+   This mirrors upstream PGlite PR #892
+   (https://github.com/electric-sql/pglite/pull/892, NodeFS `.lock` +
+   `takeover`, currently unmerged) — replicate it externally; cheer the PR along
+   as defense-in-depth but do not depend on it landing.
+2. **Same-process HMR**: a PID lockfile can't distinguish two PGlite instances
+   in the *same* process (Next.js module reload keeps the process alive). Pin
+   the instance to `globalThis` keyed by datadir (the Prisma-client-in-Next-dev
+   pattern) so a reload reuses the one instance instead of opening a second.
+
+Note this is the *local* analog of the remote single-writer protection, which
+is already built and stronger: the bucket lease + fencing tokens (E4 P4 fenced a
+live rival service). `O_EXCL` and `If-None-Match: *` are the same atomic
+primitive in two media (STORAGE-BACKENDS.md lists both). For remote we do NOT
+trust the platform's `max-instances=1` — the lease is the protection and it
+already passed the rival-service test.
+
+### E2. Single env-var connection-string switch — `connect(DATABASE_URL)`
+
+One factory, one node-postgres-shaped interface (`query`/`transaction`/`end`,
+`{rows,rowCount,fields}`), four engines behind it, **zero app code change** across
+the ladder. **Bundle `pg`** as a dependency so `postgres://` works with no extra
+install.
+
+| `DATABASE_URL` | engine | driver app sees |
+|---|---|---|
+| `memory://` | embedded PGlite in-process | pg-shaped adapter |
+| `file://./dev.db` | PGlite (local lockfile from E1; optionally behind a managed localhost `pglite-socket` server for true multi-process + real-wire parity) | adapter or real `pg` |
+| `gs://` / `r2://` / `s3://` / `cos://` | bucket-backed zeropg, scale-to-zero | adapter over the server's HTTP `/sql` |
+| `postgres://…` | graduated RDS / Cloud SQL / Neon | real `pg` |
+
+Decide the `file://` default: in-process embed (fast, lockfile-protected) vs
+auto-managed `pglite-socket` server (kills multi-process corruption by
+construction + gives byte-identical `pg`-over-wire parity with prod). Likely:
+`memory://` in-process, `file://` defaults to the socket server, lockfile as the
+opt-out path's guard. Builds on `packages/server` (`ZeroPGRemoteClient`, the
+standalone server's loopback 5432 + `/sql`).
+
+### E3. Pre-warm / wake — ALREADY BUILT; expose it through the unified client
+
+`packages/server` already has both halves: the server serves `/wake` (the HTTP
+request itself wakes the instance), `/ready` (restore progress), `/healthz`/`/up`;
+`ZeroPGRemoteClient` (`packages/server/src/remote-client.ts`) has `wake()`,
+`waitReady()`, and `ensureReady()` (wake + poll-until-restored in one call).
+Remaining work: surface `ensureReady()` through the E2 unified client (so a
+remote `connect()` can pre-warm before first query), and add a CLI `prewarm`
+command (and document the `/wake` ping for an external scheduler/keepalive).
+
+> See also: the OSS local **studio** (`npx @zeropg/studio`) — registry +
+> connection-string vault + free-tier usage gauge (derived from a bucket LIST,
+> not billing APIs) + SQL console — to be specced in `docs/STUDIO.md`. Separate
+> from this package but the same "client-side, we host nothing" philosophy.
+
+---
+
 ## Housekeeping
 
 - Remove tracked scratch files `_debug-v1.mjs`, `_debug-v2.mjs` from the repo
