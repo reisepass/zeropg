@@ -19,7 +19,13 @@ export interface OpenedDb {
  * schema up to date before returning. The app never calls connect() directly. */
 export async function openDb(url?: string): Promise<OpenedDb> {
   const target = url ?? process.env.DATABASE_URL ?? 'file://./data/taskboard.db'
-  const db = await connect(target)
+  // ZEROPG_ACQUIRE_TIMEOUT_MS lets a hot-reloading dev server wait out the
+  // previous process's file:// lock (the overlap window); a low value makes a
+  // genuinely-contended second process fail fast instead of hanging.
+  const acquireTimeoutMs = process.env.ZEROPG_ACQUIRE_TIMEOUT_MS
+    ? Number(process.env.ZEROPG_ACQUIRE_TIMEOUT_MS)
+    : undefined
+  const db = await connect(target, { acquireTimeoutMs })
   // Remote scale-to-zero instances apply their own migrations at their boot, so
   // an external HTTP client must not also push DDL (single-applier invariant).
   const appliedMigrations = db.engine === 'remote' ? [] : await migrate(db)

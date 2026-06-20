@@ -44,6 +44,13 @@ npx tsx examples/taskboard/test/api-parity.test.ts
 # 2. End-to-end UI in headless chromium: add -> toggle -> detail route -> save
 #    notes -> reload-persisted -> delete. (needs: npx playwright install chromium)
 npx tsx examples/taskboard/test/e2e.test.ts
+
+# 3. Concurrent-process safety: boots the app as separate OS processes on ONE
+#    file:// datadir. A 2nd process is locked out (not corrupting) while the 1st
+#    serves; after a SIGKILL, a successor reclaims the dead lock and recovers
+#    every durable write. This is the hot-reload-overlap hazard the E1 lock exists
+#    for, exercised through the real app.
+npx tsx examples/taskboard/test/concurrent-process.test.ts
 ```
 
 Both are assertion scripts that exit non-zero on failure (the repo's `experiments/`

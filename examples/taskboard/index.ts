@@ -9,13 +9,27 @@
 import { openDb } from './db.js'
 import { createApp } from './app.js'
 
-const { db, appliedMigrations } = await openDb()
-const app = createApp(db)
 const port = Number(process.env.PORT ?? 8082)
 
+let opened
+try {
+  opened = await openDb()
+} catch (e) {
+  // A contended file:// lock (another process owns the datadir) surfaces here.
+  // Exit non-zero with a clear signal rather than corrupting anything.
+  console.error(`taskboard boot failed: ${e instanceof Error ? e.message : e}`)
+  process.exit(1)
+}
+const { db, appliedMigrations } = opened
+const app = createApp(db)
+
 app.listen(port, () => {
+  // The READY line carries the ACTUAL bound port (PORT=0 picks a free one) so a
+  // supervisor/test can detect boot and find where to connect.
+  const addr = app.address()
+  const bound = typeof addr === 'object' && addr ? addr.port : port
   console.log(
-    `taskboard on http://localhost:${port}  engine=${db.engine}` +
+    `taskboard READY on http://localhost:${bound}  engine=${db.engine}` +
       (appliedMigrations.length ? `  migrated=[${appliedMigrations.join(',')}]` : ''),
   )
 })
