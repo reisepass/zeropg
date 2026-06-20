@@ -334,6 +334,16 @@ Remaining work: surface `ensureReady()` through the E2 unified client (so a
 remote `connect()` can pre-warm before first query), and add a CLI `prewarm`
 command (and document the `/wake` ping for an external scheduler/keepalive).
 
+> **Showcase 2026-06-20 — `examples/taskboard`.** A real task-board app (HTTP API +
+> server-rendered UI) built entirely on `@zeropg/client`, demonstrating the thesis:
+> the migrations, SQL, routes and HTML are written once; only `DATABASE_URL` moves
+> it across the ladder. Boot-time single-applier migrations (the ORM-notes pattern).
+> Verified: `test/api-parity.test.ts` proves `memory://` and `file://` produce
+> byte-identical HTTP transcripts + file data survives close/reopen; `test/e2e.test.ts`
+> drives the real UI in headless chromium (add → toggle → detail route → save notes →
+> reload-persisted → delete). First end-to-end proof of the unified client on a
+> non-trivial app.
+
 > See also: the OSS local **studio** (`npx @zeropg/studio`) — registry +
 > connection-string vault + free-tier usage gauge (derived from a bucket LIST,
 > not billing APIs) + SQL console — to be specced in `docs/STUDIO.md`. Separate
