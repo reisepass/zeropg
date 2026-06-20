@@ -271,10 +271,13 @@ files.
 > naive read-then-unlink. Verified by real multi-process race tests
 > (`packages/client/test/lock-multiprocess.test.ts`: fresh N-way race, stale
 > stampede, reclaim-after-SIGKILL, live-holder rejection — O_EXCL sentinel probe
-> detects any double-grant). The end state is to consume the fork (or upstream
-> once #892 lands) and drop the wrapper lock in favor of PGlite's NodeFS lock +
-> `takeover`. So the original "no PGlite fork" stance below is SUPERSEDED for the
-> lock specifically.
+> detects any double-grant). **This wrapper reimplementation is the intended,
+> permanent solution — we deliberately do NOT wait for PR #892 to merge upstream
+> (that blocker is the whole reason we reimplement in the client).** The fork is
+> the reference we mirror, not a dependency we plan to consume; the `globalThis`
+> HMR pin is our equivalent of the fork's `takeover`. So the "no PGlite fork"
+> stance below holds in spirit (we ship without forking PGlite) — the lock just
+> lives in our `connect()` layer.
 
 **We own this in our client wrapper** today (mirroring the fork's protocol).
 Two layers, both in our `connect()` layer around the PGlite open/close:
