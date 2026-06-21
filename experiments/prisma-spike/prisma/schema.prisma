@@ -1,0 +1,25 @@
+// Spike schema: smallest thing that exercises a CREATE TABLE + a foreign key, so
+// we learn whether Prisma's migration engine can author + apply DDL to zeropg
+// over the local pglite-socket wire (with a 2nd wire server as the shadow DB).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Poll {
+  id        String   @id @default(cuid())
+  title     String
+  createdAt DateTime @default(now())
+  options   Option[]
+}
+
+model Option {
+  id     String @id @default(cuid())
+  label  String
+  pollId String
+  poll   Poll   @relation(fields: [pollId], references: [id], onDelete: Cascade)
+}

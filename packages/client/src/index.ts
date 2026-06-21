@@ -33,6 +33,7 @@ export {
   type DatadirLock,
   type AcquireOptions,
 } from './lockfile.js'
+export { serveWire, type WireServer, type ServeWireOptions } from './wire.js'
 
 const DEFAULT_URL = 'memory://'
 

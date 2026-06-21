@@ -178,6 +178,36 @@ answer and is simpler and more aligned with the single-writer model.
 
 ---
 
+## VERIFIED EMPIRICALLY (2026-06-21) — Prisma 7.8 over the pglite-socket wire
+
+Spike: `experiments/prisma-spike/` (run `tsx experiments/prisma-spike/run.ts`), against
+the new local-wire mode `serveWire()` in `@zeropg/client` (`packages/client/src/wire.ts`),
+which stands up a real `postgres://` localhost endpoint over one PGlite via
+`@electric-sql/pglite-socket`.
+
+- **`prisma migrate dev` (native engine) does NOT work over the wire.** It clears
+  SSL only with `?sslmode=disable` (the Rust engine defaults to `prefer` and sends
+  an SSLRequest the socket doesn't negotiate → P1001) and auth only with user
+  `postgres` (else P1010), and THEN drops the connection (**P1017**) during the
+  migration workflow — multiple sessions + advisory locks + shadow-DB reset all
+  multiplexed onto pglite-socket's single backend. The migrate engine is the
+  blocker, exactly as predicted.
+- **The resolution path WORKS end to end (8/8):** Prisma *authors* offline with
+  `prisma migrate diff --from-empty --to-schema <schema> --script` (no DB
+  connection); zeropg's single writer *applies* that SQL itself; then `prisma
+  generate` + `PrismaClient({ adapter: new PrismaPg({ connectionString }) })`
+  (`@prisma/adapter-pg`, the JS pg driver) does nested writes, relation reads and
+  filtered queries over the wire with no native engine involved.
+- **Prisma 7 specifics learned:** connection URLs moved OUT of `schema.prisma`
+  into `prisma.config.ts` (`datasource.url` / `shadowDatabaseUrl`, resolved at
+  config-load time so the CLI needs them set even for offline `diff`); the client
+  REQUIRES a driver adapter (or Accelerate) in the constructor; `migrate diff`
+  flag is `--to-schema` (not the removed `--to-schema-datamodel`).
+- **Net recommendation, now evidence-backed:** use Prisma for *authoring* +
+  *client queries via the pg adapter*; deliver migrations as committed SQL the
+  zeropg instance applies at boot (single-applier). Do NOT route `prisma migrate`
+  through the running instance.
+
 ## Caveats / things to verify before building
 
 - **PGlite `CREATE DATABASE` / multi-DB** support (decides whether a Prisma
