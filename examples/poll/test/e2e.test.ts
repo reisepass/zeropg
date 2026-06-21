@@ -62,15 +62,36 @@ async function main(): Promise<void> {
     ok(await page.getByTestId('row-Alan').isVisible(), "Alan's row appears")
     ok((await page.getByTestId('best').textContent())?.includes('Thu 15:00') ?? false, 'Thursday still best with 2 yes')
 
+    console.log('the results grid renders the right marks per person per slot')
+    // td[0] = name, td[1] = Thu 15:00, td[2] = Fri 11:00 (option order).
+    const cell = (row: string, col: number) => page.getByTestId(`row-${row}`).locator('td').nth(col).textContent()
+    ok((await cell('Grace', 1))?.trim() === '✓', 'Grace × Thu = ✓ (yes)')
+    ok((await cell('Grace', 2))?.trim() === '✗', 'Grace × Fri = ✗ (no)')
+    ok((await cell('Alan', 1))?.trim() === '✓', 'Alan × Thu = ✓ (yes)')
+    ok((await cell('Alan', 2))?.trim() === '~', 'Alan × Fri = ~ (if need be)')
+
+    console.log('the ✓-total row and best-column highlight are correct')
+    const totalRow = page.locator('tr', { hasText: '✓ total' })
+    ok((await totalRow.locator('td').nth(1).textContent())?.includes('2 ✓') ?? false, 'Thu total = 2 ✓')
+    ok((await totalRow.locator('td').nth(2).textContent())?.includes('0 ✓') ?? false, 'Fri total = 0 ✓')
+    const bestHead = page.locator('th.best')
+    ok((await bestHead.count()) === 1 && (await bestHead.textContent())?.trim() === 'Thu 15:00', 'best column header is Thu, highlighted')
+
     console.log('reload -> persisted')
     await page.reload()
     ok(await page.getByTestId('row-Grace').isVisible(), 'Grace persisted across reload')
     ok(await page.getByTestId('row-Alan').isVisible(), 'Alan persisted across reload')
+    ok((await cell('Alan', 2))?.trim() === '~', 'Alan × Fri mark persisted across reload')
 
     console.log('open the share link directly (own URL)')
     const share = (await page.getByTestId('share').textContent())!
     await page.goto(base + share)
     ok((await page.getByTestId('poll-title').textContent()) === 'Sprint demo slot', 'share URL loads the poll directly')
+
+    console.log('a bad poll id shows the 404 view')
+    const resp = await page.goto(base + '/poll/does-not-exist')
+    ok(resp?.status() === 404, 'unknown poll returns HTTP 404')
+    ok((await page.locator('h1').textContent())?.includes('no such poll') ?? false, '404 page rendered')
   } finally {
     if (browser) await browser.close()
     await new Promise<void>((r) => app.close(() => r()))
