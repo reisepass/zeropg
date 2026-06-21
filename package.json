@@ -21,6 +21,7 @@
     "@types/pg": "^8.20.0",
     "esbuild": "^0.28.0",
     "pg": "^8.21.0",
+    "pg-gateway": "^0.3.0-beta.4",
     "playwright": "^1.60.0",
     "prisma": "^7.8.0",
     "tsx": "^4.19.2",

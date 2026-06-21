@@ -211,11 +211,29 @@ applies it natively). The standard flow is unchanged:
    `examples/poll/boot.ts` does). Either way, exactly one applier.
 3. **Query** via `PrismaClient({ adapter: new PrismaPg({ connectionString }) })`.
 
-**To make `prisma migrate dev` itself work over the wire** (so the local
-authoring step needs no separate Postgres), the fix is a more complete wire
-gateway than pglite-socket — evaluate `pg-gateway` (supabase-community, the
-community's pglite+Prisma path) or upstreaming the #985/#958 fixes into
-pglite-socket. Open follow-up, not required for apps to run.
+**pg-gateway TESTED (2026-06-21, `experiments/prisma-spike/pggw.ts`) — does NOT
+fix `migrate dev`.** Fronting PGlite with supabase-community's `pg-gateway`
+(startup/auth/SSL handshake, then raw bytes → PGlite's own `execProtocolRaw`,
+serialized by PGlite's `runExclusive`) still fails `migrate dev` with **P1017**.
+The debug shows PGlite never errors on any message — the schema engine itself
+closes the connection. Root cause is structural, not a framing bug a gateway can
+fix: Prisma's schema engine needs **multiple independent Postgres sessions**
+(advisory-lock conn + work conn + shadow reset), and **PGlite is a single backend
+session**. This is why `migrate dev` against PGlite is broken even in Prisma's
+OWN `prisma dev` (the #29366 thread is full of P1017 against Prisma's own
+PGlite-backed local server, even with `connection_limit=1` + a separate shadow).
+So: treat `prisma migrate dev` against any single PGlite as unsupported; AUTHOR
+migrations against a throwaway real Postgres (Docker/local) and `migrate deploy`
+to zeropg.
+
+**Silver lining — pg-gateway is the better wire layer for everything else.** A
+plain `pg` client connected over pg-gateway with NO `sslmode=disable` and NO user
+override (pg-gateway answers `SSLRequest` correctly and uses PGlite's faithful
+`execProtocolRaw`), whereas pglite-socket needed both. Candidate follow-up: swap
+`serveWire`'s backend from `@electric-sql/pglite-socket` to `pg-gateway` so
+`migrate deploy`, `db push`, `drizzle-kit`, `psql`, TablePlus, and the client all
+"just work" without connection-string hacks. Does not change the `migrate dev`
+verdict.
 
 **Prisma 7 specifics learned:** connection URLs moved OUT of `schema.prisma` into
 `prisma.config.ts` (`datasource.url` / `shadowDatabaseUrl`, resolved at
