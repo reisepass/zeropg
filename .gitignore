@@ -22,3 +22,7 @@ experiments/loadtest-service/dist/
 
 # taskboard example local datadir (file:// engine)
 examples/taskboard/data/
+
+# poll example local datadir + generated prisma client
+examples/poll/data/
+examples/*/generated/
