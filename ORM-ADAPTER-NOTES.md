@@ -185,28 +185,44 @@ the new local-wire mode `serveWire()` in `@zeropg/client` (`packages/client/src/
 which stands up a real `postgres://` localhost endpoint over one PGlite via
 `@electric-sql/pglite-socket`.
 
-- **`prisma migrate dev` (native engine) does NOT work over the wire.** It clears
-  SSL only with `?sslmode=disable` (the Rust engine defaults to `prefer` and sends
-  an SSLRequest the socket doesn't negotiate → P1001) and auth only with user
-  `postgres` (else P1010), and THEN drops the connection (**P1017**) during the
-  migration workflow — multiple sessions + advisory locks + shadow-DB reset all
-  multiplexed onto pglite-socket's single backend. The migrate engine is the
-  blocker, exactly as predicted.
-- **The resolution path WORKS end to end (8/8):** Prisma *authors* offline with
-  `prisma migrate diff --from-empty --to-schema <schema> --script` (no DB
-  connection); zeropg's single writer *applies* that SQL itself; then `prisma
-  generate` + `PrismaClient({ adapter: new PrismaPg({ connectionString }) })`
-  (`@prisma/adapter-pg`, the JS pg driver) does nested writes, relation reads and
-  filtered queries over the wire with no native engine involved.
-- **Prisma 7 specifics learned:** connection URLs moved OUT of `schema.prisma`
-  into `prisma.config.ts` (`datasource.url` / `shadowDatabaseUrl`, resolved at
-  config-load time so the CLI needs them set even for offline `diff`); the client
-  REQUIRES a driver adapter (or Accelerate) in the constructor; `migrate diff`
-  flag is `--to-schema` (not the removed `--to-schema-datamodel`).
-- **Net recommendation, now evidence-backed:** use Prisma for *authoring* +
-  *client queries via the pg adapter*; deliver migrations as committed SQL the
-  zeropg instance applies at boot (single-applier). Do NOT route `prisma migrate`
-  through the running instance.
+Connection URL prerequisites for the native engine to reach pglite-socket at all:
+`?sslmode=disable` (the Rust engine defaults to `prefer` and sends an SSLRequest
+the socket doesn't negotiate → P1001) and user `postgres` (else P1010).
+
+**What each Prisma migration command does over the raw pglite-socket wire
+(experiments: `run.ts`, `migrate-dev.ts`, `deploy.ts`):**
+
+| Command | Result | Why |
+|---|---|---|
+| `prisma migrate diff --script` | ✅ works | offline, no DB connection |
+| `prisma migrate deploy` | ✅ **works** | applies committed migration SQL; no shadow DB, single session |
+| `prisma generate` + client via `@prisma/adapter-pg` | ✅ works | nested writes / relations / filters over the wire |
+| `prisma migrate dev` | ❌ **P1017** | shadow-DB reset + multi-session/advisory-lock workflow hits pglite-socket's wire bugs (electric-sql/pglite #985 deadlock-on-disconnect-mid-tx, #958 premature ReadyForQuery) — **fails even with the maintainer's `connection_limit=1` + separate-PGlite-shadow fix** (prisma/prisma#29366), because that fix targets Prisma's own `prisma dev` proxy, not raw pglite-socket |
+
+**Corrected conclusion (an earlier note here wrongly said "migrations don't work
+at all"):** existing Prisma apps run on zeropg with their NORMAL workflow, and NO
+Prisma-migration parser is needed (Prisma emits plain SQL; `migrate deploy`
+applies it natively). The standard flow is unchanged:
+1. **Author** migrations with `prisma migrate dev` against any local Postgres OR
+   Prisma's own PGlite-backed `prisma dev` (which works because it ships a more
+   complete wire gateway than pglite-socket). Commit the `migrations/` folder.
+2. **Apply** to zeropg with `prisma migrate deploy` over the wire (verified), or
+   have the zeropg instance apply the committed SQL at boot (single-applier — what
+   `examples/poll/boot.ts` does). Either way, exactly one applier.
+3. **Query** via `PrismaClient({ adapter: new PrismaPg({ connectionString }) })`.
+
+**To make `prisma migrate dev` itself work over the wire** (so the local
+authoring step needs no separate Postgres), the fix is a more complete wire
+gateway than pglite-socket — evaluate `pg-gateway` (supabase-community, the
+community's pglite+Prisma path) or upstreaming the #985/#958 fixes into
+pglite-socket. Open follow-up, not required for apps to run.
+
+**Prisma 7 specifics learned:** connection URLs moved OUT of `schema.prisma` into
+`prisma.config.ts` (`datasource.url` / `shadowDatabaseUrl`, resolved at
+config-load time so the CLI needs them set even for offline `diff`); the client
+REQUIRES a driver adapter (or Accelerate) in the constructor; `migrate diff` flag
+is `--to-schema` (not the removed `--to-schema-datamodel`); PGlite is single-
+connection so any wire client must use `connection_limit=1`.
 
 ## Caveats / things to verify before building
 

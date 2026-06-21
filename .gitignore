@@ -26,3 +26,7 @@ examples/taskboard/data/
 # poll example local datadir + generated prisma client
 examples/poll/data/
 examples/*/generated/
+
+# prisma-spike generated migrations + scratch
+experiments/prisma-spike/prisma/migrations/
+experiments/prisma-spike/dbpush.ts
