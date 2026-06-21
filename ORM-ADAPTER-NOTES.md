@@ -226,6 +226,32 @@ So: treat `prisma migrate dev` against any single PGlite as unsupported; AUTHOR
 migrations against a throwaway real Postgres (Docker/local) and `migrate deploy`
 to zeropg.
 
+## THE SOLUTION — a homegrown `migrate dev` for Prisma-on-zeropg (2026-06-21) ✅
+
+We do NOT need the native `migrate dev` engine, a real external Postgres, or
+pg-gateway. Native `migrate dev` is just **generate-new-migration + apply**,
+bundled with a concurrent shadow/advisory-lock orchestration PGlite can't satisfy.
+Each half works on PGlite ALONE:
+
+- **GENERATE:** `prisma migrate diff --from-migrations <dir> --to-schema <schema>
+  --script --exit-code` replays the migration history into a THROWAWAY in-process
+  PGlite shadow (sequential, single session) and emits the new SQL. The shadow URL
+  comes from `prisma.config.ts` `datasource.shadowDatabaseUrl` (read from
+  `process.env`, NOT prisma's `env()` which throws when unset — so it can be
+  omitted for commands that don't use a shadow). `--exit-code`: 0=in-sync, 2=diff.
+- **APPLY:** `prisma migrate deploy` applies committed migrations over the wire
+  (no shadow; don't set `SHADOW_DATABASE_URL` for it or prisma's "shadow == main"
+  guard trips).
+
+So we orchestrate the two ourselves (~100 lines: `experiments/prisma-spike/
+zeropg-migrate.ts` `migrateDev()`): spin a throwaway PGlite shadow → `diff
+--from-migrations` → write `migrations/<ts>_<name>/migration.sql` → `migrate
+deploy` to the dev datadir. Same DX as `migrate dev` (edit schema → timestamped
+migration → applied), entirely on PGlite. Verified end to end (6/6,
+`migrate-dev-tool.test.ts`): generates `ADD COLUMN`, the dev DB gains the column,
+both migrations land in `_prisma_migrations`, idempotent when in sync. This is the
+path to promote into a `zeropg migrate` CLI verb.
+
 **Silver lining — pg-gateway is the better wire layer for everything else.** A
 plain `pg` client connected over pg-gateway with NO `sslmode=disable` and NO user
 override (pg-gateway answers `SSLRequest` correctly and uses PGlite's faithful
