@@ -1,13 +1,14 @@
 // A tiny Rallly/Doodle-style meeting poll, authored in Prisma. This is a REAL
 // Prisma app — the point is that an existing Prisma codebase runs on zeropg with
 // the proven path: Prisma authors the schema, zeropg's single writer applies the
-// generated SQL at boot, and the Prisma client queries over the pglite-socket
-// wire via @prisma/adapter-pg (see ORM-ADAPTER-NOTES.md, verified 2026-06-21).
+// committed migrations at boot (via @zeropg/cli's migrateDeploy()), and the
+// Prisma client queries over the wire via @prisma/adapter-pg (see
+// ORM-ADAPTER-NOTES.md, verified 2026-06-21).
 //
-// Regenerate the client + migration SQL after editing:
-//   DATABASE_URL=postgres://x npx prisma generate --schema examples/poll/prisma/schema.prisma
-//   DATABASE_URL=postgres://x npx prisma migrate diff --from-empty \
-//     --to-schema examples/poll/prisma/schema.prisma --script > examples/poll/prisma/migrations/0001_init.sql
+// Regenerate the client, then author the next migration with the zeropg CLI
+// (which needs no external Postgres — it uses a throwaway PGlite shadow):
+//   npx prisma generate --schema examples/poll/prisma/schema.prisma
+//   cd examples/poll && npx tsx ../../packages/cli/src/zeropg.ts migrate dev --name <name>
 
 generator client {
   provider = "prisma-client-js"

@@ -10,7 +10,7 @@ const app = createApp(prisma)
 app.listen(port, () => {
   const addr = app.address()
   const bound = typeof addr === 'object' && addr ? addr.port : port
-  console.log(`poll READY on http://localhost:${bound}${applied.length ? `  migrated=[${applied.join(',')}]` : ''}`)
+  console.log(`poll READY on http://localhost:${bound}${applied ? `  migrated=${applied}` : ''}`)
 })
 
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {

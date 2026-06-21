@@ -1,0 +1,20 @@
+{
+  "name": "@zeropg/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "zeropg": "./src/zeropg.ts"
+  },
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "description": "The zeropg CLI. `zeropg migrate dev` / `zeropg migrate deploy`: a Prisma-migration workflow for zeropg/PGlite that needs no external Postgres and avoids the native migrate engine (which can't drive single-session PGlite).",
+  "license": "MIT",
+  "dependencies": {
+    "@zeropg/client": "*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
