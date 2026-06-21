@@ -7,7 +7,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "tsx test/client.test.ts && tsx test/lock-multiprocess.test.ts"
+    "test": "tsx test/client.test.ts && tsx test/lock-multiprocess.test.ts",
+    "test:stress": "tsx test/lock-stress.test.ts"
   },
   "description": "The unified zeropg client (Track E): one connect(DATABASE_URL) factory and one node-postgres-shaped interface over four engines (in-process PGlite for memory://, file:// with a cross-process lockfile, bucket-backed scale-to-zero zeropg over HTTP, and a graduated postgres:// passthrough). Only the connection string changes from laptop to bucket to always-on server.",
   "license": "MIT",

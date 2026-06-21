@@ -200,18 +200,28 @@ export async function acquireDatadirLock(
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
     }
 
+    // Decide how long to wait before the next create attempt. The deadline is
+    // checked EVERY iteration below (including the fast-retry paths) so sustained
+    // contention can never loop past the timeout, and contended reclaim backs off
+    // instead of spinning the CPU between create and the claim mutex.
     const seen = await inspect(lockPath, now, isAlive)
+    let waitMs: number
     switch (seen.state) {
       case 'gone':
-        continue // released between our create and inspect — retry immediately
-      case 'reclaimable':
-        await tryReclaim(lockPath, now, isAlive)
-        continue // whether or not we won the claim, retry the create
+        waitMs = 0 // genuinely free — race for it immediately
+        break
+      case 'reclaimable': {
+        const won = await tryReclaim(lockPath, now, isAlive)
+        waitMs = won ? 0 : reclaimBackoff() // lost the claim race -> back off, don't spin
+        break
+      }
       case 'live':
         lastLive = seen.rec
+        waitMs = pollMs
         break
       case 'pending':
-        break // a writer is mid-birth — just wait and retry
+        waitMs = pollMs // a writer is mid-birth — wait and re-check
+        break
     }
 
     if (now() >= deadline) {
@@ -220,8 +230,14 @@ export async function acquireDatadirLock(
         : 'a writer is still initializing it'
       throw new LockTimeoutError(lockPath, detail, timeoutMs)
     }
-    await sleep(pollMs)
+    if (waitMs > 0) await sleep(waitMs)
   }
+}
+
+/** Small randomized backoff (jitter) so a stampede of reclaimers does not
+ * thundering-herd the claim mutex or busy-spin between create attempts. */
+function reclaimBackoff(): number {
+  return 4 + Math.floor(Math.random() * 12)
 }
 
 function makeLock(path: string): DatadirLock {
