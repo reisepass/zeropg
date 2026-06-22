@@ -12,6 +12,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir, hostname } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { lockPathFor } from '../src/lockfile.js'
 
 const CHILD = join(dirname(fileURLToPath(import.meta.url)), 'lock-child.ts')
 
@@ -83,7 +84,7 @@ async function testStaleStampede(): Promise<void> {
   // Pre-seed a stale lock owned by a (practically) dead PID on this host, so
   // every racer hits the dead-holder reclaim branch simultaneously.
   await writeFile(
-    `${dataDir}.lock`,
+    lockPathFor(dataDir),
     JSON.stringify({ pid: 2147480000, host: hostname(), acquiredAt: new Date(0).toISOString() }),
   )
   const N = 12

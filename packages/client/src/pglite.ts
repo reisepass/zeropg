@@ -9,6 +9,19 @@ import { resolve } from 'node:path'
 import { acquireDatadirLock, type DatadirLock } from './lockfile.js'
 import type { Client, ConnectOptions, Engine, FieldInfo, QueryResult, Queryable } from './types.js'
 
+// Whether the installed PGlite build takes its OWN cross-process datadir lock
+// (the reisepass/pglite-kill-dash-9 fork does, baked into NodeFS). If it does,
+// the wrapper MUST NOT also lock: both use the same `<datadir>.lock` path with
+// incompatible token formats, so running both stalls ~10s while each treats the
+// other's lock as foreign and reclaims it. Resolution order: explicit option ->
+// env var -> a static `managesDataDirLock` marker the fork can advertise.
+export function nativeDatadirLockEnabled(opts: { nativeDatadirLock?: boolean }): boolean {
+  if (opts.nativeDatadirLock !== undefined) return opts.nativeDatadirLock
+  const env = process.env.ZEROPG_NATIVE_DATADIR_LOCK
+  if (env === '1' || env === 'true') return true
+  return (PGlite as unknown as { managesDataDirLock?: boolean }).managesDataDirLock === true
+}
+
 interface PgliteRow {
   rows: unknown[]
   fields?: { name: string; dataTypeID: number }[]
@@ -112,12 +125,16 @@ export async function connectFile(dataDir: string, opts: ConnectOptions): Promis
     }
   }
 
-  const lock = await acquireDatadirLock(abs, { acquireTimeoutMs: opts.acquireTimeoutMs })
+  // Stand down when PGlite locks the datadir itself — let the single, canonical
+  // lock (the fork's) own `<datadir>.lock`; never run two protocols over it.
+  const lock = nativeDatadirLockEnabled(opts)
+    ? null
+    : await acquireDatadirLock(abs, { acquireTimeoutMs: opts.acquireTimeoutMs })
   let pg: PGlite
   try {
     pg = await PGlite.create({ dataDir: abs })
   } catch (e) {
-    await lock.release()
+    if (lock) await lock.release()
     throw e
   }
 

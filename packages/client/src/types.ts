@@ -46,4 +46,22 @@ export interface ConnectOptions {
   readyTimeoutMs?: number
   /** Disable the same-process HMR instance pin for file:// (default: pinned). */
   noHmrPin?: boolean
+  /**
+   * Optimization: the underlying PGlite build ALREADY holds a cross-process
+   * datadir lock of its own (the reisepass/pglite-kill-dash-9 fork bakes the lock
+   * into NodeFS). When true, connect() / serveWire() skip the wrapper lock, since
+   * the engine's own lock is sufficient — saving the extra `<datadir>.zeropg.lock`
+   * file and its syscalls.
+   *
+   * This is purely an optimization, NOT a correctness requirement: the wrapper
+   * lock lives in its own namespaced `<datadir>.zeropg.lock` file (never PGlite's
+   * `<datadir>.lock`), so leaving it on alongside an engine that also locks is a
+   * harmless redundant guard, not a conflict.
+   *
+   * Defaults to false — on stock PGlite (0.5.x ships no datadir lock) the wrapper
+   * lock is the ONLY guard, so it must stay on. Also settable process-wide via
+   * ZEROPG_NATIVE_DATADIR_LOCK=1, and auto-detected when the PGlite build
+   * advertises a truthy static `managesDataDirLock`.
+   */
+  nativeDatadirLock?: boolean
 }

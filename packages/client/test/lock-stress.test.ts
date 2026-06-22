@@ -16,6 +16,7 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir, hostname } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { lockPathFor } from '../src/lockfile.js'
 
 const CHILD = join(dirname(fileURLToPath(import.meta.url)), 'lock-child.ts')
 const SCALE = Number(process.env.STRESS_SCALE ?? 1)
@@ -79,7 +80,7 @@ function countViolations(events: Event[]): number {
 
 async function seedStaleLock(dataDir: string): Promise<void> {
   await writeFile(
-    `${dataDir}.lock`,
+    lockPathFor(dataDir),
     JSON.stringify({ pid: 2147480000, host: hostname(), acquiredAt: new Date(0).toISOString() }),
   )
 }

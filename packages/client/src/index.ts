@@ -33,10 +33,12 @@ export type {
 } from './types.js'
 export {
   acquireDatadirLock,
+  lockPathFor,
   LockTimeoutError,
   type DatadirLock,
   type AcquireOptions,
 } from './lockfile.js'
+export { nativeDatadirLockEnabled } from './pglite.js'
 export { serveWire, type WireServer, type ServeWireOptions } from './wire.js'
 
 const DEFAULT_URL = 'memory://'

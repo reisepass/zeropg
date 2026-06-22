@@ -7,7 +7,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir, hostname } from 'node:os'
 import { join } from 'node:path'
 import { connect } from '../src/index.js'
-import { acquireDatadirLock, LockTimeoutError } from '../src/lockfile.js'
+import { acquireDatadirLock, lockPathFor, LockTimeoutError } from '../src/lockfile.js'
 
 let passed = 0
 function ok(cond: unknown, msg: string): void {
@@ -68,7 +68,7 @@ async function testLockReleasedOnEnd(): Promise<void> {
   // Lock file must be gone after a clean end().
   let lockExists = true
   try {
-    await readFile(`${dataDir}.lock`, 'utf8')
+    await readFile(lockPathFor(dataDir), 'utf8')
   } catch {
     lockExists = false
   }
@@ -102,7 +102,7 @@ async function testLockReclaimsDeadHolder(): Promise<void> {
   console.log('lock: a DEAD holder is reclaimed immediately (no wait)')
   const dir = await mkdtemp(join(tmpdir(), 'zeropg-lock-'))
   const dataDir = join(dir, 'db')
-  const lockPath = `${dataDir}.lock`
+  const lockPath = lockPathFor(dataDir)
   // Forge a stale lock owned by a PID that is (almost certainly) dead, on this host.
   await writeFile(
     lockPath,
@@ -137,12 +137,59 @@ async function testHmrPin(): Promise<void> {
   await a.end() // owner end: closes + releases + clears pin
 }
 
+async function exists(path: string): Promise<boolean> {
+  try {
+    await readFile(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function testNoCollisionWithPgliteOwnLock(): Promise<void> {
+  console.log("namespaced lock: a foreign PGlite-style <datadir>.lock is never touched")
+  const dir = await mkdtemp(join(tmpdir(), 'zeropg-foreign-'))
+  const dataDir = join(dir, 'db')
+  // Simulate the lock PGlite's own NodeFS (the fork / a future upstream) writes:
+  // same `<datadir>.lock` path, but its newline-delimited token, not our JSON.
+  const pgliteLockPath = `${dataDir}.lock`
+  const pgliteToken = `${process.pid}\n${Date.now()}\n0\n`
+  await writeFile(pgliteLockPath, pgliteToken)
+
+  const db = await connect(`file://${dataDir}`, { noHmrPin: true })
+  // The wrapper took ITS OWN namespaced file, leaving PGlite's lock alone.
+  ok(await exists(lockPathFor(dataDir)), 'wrapper created its own <datadir>.zeropg.lock')
+  eq(
+    await readFile(pgliteLockPath, 'utf8'),
+    pgliteToken,
+    "PGlite's own <datadir>.lock was not reclaimed, rewritten, or stalled on",
+  )
+  await db.end()
+  ok(!(await exists(lockPathFor(dataDir))), 'wrapper lock removed on end()')
+  ok(await exists(pgliteLockPath), "PGlite's own lock still left intact after end()")
+}
+
+async function testNativeDatadirLockStandsDown(): Promise<void> {
+  console.log('nativeDatadirLock: wrapper skips its lock entirely when told the engine locks')
+  const dir = await mkdtemp(join(tmpdir(), 'zeropg-native-'))
+  const dataDir = join(dir, 'db')
+  const db = await connect(`file://${dataDir}`, { noHmrPin: true, nativeDatadirLock: true })
+  ok(!(await exists(lockPathFor(dataDir))), 'no <datadir>.zeropg.lock created when nativeDatadirLock=true')
+  await db.exec('create table n (v text)')
+  await db.query("insert into n values ('ok')")
+  const r = await db.query<{ v: string }>('select v from n')
+  eq(r.rows, [{ v: 'ok' }], 'db still works without the wrapper lock')
+  await db.end()
+}
+
 async function main(): Promise<void> {
   await testMemory()
   await testFileRoundTrip()
   await testLockReleasedOnEnd()
   await testLockRejectsLiveHolder()
   await testLockReclaimsDeadHolder()
+  await testNoCollisionWithPgliteOwnLock()
+  await testNativeDatadirLockStandsDown()
   await testHmrPin()
   console.log(`\nPASS — ${passed} assertions`)
 }

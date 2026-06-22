@@ -3,11 +3,23 @@
 // PGlite is single-connection / single-process and the NodeFS backend has no
 // cross-process guard, so two processes (a hot-reloading dev server's old + new
 // instance, two `tsx watch` runs, nodemon overlap) opening the same datadir tear
-// the files. We own this in the connect() layer: a sibling `<datadir>.lock`
+// the files. We own this in the connect() layer: a sibling `<datadir>.zeropg.lock`
 // file created with O_EXCL ('wx') holding the owner PID. This is the local
 // analog of the remote single-writer lease (DESIGN §7) — `O_EXCL` and
 // `If-None-Match: *` are the same atomic create-if-absent primitive in two
 // media.
+//
+// NAMESPACED ON PURPOSE. We deliberately do NOT use `<datadir>.lock`: that is
+// the path PGlite's OWN datadir lock uses (the reisepass/pglite-kill-dash-9 fork,
+// and possibly a future upstream PGlite). Two lock protocols sharing one file —
+// our JSON token vs PGlite's newline-delimited token — are mutually unparseable,
+// so each treats the other's lock as a foreign/corrupt file and reclaims it,
+// stalling ~10s on every open. Owning a distinct `.zeropg.lock` file means the
+// wrapper lock is correct and conflict-free whether the underlying PGlite locks
+// itself or not, and survives PGlite changing its lock format underneath us — no
+// detection, no coupling. (When PGlite already locks, this wrapper lock is a
+// harmless redundant guard; skip it with ConnectOptions.nativeDatadirLock to save
+// the extra file + syscalls.)
 //
 // The canonical, battle-tested version of this protocol lives INSIDE PGlite's
 // NodeFS in the fork at reisepass/pglite-kill-dash-9 (upstream PR #892), whose
@@ -164,14 +176,22 @@ async function tryReclaim(
   }
 }
 
+/** The wrapper lock file for a datadir: a sibling `<dataDir>.zeropg.lock`.
+ * Namespaced (NOT `<dataDir>.lock`) so it never shares a file with PGlite's own
+ * datadir lock — see the module header. Exported so callers/tests reference the
+ * one canonical path instead of hardcoding the suffix. */
+export function lockPathFor(dataDir: string): string {
+  return `${dataDir.replace(/[/\\]+$/, '')}.zeropg.lock`
+}
+
 /** Acquire the cross-process lock for `dataDir`. The lock file is a sibling
- * `<dataDir>.lock` so it never collides with PGlite's own files and works
+ * `<dataDir>.zeropg.lock` so it never collides with PGlite's own files and works
  * whether or not the datadir exists yet. */
 export async function acquireDatadirLock(
   dataDir: string,
   opts: AcquireOptions = {},
 ): Promise<DatadirLock> {
-  const lockPath = `${dataDir.replace(/[/\\]+$/, '')}.lock`
+  const lockPath = lockPathFor(dataDir)
   const timeoutMs = opts.acquireTimeoutMs ?? 10_000
   const pollMs = opts.pollIntervalMs ?? 50
   const now = opts.now ?? (() => Date.now())

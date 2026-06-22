@@ -16,6 +16,7 @@ import { PGlite } from '@electric-sql/pglite'
 import { createServer } from 'node:net'
 import { resolve } from 'node:path'
 import { acquireDatadirLock, type DatadirLock } from './lockfile.js'
+import { nativeDatadirLockEnabled } from './pglite.js'
 
 // @electric-sql/pglite-socket is an OPTIONAL peer: only `serveWire` needs it, and
 // it is loaded on demand so merely importing @zeropg/client (for memory:// /
@@ -49,6 +50,11 @@ export interface ServeWireOptions {
   maxConnections?: number
   /** Lock acquire timeout for the datadir (ms). Default 10s. */
   acquireTimeoutMs?: number
+  /** The PGlite build already takes its own datadir lock (the fork) — skip the
+   * wrapper lock so the two don't fight over `<datadir>.lock`. See
+   * {@link ConnectOptions.nativeDatadirLock}. Also honored via
+   * ZEROPG_NATIVE_DATADIR_LOCK=1 and the PGlite `managesDataDirLock` marker. */
+  nativeDatadirLock?: boolean
 }
 
 export interface WireServer {
@@ -84,11 +90,14 @@ export async function serveWire(opts: ServeWireOptions = {}): Promise<WireServer
   let pglite: PGlite
   if (opts.dataDir) {
     const abs = resolve(opts.dataDir)
-    lock = await acquireDatadirLock(abs, { acquireTimeoutMs: opts.acquireTimeoutMs })
+    // Stand down when PGlite locks the datadir itself (see connectFile).
+    lock = nativeDatadirLockEnabled(opts)
+      ? null
+      : await acquireDatadirLock(abs, { acquireTimeoutMs: opts.acquireTimeoutMs })
     try {
       pglite = await PGlite.create({ dataDir: abs })
     } catch (e) {
-      await lock.release()
+      if (lock) await lock.release()
       throw e
     }
   } else {
