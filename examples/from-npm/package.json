@@ -12,7 +12,8 @@
     "all": "node 01-basic.mjs && node 02-kill-9-recovery.mjs && node 03-concurrent-lockout.mjs && node 04-crash-handoff.mjs"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5",
     "@zeropg/client": "^0.0.1",
-    "@electric-sql/pglite": "^0.5"
+    "pg": "^8.22.0"
   }
 }
