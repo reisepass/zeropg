@@ -1,6 +1,6 @@
 {
   "name": "@zeropg/lease",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -19,9 +19,9 @@
     "access": "public"
   },
   "dependencies": {
-    "@zeropg/blobstore": "^0.1.0"
+    "@zeropg/blobstore": "^0.0.1"
   },
-  "description": "Single-writer lease on object storage for zeropg: conditional-create acquire, CAS renew/takeover, monotonic fencing tokens. No coordination service, no clock dependence for correctness.",
+  "description": "Early experiment in the cheapest possible scale-to-zero Postgres. Single-writer lease on object storage for zeropg: conditional-create acquire, CAS renew/takeover, monotonic fencing tokens. No coordination service, no clock dependence for correctness.",
   "license": "MIT",
   "repository": {
     "type": "git",

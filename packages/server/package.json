@@ -1,6 +1,6 @@
 {
   "name": "@zeropg/server",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -19,14 +19,14 @@
     "access": "public"
   },
   "dependencies": {
-    "@zeropg/blobstore": "^0.1.0",
-    "@zeropg/objectstore-fs": "^0.1.0"
+    "@zeropg/blobstore": "^0.0.1",
+    "@zeropg/objectstore-fs": "^0.0.1"
   },
   "peerDependencies": {
     "@electric-sql/pglite": "*",
     "@electric-sql/pglite-socket": "*"
   },
-  "description": "Standalone dedicated-Postgres server for zeropg: one scale-to-zero container holding the lease + PGlite + ObjectStoreFS, exposing the real Postgres wire protocol (pglite-socket) on a local port, a default-on PostgREST auto-REST API, and an HTTP control face (/wake, /ready, POST /sql) a remote app connects to.",
+  "description": "Early experiment in the cheapest possible scale-to-zero Postgres. Standalone dedicated-Postgres server for zeropg: one scale-to-zero container holding the lease + PGlite + ObjectStoreFS, exposing the real Postgres wire protocol (pglite-socket) on a local port, a default-on PostgREST auto-REST API, and an HTTP control face (/wake, /ready, POST /sql) a remote app connects to.",
   "license": "MIT",
   "repository": {
     "type": "git",

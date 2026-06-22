@@ -1,6 +1,6 @@
 {
   "name": "@zeropg/blobstore",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,7 +18,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "description": "Object-store transports for zeropg: GCS with atomic conditional writes (CAS), parallel-range streaming GET, chunked streaming PUT, server-side copy, and a per-provider cost/limit model.",
+  "description": "Early experiment in the cheapest possible scale-to-zero Postgres. Object-store transports for zeropg: GCS with atomic conditional writes (CAS), parallel-range streaming GET, chunked streaming PUT, server-side copy, and a per-provider cost/limit model.",
   "license": "MIT",
   "repository": {
     "type": "git",
