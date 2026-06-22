@@ -1,0 +1,18 @@
+{
+  "name": "zeropg-from-npm-examples",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Standalone examples that consume @zeropg/client FROM NPM (not the workspace) to drive real PGlite and work through crash (kill -9) and concurrency failure cases.",
+  "scripts": {
+    "basic": "node 01-basic.mjs",
+    "kill-test": "node 02-kill-9-recovery.mjs",
+    "concurrent-test": "node 03-concurrent-lockout.mjs",
+    "handoff-test": "node 04-crash-handoff.mjs",
+    "all": "node 01-basic.mjs && node 02-kill-9-recovery.mjs && node 03-concurrent-lockout.mjs && node 04-crash-handoff.mjs"
+  },
+  "dependencies": {
+    "@zeropg/client": "^0.0.1",
+    "@electric-sql/pglite": "^0.5"
+  }
+}
