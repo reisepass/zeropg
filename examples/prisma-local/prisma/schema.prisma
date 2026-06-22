@@ -1,0 +1,20 @@
+// Generated into ./generated/client (isolated, so it doesn't clobber the repo's
+// shared @prisma/client). The Prisma client talks to the local zeropg Postgres
+// over the wire via @prisma/adapter-pg - graduate to remote by pointing
+// DATABASE_URL at a real postgres://, no app change.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Note {
+  id        Int      @id @default(autoincrement())
+  body      String
+  done      Boolean  @default(false)
+  createdAt DateTime @default(now())
+}

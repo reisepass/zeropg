@@ -7,7 +7,12 @@
 //   zeropg migrate dev --name <name> [--schema p] [--migrations d] [--data d]
 //   zeropg migrate deploy            [--migrations d] [--data d]
 //   zeropg migrate status            [--migrations d]
+//   zeropg run <cmd...>              run a tool with DATABASE_URL pointed at a
+//                                    local elected Postgres (file:./pgdata)
 
+import { spawn } from 'node:child_process'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { resolveDatabaseUrl } from '@zeropg/client'
 import { migrateDev, migrateDeploy, listMigrations, type MigrateContext } from './migrate.js'
 
 interface Parsed {
@@ -66,8 +71,47 @@ Usage:
 
 Defaults: --schema prisma/schema.prisma  --migrations prisma/migrations  --data .zeropg/dev`
 
+/**
+ * `zeropg run <cmd...>` — resolve DATABASE_URL (default `file:./pgdata`) to a
+ * local elected Postgres, then run <cmd> with that real postgres:// URL injected
+ * into its env. Lets `drizzle-kit push`, `prisma db push`, `psql`, etc. talk to
+ * the local single-writer Postgres with no special config. Tears the leader down
+ * when the child exits.
+ */
+async function runCommand(rawArgs: string[]): Promise<void> {
+  if (rawArgs.length === 0) throw new Error('run requires a command, e.g. zeropg run drizzle-kit push')
+  const cwd = invocationCwd()
+  let target = process.env.DATABASE_URL ?? 'file:./pgdata'
+  // Resolve a relative file:/pglite: path against the invocation dir, because the
+  // npx-tsx shebang moves process.cwd() away from where the user ran the command.
+  const m = /^(file|pglite):(?:\/\/)?(.+)$/i.exec(target)
+  if (m && !isAbsolute(m[2])) target = `file:${resolvePath(cwd, m[2])}`
+
+  const handle = await resolveDatabaseUrl(target)
+  const [cmd, ...args] = rawArgs
+  const child = spawn(cmd, args, {
+    cwd,
+    stdio: 'inherit',
+    env: { ...process.env, DATABASE_URL: handle.url },
+  })
+  const code: number = await new Promise((res) => {
+    child.on('exit', (c) => res(c ?? 0))
+    child.on('error', (e) => {
+      console.error(`zeropg run: ${e instanceof Error ? e.message : e}`)
+      res(127)
+    })
+  })
+  await handle.close()
+  process.exit(code)
+}
+
 async function main(): Promise<void> {
-  const { positionals, flags } = parse(process.argv.slice(2))
+  const argv = process.argv.slice(2)
+  if (argv[0] === 'run') {
+    await runCommand(argv.slice(1))
+    return
+  }
+  const { positionals, flags } = parse(argv)
   const [group, sub] = positionals
 
   if (flags.help || group === 'help' || !group) {

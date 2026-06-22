@@ -1,0 +1,12 @@
+{
+  "name": "zeropg-drizzle-local-example",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Drizzle ORM over a local zeropg Postgres - only DATABASE_URL changes to go remote.",
+  "scripts": {
+    "db:push": "tsx ../../packages/cli/src/zeropg.ts run npx drizzle-kit push --force",
+    "start": "tsx app.ts",
+    "dev": "npm run db:push && npm run start"
+  }
+}

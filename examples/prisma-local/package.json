@@ -1,0 +1,12 @@
+{
+  "name": "zeropg-prisma-local-example",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Prisma ORM over a local zeropg Postgres - only DATABASE_URL changes to go remote.",
+  "scripts": {
+    "generate": "prisma generate",
+    "start": "tsx app.ts",
+    "dev": "npm run generate && npm run start"
+  }
+}

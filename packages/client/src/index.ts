@@ -40,6 +40,12 @@ export {
 } from './lockfile.js'
 export { nativeDatadirLockEnabled } from './pglite.js'
 export { serveWire, type WireServer, type ServeWireOptions } from './wire.js'
+export {
+  resolveDatabaseUrl,
+  resolve,
+  type LocalHandle,
+  type ResolveOptions,
+} from './local.js'
 
 const DEFAULT_URL = 'memory://'
 
