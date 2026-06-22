@@ -20,6 +20,9 @@ SELFHOST-CANDIDATES.md
 # loadtest-service build artifacts (bundled at deploy)
 experiments/loadtest-service/dist/
 
+# package build output (emitted by `npm run build`, shipped via npm `files`)
+packages/*/dist/
+
 # taskboard example local datadir (file:// engine)
 examples/taskboard/data/
 

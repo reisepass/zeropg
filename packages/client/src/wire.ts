@@ -13,10 +13,29 @@
 // the single serialized PGlite — which is exactly the single-writer model.
 
 import { PGlite } from '@electric-sql/pglite'
-import { PGLiteSocketServer } from '@electric-sql/pglite-socket'
 import { createServer } from 'node:net'
 import { resolve } from 'node:path'
 import { acquireDatadirLock, type DatadirLock } from './lockfile.js'
+
+// @electric-sql/pglite-socket is an OPTIONAL peer: only `serveWire` needs it, and
+// it is loaded on demand so merely importing @zeropg/client (for memory:// /
+// file://) never requires it to be installed. Loaded lazily with an actionable
+// error if the wire feature is used without the dep present.
+async function loadSocketServer(): Promise<
+  new (cfg: { db: PGlite; host: string; port: number; maxConnections: number }) => {
+    start(): Promise<void>
+    stop(): Promise<void>
+  }
+> {
+  try {
+    return (await import('@electric-sql/pglite-socket')).PGLiteSocketServer as never
+  } catch {
+    throw new Error(
+      'serveWire() requires the optional peer dependency @electric-sql/pglite-socket. ' +
+        'Install it: npm i @electric-sql/pglite-socket',
+    )
+  }
+}
 
 export interface ServeWireOptions {
   /** Datadir to back the wire server. Omit for an ephemeral in-memory database. */
@@ -76,6 +95,7 @@ export async function serveWire(opts: ServeWireOptions = {}): Promise<WireServer
     pglite = await PGlite.create()
   }
 
+  const PGLiteSocketServer = await loadSocketServer()
   const server = new PGLiteSocketServer({
     db: pglite,
     host,

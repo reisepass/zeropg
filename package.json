@@ -10,6 +10,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "build": "npm run build -w @zeropg/blobstore && npm run build -w @zeropg/lease && npm run build -w @zeropg/objectstore-fs && npm run build -w @zeropg/server && npm run build -w @zeropg/client",
     "e0": "tsx experiments/e0-primitives.ts",
     "e1": "tsx experiments/e1-lease.ts",
     "e2": "tsx experiments/e2-roundtrip.ts"
@@ -19,6 +20,8 @@
     "@prisma/client": "^7.8.0",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.20.0",
+    "drizzle-kit": "^0.31.10",
+    "drizzle-orm": "^0.45.2",
     "esbuild": "^0.28.0",
     "pg": "^8.21.0",
     "pg-gateway": "^0.3.0-beta.4",

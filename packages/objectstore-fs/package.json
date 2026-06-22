@@ -2,13 +2,25 @@
   "name": "@zeropg/objectstore-fs",
   "version": "0.1.0",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
-    "@zeropg/blobstore": "*",
-    "@zeropg/lease": "*"
+    "@zeropg/blobstore": "^0.1.0",
+    "@zeropg/lease": "^0.1.0"
   },
   "peerDependencies": {
     "@electric-sql/pglite": "*"

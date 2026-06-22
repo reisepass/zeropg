@@ -15,9 +15,13 @@
 //   postgres://… / postgresql://… graduated real Postgres via node-postgres
 
 import { connectFile, connectMemory } from './pglite.js'
-import { connectRemote } from './remote.js'
-import { connectPostgres } from './postgres.js'
 import type { Client, ConnectOptions } from './types.js'
+
+// The remote (http) and postgres engines are loaded on demand so the local
+// rungs — memory:// and file:// — never pull the server stack (@zeropg/server
+// and its transitive pglite-socket / postgrest) or node-postgres into the
+// process. A laptop that only ever opens file://./dev.db pays for nothing but
+// PGlite + the lockfile.
 
 export type {
   Client,
@@ -68,10 +72,10 @@ export async function connect(url?: string, opts: ConnectOptions = {}): Promise<
       return connectFile(filePath(target), opts)
     case 'http':
     case 'https':
-      return connectRemote(target, opts)
+      return (await import('./remote.js')).connectRemote(target, opts)
     case 'postgres':
     case 'postgresql':
-      return connectPostgres(target)
+      return (await import('./postgres.js')).connectPostgres(target)
     case 'gs':
     case 'r2':
     case 's3':

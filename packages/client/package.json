@@ -2,11 +2,21 @@
   "name": "@zeropg/client",
   "version": "0.1.0",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src"],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json",
     "test": "tsx test/client.test.ts && tsx test/lock-multiprocess.test.ts",
     "test:stress": "tsx test/lock-stress.test.ts"
   },
@@ -26,15 +36,19 @@
     "node-postgres"
   ],
   "dependencies": {
-    "@zeropg/blobstore": "*",
-    "@zeropg/objectstore-fs": "*",
-    "@zeropg/server": "*"
+    "@zeropg/blobstore": "^0.1.0",
+    "@zeropg/objectstore-fs": "^0.1.0",
+    "@zeropg/server": "^0.1.0"
   },
   "peerDependencies": {
     "@electric-sql/pglite": "*",
+    "@electric-sql/pglite-socket": "*",
     "pg": "*"
   },
   "peerDependenciesMeta": {
+    "@electric-sql/pglite-socket": {
+      "optional": true
+    },
     "pg": {
       "optional": true
     }
