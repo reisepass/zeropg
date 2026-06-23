@@ -48,9 +48,14 @@ spec:
               value: "cloudrun-cocoon-session-secret-0123456789"
             - name: COCOON_REQUIRE_INVITE
               value: "false"
-            # COCOON_DID / COCOON_HOSTNAME are injected at deploy time once the
-            # Cloud Run URL is known (see deploy notes); the did:plc account works
-            # regardless of hostname.
+            # The Cloud Run URL is deterministic for this project:
+            # https://<service>-71428757273.europe-west1.run.app
+            # The served did:web document + availableUserDomains use this host; the
+            # account identity is a did:plc, so it works regardless of hostname.
+            - name: COCOON_HOSTNAME
+              value: "cocoon-pds-zeropg-71428757273.europe-west1.run.app"
+            - name: COCOON_DID
+              value: "did:web:cocoon-pds-zeropg-71428757273.europe-west1.run.app"
           resources:
             limits:
               cpu: "1"
