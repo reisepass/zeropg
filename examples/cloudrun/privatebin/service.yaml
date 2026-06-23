@@ -1,0 +1,56 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: privatebin-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"        # single writer on the GCS datadir
+        autoscaling.knative.dev/minScale: "0"        # scale to zero
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"   # keep CPU while warm so the WAL-ship timer runs
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'  # app waits for db /healthz
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # ingress container (serves Cloud Run port)
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/privatebin-zeropg:latest
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+        - name: db                                    # zeropg sidecar: GCS-backed Postgres on localhost:5432
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/zeropg-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-privatebin"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: PORT
+              value: "8081"
+            - name: APP_LABEL
+              value: "privatebin"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 40                      # allow up to ~2min for first restore
+  traffic:
+    - percent: 100
+      latestRevision: true
