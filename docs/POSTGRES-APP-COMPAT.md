@@ -111,14 +111,68 @@ seconds later. → **Tooling/test action:** read-after-write verification must *
 not assume immediate visibility, on a busy single-session instance. Concurrent transactional
 throughput is the real ceiling and the signal to graduate to a managed Postgres.
 
-## Limitation 5 — client wire-protocol coverage (one untested edge)
+## Limitation 5 — NAMED server-side prepared statements are the real wall (now characterized)
 
-Three different client stacks drove pglite-socket cleanly: node-postgres (Cal.com/Rallly/NocoDB),
-Prisma native engine over libpq-style (Documenso), and PHP `pdo_pgsql`/libpq (PrivateBin —
-SSL auto-fell-back to plaintext, no `sslmode` tweak needed). **One surface remains untested:**
-server-side named prepared statements (extended-protocol PREPARE/Bind/Execute reuse) under
-**persistent** connections — PrivateBin ran fresh-connection-per-request so never exercised it.
-Worth a dedicated test before claiming full extended-protocol parity.
+Four client stacks drive pglite-socket cleanly: node-postgres (Cal.com/Rallly/NocoDB/**nostream**),
+Prisma native engine over libpq-style (Documenso), and PHP `pdo_pgsql`/libpq (PrivateBin). They
+share one trait: they use **UNNAMED** prepared statements (the empty-string statement name in the
+extended protocol), so nothing in the catalog collides when many connections share PGlite's single
+session. nostream specifically was run with **persistent pooled** knex/`pg` connections issuing
+parameterized extended-protocol queries — verified fine — so persistent connections per se are NOT
+the problem.
+
+**The wall is NAMED server-side prepared statements.** Rust's **`sqlx`** creates named statements
+`sqlx_s_1`, `sqlx_s_2`, … assuming each TCP connection owns a clean catalog namespace. pglite-socket
+multiplexes every connection onto ONE PGlite session and never resets prepared statements between
+connection lifecycles, so the second connection that prepares `sqlx_s_1` gets
+`42P05: prepared statement "sqlx_s_1" already exists` — the same failure sqlx has against pgBouncer
+in transaction-pooling mode. `max_conn=1` does **not** fix it (sqlx still opens a second connection
+while pipelining). This blocks **nostr-rs-relay** (the Rust relay) entirely.
+
+**Fix scope (assessed against `@electric-sql/pglite-socket@0.2.2` source):** it's a DEEP/architectural
+change, not a small patch. The socket layer frames messages only by length prefix and forwards each
+message as an opaque `Uint8Array` into `db.execProtocolRawStream` — it never decodes the message
+type or the statement-name field, so it cannot rewrite/mangle statement names without adding a real
+wire-protocol parser (a medium-to-large new component). The one "small patch" available — running
+`DISCARD ALL` on connection close at the `detach()`/`handleClose()` seam — is unsafe because the
+server tracks concurrent overlapping connections on the shared session, so clearing one connection's
+statements would nuke a peer's. True per-connection catalog isolation needs one PGlite session per
+connection (or a per-connection namespace), i.e. a change to the single-session model itself.
+→ **Tooling action:** screen apps for sqlx/named-prepared-statement drivers up front and reject them,
+the same way non-bundled extensions are screened (Limitation 1).
+
+## nostream (Node nostr relay) — VERIFIED, including a Redis sidecar
+
+nostream (`github.com/cameri/nostream` v3.0.0) runs on zeropg, verified by a real NIP-01 round-trip
+both **locally** and on a **live Cloud Run** multi-container service
+(`https://nostr-zeropg-71428757273.europe-west1.run.app`): publish a signed EVENT → `OK true`,
+open a REQ subscription → the event streams back + EOSE. Durability proven by forcing a cold restart
+(new revision `nostr-zeropg-00002-xlp`) that restored only from `gs://zeropg-experiments-euw1/cloudrun-nostr/`
+— the event published to the prior instance still served back over wss.
+
+- **DB**: knex + `pg`, UNNAMED statements → works (see Limitation 5). 29 knex `.js` migrations apply
+  over the wire (a `knex migrate:latest` step, not the SQL-folder migrate sidecar). Needs contrib
+  **`uuid_ossp`** (`CREATE EXTENSION "uuid-ossp" … version "1.1"`) and **`btree_gin`** (the
+  kind/tags/created_at GIN index) — both bundled.
+- **Redis is mandatory, not optional.** It's on the EVENT hot path (rate limiter + dedup cache via
+  `messageHandlerFactory`→`getCache()`/`rateLimiterFactory`). It is NOT used for cross-worker event
+  fan-out — that's done with Node **cluster IPC** (`worker.send`/`process.on('message')`), so
+  `WORKER_COUNT` does not remove the Redis need. The minimal viable story: run a small **valkey**
+  sidecar (`valkey/valkey:8-alpine`, `--save "" --appendonly no`) that scales WITH the instance, so
+  the whole service (app + zeropg-db + valkey) still scales to **zero as a unit** — not an always-on
+  external Redis. This is the first example here needing a *second* stateful sidecar.
+- **Boot gotcha**: nostream's settings watcher `fs.watch()`es `$NOSTR_CONFIG_DIR/settings.yaml` and
+  crashes if it's missing (its `createSettings` never actually writes it on a fresh dir). The app
+  image must seed `settings.yaml` from `resources/default-settings.yaml` before boot.
+
+Example: `examples/cloudrun/nostr/` (nostream-app built from source + nostr-db sidecar + valkey).
+
+## Limitation 6 — a verifier reaching the live wire
+
+For the prior 5 apps the DB write was read back from the wire directly. For a relay the wire is
+localhost-only inside the instance, so the write is verified two ways instead: (a) the protocol
+round-trip (REQ returns the just-published event over wss), and (b) GCS durability — the WAL segment
+timestamps advance past the publish time and a cold-restart instance restores and re-serves the event.
 
 ## Testability grades (how hard for an AI to verify, 1-10)
 
@@ -128,6 +182,7 @@ Worth a dedicated test before claiming full extended-protocol parity.
 | PrivateBin | 9 | no auth at all; paste round-trip; stored blob is opaque ciphertext (verify by row existence) |
 | Cal.com | 8 | email+password signup writes the row before email verification; heavy boot |
 | Documenso | 8 | email+password signup writes before verification; requires drawing/typing a signature pad |
+| nostream | 9 | no auth gate; sign+publish an EVENT over ws (nostr-tools), assert REQ streams it back; wait for the AUTH challenge before the first publish or the relay drops the racing frame |
 
 All four reached a real DB write with **no human-only step** (no OAuth, no emailed code). Apps
 that gate the first DB write behind OAuth or an emailed verification code are the ones to skip
