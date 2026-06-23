@@ -1,0 +1,84 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: cocoon-pds-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"        # single writer on the GCS datadir
+        autoscaling.knative.dev/minScale: "0"        # scale to zero
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"   # keep CPU while warm so the WAL-ship timer runs
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'  # cocoon waits for db /healthz
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # cocoon PDS, ingress container (serves Cloud Run port)
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/cocoon-pds-keyed:latest
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            - name: COCOON_ADDR
+              value: ":8080"
+            - name: COCOON_DB_TYPE
+              value: "postgres"
+            # simple_protocol => pgx uses the simple protocol: no named server-side
+            # prepared statements, so no 42P05 on the shared single-session zeropg wire.
+            - name: COCOON_DATABASE_URL
+              value: "postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable&default_query_exec_mode=simple_protocol"
+            - name: COCOON_ROTATION_KEY_PATH
+              value: "/keys/rotation.key"
+            - name: COCOON_JWK_PATH
+              value: "/keys/jwk.key"
+            - name: COCOON_CONTACT_EMAIL
+              value: "admin@forest-ai.org"
+            # No relays => the boot requestCrawl is a no-op; cocoon does NOT hold an
+            # outbound firehose connection, so nothing keeps the instance warm.
+            - name: COCOON_RELAYS
+              value: ""
+            - name: COCOON_ADMIN_PASSWORD
+              value: "cocoon-admin-pw"
+            - name: COCOON_SESSION_SECRET
+              value: "cloudrun-cocoon-session-secret-0123456789"
+            - name: COCOON_REQUIRE_INVITE
+              value: "false"
+            # COCOON_DID / COCOON_HOSTNAME are injected at deploy time once the
+            # Cloud Run URL is known (see deploy notes); the did:plc account works
+            # regardless of hostname.
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+        - name: db                                    # zeropg sidecar: GCS-backed Postgres on localhost:5432
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/zeropg-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-pds"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: PORT
+              value: "8081"
+            - name: APP_LABEL
+              value: "cocoon-pds"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 40                      # allow up to ~2min for first restore
+  traffic:
+    - percent: 100
+      latestRevision: true
