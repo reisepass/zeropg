@@ -107,6 +107,11 @@ export interface BackupTarget {
 
 export interface ZeroPGOptions {
   store: BlobStore
+  /** PGlite contrib/extension modules to load, e.g. `{ citext, pgcrypto }` from
+   * `@electric-sql/pglite/contrib/*`. Required for schemas that use those types
+   * (a real Prisma app like Rallly needs citext + pgcrypto). Passed to
+   * `PGlite.create({ extensions })` on every datadir open. */
+  extensions?: Record<string, unknown>
   /** Stable writer identity. Default: hostname:pid. */
   holder?: string
   /** Lease TTL ms. Default 30s. */
@@ -295,8 +300,11 @@ export class ZeroPG {
    * no walFlushLsn to resume shipping from). */
   private forceCompactNext = false
 
+  private extensions?: Record<string, unknown>
+
   private constructor(opts: ZeroPGOptions) {
     this.store = opts.store
+    this.extensions = opts.extensions
     this.noLease = opts.noLease ?? false
     this.durability = opts.durability ?? (opts.relaxedDurability ? 'interval' : 'strict')
     this.leaseTtlMs = opts.leaseTtlMs ?? 30_000
@@ -449,7 +457,7 @@ export class ZeroPG {
           this.dataDir,
         )
       }
-      this.pg = await PGlite.create({ dataDir: this.dataDir })
+      this.pg = await PGlite.create({ dataDir: this.dataDir, extensions: this.extensions as never })
       await this.pg.waitReady
       this.bootTimings.pgliteCreateMs = performance.now() - tPg
       await this.ensureWalConfig()
@@ -499,7 +507,7 @@ export class ZeroPG {
     )
     this.bootTimings.restoreMs = performance.now() - tRestore
     const tPg = performance.now()
-    this.pg = await PGlite.create({ dataDir: this.dataDir })
+    this.pg = await PGlite.create({ dataDir: this.dataDir, extensions: this.extensions as never })
     await this.pg.waitReady
     this.bootTimings.pgliteCreateMs = performance.now() - tPg
     await this.ensureWalConfig()
@@ -716,7 +724,7 @@ export class ZeroPG {
       const walcMismatch = walcApplied && liveWalc !== this.walCompression
       if (fpwMismatch || walcMismatch) {
         await this.pg.close()
-        this.pg = await PGlite.create({ dataDir: this.dataDir })
+        this.pg = await PGlite.create({ dataDir: this.dataDir, extensions: this.extensions as never })
         await this.pg.waitReady
       }
     } catch {

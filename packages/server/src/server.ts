@@ -34,6 +34,9 @@ export type BootPhase = 'init' | 'restoring' | 'wire' | 'postgrest' | 'ready' | 
 
 export interface ZeroPGServerOptions {
   store: BlobStore
+  /** PGlite contrib extension modules to load (e.g. `{ citext, pgcrypto }` from
+   * `@electric-sql/pglite/contrib/*`). Forwarded to ZeroPG/PGlite. */
+  extensions?: Record<string, unknown>
   /** Public HTTP port (control face + /rest proxy). Default 8080 / $PORT. */
   port?: number
   /** Local Postgres wire-protocol port. Default 5432. */
@@ -140,6 +143,7 @@ export class ZeroPGServer {
         leaseTtlMs: o.leaseTtlMs ?? 60_000,
         acquireTimeoutMs: o.acquireTimeoutMs ?? 90_000,
         seedSnapshot: o.seedSnapshot,
+        extensions: o.extensions,
       })
       this.bootTimings.restoreMs = performance.now() - t0
       this.log('db-open', { restoreMs: Math.round(this.bootTimings.restoreMs), boot: this.db.bootTimings })

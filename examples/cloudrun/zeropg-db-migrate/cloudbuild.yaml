@@ -1,0 +1,4 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build','-t','${_IMAGE}','--build-arg','MIG_GIT=${_MIG_GIT}','--build-arg','MIG_REF=${_MIG_REF}','--build-arg','MIG_PATH=${_MIG_PATH}','.']
+images: ['${_IMAGE}']

@@ -1,0 +1,73 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: rallly-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"
+        autoscaling.knative.dev/minScale: "0"
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # Rallly (official image, unmodified)
+          image: docker.io/lukevella/rallly:latest
+          ports:
+            - name: http1
+              containerPort: 3000
+          # The ONLY startup change: drop `prisma migrate deploy` (the db sidecar
+          # owns migrations); export AUTH_URL and start the server.
+          command: ["sh", "-c"]
+          args: ["export AUTH_URL=$NEXT_PUBLIC_BASE_URL; exec node apps/web/server.js"]
+          env:
+            - name: DATABASE_URL
+              value: "postgres://postgres:postgres@127.0.0.1:5432/rallly"
+            - name: SECRET_PASSWORD
+              value: "zeropg_cloudrun_demo_secret_min_32_chars"
+            - name: NEXT_PUBLIC_BASE_URL
+              value: "https://rallly-zeropg-71428757273.europe-west1.run.app"
+            - name: SUPPORT_EMAIL
+              value: "support@example.com"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+        - name: db                                    # migration-capable zeropg sidecar
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/rallly-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-rallly"
+            - name: ZEROPG_EXTENSIONS
+              value: "citext,pgcrypto"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: ZEROPG_CONTROL_PORT
+              value: "8081"
+            - name: READY_PORT
+              value: "8082"
+            - name: APP_LABEL
+              value: "rallly"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /
+              port: 8082                              # 200 only AFTER migrations applied
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 60
+  traffic:
+    - percent: 100
+      latestRevision: true

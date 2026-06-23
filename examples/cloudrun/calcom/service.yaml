@@ -1,0 +1,93 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: calcom-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"
+        autoscaling.knative.dev/minScale: "0"
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # Cal.com (official image, unmodified)
+          image: docker.io/calcom/cal.com:latest
+          ports:
+            - name: http1
+              containerPort: 3000
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              scripts/replace-placeholder.sh "$BUILT_NEXT_PUBLIC_WEBAPP_URL" "$NEXT_PUBLIC_WEBAPP_URL" || true
+              scripts/wait-for-it.sh "$DATABASE_HOST" -- echo "database is up"
+              npx ts-node --transpile-only /calcom/scripts/seed-app-store.ts || echo "seed-app-store skipped"
+              exec yarn start
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://postgres:postgres@127.0.0.1:5432/calendso"
+            - name: DATABASE_DIRECT_URL
+              value: "postgresql://postgres:postgres@127.0.0.1:5432/calendso"
+            - name: DATABASE_HOST
+              value: "127.0.0.1:5432"
+            - name: NEXT_PUBLIC_WEBAPP_URL
+              value: "https://calcom-zeropg-71428757273.europe-west1.run.app"
+            - name: NEXTAUTH_URL
+              value: "https://calcom-zeropg-71428757273.europe-west1.run.app"
+            - name: NEXTAUTH_SECRET
+              value: "zeropg_cloudrun_nextauth_secret_min_32_chars"
+            - name: CALENDSO_ENCRYPTION_KEY
+              value: "zeropg_cloudrun_encryption_key_32"
+            - name: NODE_ENV
+              value: "production"
+            - name: CALCOM_TELEMETRY_DISABLED
+              value: "1"
+            - name: NEXT_PUBLIC_DISABLE_SIGNUP
+              value: "false"
+          resources:
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          startupProbe:
+            tcpSocket:
+              port: 3000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 40                      # heavy Next.js boot + app-store seed
+        - name: db
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/calcom-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-calcom"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: ZEROPG_CONTROL_PORT
+              value: "8081"
+            - name: READY_PORT
+              value: "8082"
+            - name: APP_LABEL
+              value: "calcom"
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /
+              port: 8082
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 120                     # 588 migrations on first boot
+  traffic:
+    - percent: 100
+      latestRevision: true

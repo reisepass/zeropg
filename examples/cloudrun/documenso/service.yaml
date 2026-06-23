@@ -1,0 +1,90 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: documenso-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"
+        autoscaling.knative.dev/minScale: "0"
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # Documenso (official image, unmodified)
+          image: docker.io/documenso/documenso:v2.13.0
+          ports:
+            - name: http1
+              containerPort: 3000
+          workingDir: /app/apps/remix
+          command: ["sh", "-c"]
+          args: ["exec node build/server/main.js"]    # stock start minus `prisma migrate deploy`
+          env:
+            - name: NEXT_PRIVATE_DATABASE_URL
+              value: "postgres://postgres:postgres@127.0.0.1:5432/documenso?sslmode=disable&connection_limit=1"
+            - name: NEXT_PRIVATE_DIRECT_DATABASE_URL
+              value: "postgres://postgres:postgres@127.0.0.1:5432/documenso?sslmode=disable&connection_limit=1"
+            - name: NEXTAUTH_SECRET
+              value: "zeropg_cloudrun_nextauth_secret_min_32_abcdef"
+            - name: NEXT_PRIVATE_ENCRYPTION_KEY
+              value: "zeropg_cloudrun_encryption_key_min_32_abcdef"
+            - name: NEXT_PRIVATE_ENCRYPTION_SECONDARY_KEY
+              value: "zeropg_cloudrun_encryption_secondary_32_abcdef"
+            - name: NEXT_PUBLIC_WEBAPP_URL
+              value: "https://documenso-zeropg-71428757273.europe-west1.run.app"
+            - name: NEXT_PRIVATE_INTERNAL_WEBAPP_URL
+              value: "http://localhost:3000"
+            - name: NEXT_PUBLIC_UPLOAD_TRANSPORT
+              value: "database"
+            - name: NEXT_PRIVATE_SMTP_TRANSPORT
+              value: "smtp-auth"
+            - name: NEXT_PRIVATE_SMTP_HOST
+              value: "localhost"
+            - name: NEXT_PRIVATE_SMTP_PORT
+              value: "2500"
+            - name: NEXT_PRIVATE_SMTP_FROM_NAME
+              value: "Documenso on zeropg"
+            - name: NEXT_PRIVATE_SMTP_FROM_ADDRESS
+              value: "noreply@example.com"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+        - name: db
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/documenso-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-documenso"
+            - name: ZEROPG_EXTENSIONS
+              value: "pgcrypto,pg_trgm"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: ZEROPG_CONTROL_PORT
+              value: "8081"
+            - name: READY_PORT
+              value: "8082"
+            - name: APP_LABEL
+              value: "documenso"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /
+              port: 8082
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 80                      # 162 migrations on first boot
+  traffic:
+    - percent: 100
+      latestRevision: true
