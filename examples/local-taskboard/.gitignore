@@ -1,0 +1,5 @@
+*.pgdata*
+.pgdata*
+*.zeropg.lock
+node_modules
+generated

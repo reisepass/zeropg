@@ -1,0 +1,13 @@
+{
+  "name": "zeropg-local-taskboard",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "A real task-board web app on a local zeropg Postgres, runnable on Drizzle OR Prisma (DB_ORM).",
+  "scripts": {
+    "generate": "prisma generate",
+    "start": "tsx src/server.ts",
+    "start:prisma": "DB_ORM=prisma tsx src/server.ts",
+    "verify": "tsx test/verify.mjs"
+  }
+}
