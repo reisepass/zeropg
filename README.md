@@ -32,6 +32,24 @@ Each page tells you whether it was served cold (instance woke from zero and rest
 
 Numbers from 20 forced cold starts per size on Cloud Run (1 vCPU + startup boost, europe-west1, same-region GCS), end-to-end from the client. The split: ~2s container start (the platform's floor — it dominates for small DBs), restore pipeline scaling with size (1.3s @ 10MB → 9.1s @ 500MB), and ~0.7s PGlite open regardless of size. Memory floor: the 500MB database runs even in a 1GiB container (datadir on tmpfs ~535MB + ~430MB RSS — tight but 5/5 stable); 2GiB is the comfortable tier, and 4GiB changes nothing because restore is bandwidth-bound, not memory-bound.
 
+## Run a real app on it (unmodified Postgres apps, scale-to-zero, DB in GCS)
+
+zeropg isn't just a storage demo — **real, unmodified open-source apps run on it** with only a Docker/config change, no source patch. Each swaps its `postgres:` service for a tiny `zeropg-db` sidecar (PGlite + the Postgres wire on `localhost`, durable home = a GCS bucket) and points its connection string at it. On Cloud Run they scale to zero; the database lives entirely in GCS and survives instance death.
+
+| app | replaces | live (scale-to-zero, DB in GCS) | source |
+|---|---|---|---|
+| **PrivateBin** | pastebin | [privatebin-zeropg](https://privatebin-zeropg-71428757273.europe-west1.run.app) | [examples/cloudrun/privatebin](examples/cloudrun/privatebin) |
+| **NocoDB** | Airtable | [nocodb-zeropg](https://nocodb-zeropg-71428757273.europe-west1.run.app) | [examples/cloudrun/nocodb](examples/cloudrun/nocodb) |
+| Cal.com · Documenso · Rallly | Calendly · DocuSign · Doodle | proven locally; rolling to Cloud Run | [examples/](examples/) |
+
+**The only change per app** (the app image is the official one, untouched):
+
+1. Replace the `postgres:` service with the **`zeropg-db` sidecar** ([examples/cloudrun/zeropg-db](examples/cloudrun/zeropg-db) — ~30 lines: `ZeroPGServer` over a GCS bucket, Postgres wire on `127.0.0.1:5432`).
+2. Point the app's `DATABASE_URL` / DB config at `127.0.0.1:5432`.
+3. If the app runs `prisma migrate deploy` at startup, let the sidecar own migrations and skip that one line (Prisma's native schema engine can't drive single-session PGlite; runtime queries are fine).
+
+Verified live: a PrivateBin paste and a NocoDB signup, each written through the wire and **shipped to GCS**, then re-read on a *fresh* instance that restored from GCS in ~5.5s — durability across scale-to-zero. Full compatibility findings (5 apps, 880 migrations, what works vs. which contrib extension each needs): [docs/POSTGRES-APP-COMPAT.md](docs/POSTGRES-APP-COMPAT.md).
+
 ## How a database with no server works
 
 ```
