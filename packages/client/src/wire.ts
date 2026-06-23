@@ -50,6 +50,11 @@ export interface ServeWireOptions {
   maxConnections?: number
   /** Lock acquire timeout for the datadir (ms). Default 10s. */
   acquireTimeoutMs?: number
+  /** PGlite contrib/extension modules to load into the engine, e.g.
+   * `{ citext, pgcrypto }` from `@electric-sql/pglite/contrib/*`. Required for
+   * schemas that use those types (a real Prisma app like Rallly needs citext +
+   * pgcrypto). Passed straight to `PGlite.create({ extensions })`. */
+  extensions?: Record<string, unknown>
   /** The PGlite build already takes its own datadir lock (the fork) — skip the
    * wrapper lock so the two don't fight over `<datadir>.lock`. See
    * {@link ConnectOptions.nativeDatadirLock}. Also honored via
@@ -95,13 +100,13 @@ export async function serveWire(opts: ServeWireOptions = {}): Promise<WireServer
       ? null
       : await acquireDatadirLock(abs, { acquireTimeoutMs: opts.acquireTimeoutMs })
     try {
-      pglite = await PGlite.create({ dataDir: abs })
+      pglite = await PGlite.create({ dataDir: abs, extensions: opts.extensions as never })
     } catch (e) {
       if (lock) await lock.release()
       throw e
     }
   } else {
-    pglite = await PGlite.create()
+    pglite = await PGlite.create({ extensions: opts.extensions as never })
   }
 
   const PGLiteSocketServer = await loadSocketServer()

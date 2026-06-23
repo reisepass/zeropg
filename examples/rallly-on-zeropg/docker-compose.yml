@@ -1,0 +1,50 @@
+# Rallly (a real, unmodified Prisma app) running on zeropg instead of Postgres.
+# Compared to Rallly's own self-hosting compose, the ONLY changes are:
+#   1. the `postgres:18-alpine` service is replaced by the `zeropg-db` service
+#   2. the app's startup skips `prisma migrate deploy` (zeropg-db owns migrations)
+# No Rallly source code is patched.
+
+services:
+  zeropg-db:
+    build: ./zeropg-db
+    restart: unless-stopped
+    volumes:
+      - zeropg-data:/data
+    ports:
+      - "5450:5432" # optional, for poking with psql from the host
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('net').connect(5432,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rallly:
+    image: lukevella/rallly:latest
+    restart: unless-stopped
+    depends_on:
+      zeropg-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      # Point Rallly's Prisma adapter at zeropg-db instead of Postgres.
+      - DATABASE_URL=postgres://postgres:postgres@zeropg-db:5432/rallly
+      - SECRET_PASSWORD=zeropg_demo_secret_password_min_32_chars
+      - NEXT_PUBLIC_BASE_URL=http://localhost:3000
+      - SUPPORT_EMAIL=support@example.com
+      - REGISTRATION_ENABLED=true
+      - EMAIL_LOGIN_ENABLED=true
+    # The ONLY startup change: drop `prisma migrate deploy` (its native schema
+    # engine can't drive single-session PGlite; zeropg-db applies migrations
+    # in-process). Everything else is Rallly's stock startup.
+    command:
+      - sh
+      - -c
+      - export AUTH_URL=$$NEXT_PUBLIC_BASE_URL; exec node apps/web/server.js
+
+volumes:
+  zeropg-data:
