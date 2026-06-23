@@ -81,6 +81,8 @@ spec:
               value: "8082"
             - name: APP_LABEL
               value: "nostream"
+            - name: ZEROPG_RESTART_NONCE
+              value: "1"                              # bump to force a cold restart (restore-from-GCS test)
           resources:
             limits:
               cpu: "1"
