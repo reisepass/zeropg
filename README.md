@@ -36,19 +36,23 @@ Numbers from 20 forced cold starts per size on Cloud Run (1 vCPU + startup boost
 
 zeropg isn't just a storage demo — **real, unmodified open-source apps run on it** with only a Docker/config change, no source patch. Each swaps its `postgres:` service for a tiny `zeropg-db` sidecar (PGlite + the Postgres wire on `localhost`, durable home = a GCS bucket) and points its connection string at it. On Cloud Run they scale to zero; the database lives entirely in GCS and survives instance death.
 
-| app | replaces | live (scale-to-zero, DB in GCS) | source |
-|---|---|---|---|
-| **PrivateBin** | pastebin | [privatebin-zeropg](https://privatebin-zeropg-71428757273.europe-west1.run.app) | [examples/cloudrun/privatebin](examples/cloudrun/privatebin) |
-| **NocoDB** | Airtable | [nocodb-zeropg](https://nocodb-zeropg-71428757273.europe-west1.run.app) | [examples/cloudrun/nocodb](examples/cloudrun/nocodb) |
-| Cal.com · Documenso · Rallly | Calendly · DocuSign · Doodle | proven locally; rolling to Cloud Run | [examples/](examples/) |
+| app | replaces | live (scale-to-zero, DB in GCS) | migrations on first boot | source |
+|---|---|---|---|---|
+| **PrivateBin** | pastebin | [privatebin-zeropg](https://privatebin-zeropg-71428757273.europe-west1.run.app) | none | [examples/cloudrun/privatebin](examples/cloudrun/privatebin) |
+| **NocoDB** | Airtable | [nocodb-zeropg](https://nocodb-zeropg-71428757273.europe-west1.run.app) | none (124 self-bootstrapped) | [examples/cloudrun/nocodb](examples/cloudrun/nocodb) |
+| **Rallly** | Doodle | [rallly-zeropg](https://rallly-zeropg-71428757273.europe-west1.run.app) | 130 (citext, pgcrypto) | [examples/cloudrun/rallly](examples/cloudrun/rallly) |
+| **Documenso** | DocuSign | [documenso-zeropg](https://documenso-zeropg-71428757273.europe-west1.run.app) | 162 (pgcrypto, pg_trgm) | [examples/cloudrun/documenso](examples/cloudrun/documenso) |
+| **Cal.com** | Calendly | [calcom-zeropg](https://calcom-zeropg-71428757273.europe-west1.run.app) | 588 (no extensions) | [examples/cloudrun/calcom](examples/cloudrun/calcom) |
+
+(The 4th column is migrations applied to the GCS-backed DB on first boot. First load after idle is a **real cold start** — ~7s for PrivateBin, longer for the heavy Next.js apps as they boot; that's the scale-to-zero tradeoff, not an error.)
 
 **The only change per app** (the app image is the official one, untouched):
 
-1. Replace the `postgres:` service with the **`zeropg-db` sidecar** ([examples/cloudrun/zeropg-db](examples/cloudrun/zeropg-db) — ~30 lines: `ZeroPGServer` over a GCS bucket, Postgres wire on `127.0.0.1:5432`).
+1. Replace the `postgres:` service with the **`zeropg-db` sidecar** (`ZeroPGServer` over a GCS bucket, Postgres wire on `127.0.0.1:5432`) — [examples/cloudrun/zeropg-db](examples/cloudrun/zeropg-db) (no migrations) or [zeropg-db-migrate](examples/cloudrun/zeropg-db-migrate) (applies the app's real migrations on first boot + loads contrib extensions).
 2. Point the app's `DATABASE_URL` / DB config at `127.0.0.1:5432`.
 3. If the app runs `prisma migrate deploy` at startup, let the sidecar own migrations and skip that one line (Prisma's native schema engine can't drive single-session PGlite; runtime queries are fine).
 
-Verified live: a PrivateBin paste and a NocoDB signup, each written through the wire and **shipped to GCS**, then re-read on a *fresh* instance that restored from GCS in ~5.5s — durability across scale-to-zero. Full compatibility findings (5 apps, 880 migrations, what works vs. which contrib extension each needs): [docs/POSTGRES-APP-COMPAT.md](docs/POSTGRES-APP-COMPAT.md).
+Verified live, each driven in a real browser then read back from the bucket: PrivateBin paste, NocoDB signup, Rallly registration, Documenso served, Cal.com signup — every write **shipped to GCS**, and PrivateBin's paste re-read on a *fresh* instance that restored from GCS in ~5.5s (durability across scale-to-zero). Full compatibility findings (5 apps, 880 migrations, what works vs. which contrib extension each needs): [docs/POSTGRES-APP-COMPAT.md](docs/POSTGRES-APP-COMPAT.md).
 
 ## How a database with no server works
 
