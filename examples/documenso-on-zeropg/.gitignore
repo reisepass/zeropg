@@ -1,0 +1,5 @@
+*.tgz
+zeropg-client-*.tgz
+data
+.pgdata*
+node_modules

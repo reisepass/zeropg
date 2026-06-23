@@ -1,0 +1,44 @@
+# NocoDB (a real, unmodified Airtable-alternative) running on zeropg instead of
+# a managed Postgres for its METADATA database.
+# Compared to NocoDB's own self-hosting compose, the ONLY changes are:
+#   1. the `postgres:16` service is replaced by the `zeropg-db` service
+#   2. NC_DB points at zeropg-db instead of Postgres
+# No NocoDB source code is patched — it self-migrates its metadata schema over
+# the wire on first boot, exactly as it would against any fresh Postgres.
+
+services:
+  zeropg-db:
+    build: ./zeropg-db
+    restart: unless-stopped
+    volumes:
+      - nocodb-zeropg-data:/data
+    ports:
+      - "5463:5432" # optional, for poking with psql from the host
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('net').connect(5432,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  nocodb:
+    image: nocodb/nocodb:latest
+    restart: unless-stopped
+    depends_on:
+      zeropg-db:
+        condition: service_healthy
+    ports:
+      - "3103:8080"
+    environment:
+      # Point NocoDB's metadata DB (Knex) at zeropg-db instead of Postgres.
+      # The `d=` database name is cosmetic on PGlite (one fixed database), but
+      # NocoDB requires it in the NC_DB connection string.
+      - NC_DB=pg://zeropg-db:5432?u=postgres&p=postgres&d=postgres
+      - NC_PUBLIC_URL=http://localhost:3103
+      - NC_DISABLE_TELE=true
+
+volumes:
+  nocodb-zeropg-data:

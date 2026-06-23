@@ -1,0 +1,71 @@
+# Cal.com (a real, unmodified Prisma app) running on zeropg instead of Postgres.
+# Compared to Cal.com's own self-hosting compose, the ONLY changes are:
+#   1. the `postgres` service is replaced by the `zeropg-db` service
+#   2. the app's startup skips `prisma migrate deploy` (zeropg-db owns migrations)
+# No Cal.com source code is patched. The official prebuilt image is used as-is.
+#
+# Unique to this example (so it can run alongside other *-on-zeropg stacks):
+#   project name `cal-zeropg`, host ports app=3101 / zeropg-db=5461, volume cal-zeropg-data.
+
+name: cal-zeropg
+
+services:
+  zeropg-db:
+    build: ./zeropg-db
+    platform: linux/amd64
+    restart: unless-stopped
+    volumes:
+      - cal-zeropg-data:/data
+    ports:
+      - "5461:5432" # for poking with psql / a pg client from the host
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('net').connect(5432,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  calcom:
+    image: calcom/cal.com:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      zeropg-db:
+        condition: service_healthy
+    ports:
+      - "3101:3000"
+    environment:
+      # Point Cal.com's Prisma adapter (@prisma/adapter-pg) at zeropg-db.
+      - DATABASE_URL=postgresql://postgres:postgres@zeropg-db:5432/calendso
+      - DATABASE_DIRECT_URL=postgresql://postgres:postgres@zeropg-db:5432/calendso
+      - DATABASE_HOST=zeropg-db:5432
+      - NEXT_PUBLIC_WEBAPP_URL=http://localhost:3101
+      - NEXTAUTH_URL=http://localhost:3101
+      - NEXTAUTH_SECRET=zeropg_demo_nextauth_secret_min_32_chars_long
+      - CALENDSO_ENCRYPTION_KEY=zeropg_demo_encryption_key_32ch
+      - NODE_ENV=production
+      - CALCOM_TELEMETRY_DISABLED=1
+      # Self-hosted signup path (email+password). Email verification is a
+      # feature flag that is OFF by default, so the user row is written without
+      # any emailed code; no OAuth, no Turnstile (no secret set).
+      - NEXT_PUBLIC_DISABLE_SIGNUP=false
+    # The ONLY startup change vs. Cal.com's stock scripts/start.sh: drop the
+    # `prisma migrate deploy` line (its native schema engine can't drive
+    # single-session PGlite; zeropg-db applies the real migrations in-process).
+    # Everything else from start.sh is kept verbatim: the URL placeholder
+    # replacement, the wait-for-db, the app-store seed, then `yarn start`.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        scripts/replace-placeholder.sh "$$BUILT_NEXT_PUBLIC_WEBAPP_URL" "$$NEXT_PUBLIC_WEBAPP_URL" || true
+        scripts/wait-for-it.sh "$$DATABASE_HOST" -- echo "database is up"
+        npx ts-node --transpile-only /calcom/scripts/seed-app-store.ts || echo "seed-app-store skipped/failed (non-fatal)"
+        exec yarn start
+
+volumes:
+  cal-zeropg-data:

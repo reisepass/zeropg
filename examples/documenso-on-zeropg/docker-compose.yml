@@ -1,0 +1,75 @@
+# Documenso (a real, unmodified Prisma app) running on zeropg instead of Postgres.
+# Compared to Documenso's own self-hosting compose (docker/production/compose.yml),
+# the ONLY changes are:
+#   1. the `postgres:15` service is replaced by the `zeropg-db` service
+#   2. the app's startup skips `prisma migrate deploy` (zeropg-db owns migrations)
+# No Documenso source code is patched. The app runs its stock official image.
+
+name: documenso-zeropg
+
+services:
+  zeropg-db:
+    build: ./zeropg-db
+    restart: unless-stopped
+    volumes:
+      - documenso-zeropg-data:/data
+    ports:
+      - "5462:5432" # optional, for poking with psql / a pg client from the host
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('net').connect(5432,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  documenso:
+    image: documenso/documenso:v2.13.0
+    restart: unless-stopped
+    depends_on:
+      zeropg-db:
+        condition: service_healthy
+    ports:
+      - "3102:3000"
+    environment:
+      - PORT=3000
+      # Point Documenso's Prisma client at zeropg-db instead of Postgres.
+      # The native Prisma query engine needs `sslmode=disable` (it defaults to
+      # `prefer` and sends an SSLRequest pglite-socket won't negotiate) and the
+      # `postgres` user. DATABASE_URL == DIRECT so getDatabaseUrl() leaves the URL
+      # untouched (no pgbouncer flag injected).
+      - NEXT_PRIVATE_DATABASE_URL=postgres://postgres:postgres@zeropg-db:5432/documenso?sslmode=disable&connection_limit=1
+      - NEXT_PRIVATE_DIRECT_DATABASE_URL=postgres://postgres:postgres@zeropg-db:5432/documenso?sslmode=disable&connection_limit=1
+      # App secrets / encryption (stock self-host requirements).
+      - NEXTAUTH_SECRET=zeropg_demo_nextauth_secret_min_32_chars_abcdef
+      - NEXT_PRIVATE_ENCRYPTION_KEY=zeropg_demo_encryption_key_min_32_chars_abcdef
+      - NEXT_PRIVATE_ENCRYPTION_SECONDARY_KEY=zeropg_demo_encryption_secondary_key_32_abcdef
+      - NEXT_PUBLIC_WEBAPP_URL=http://localhost:3102
+      - NEXT_PRIVATE_INTERNAL_WEBAPP_URL=http://localhost:3000
+      # Keep document bytes OUT of Postgres so PG stays tiny (per zeropg target).
+      # `database` would also work for the signup proof, but s3 is the intended
+      # production config. We leave it as `database` here because the signup write
+      # we verify does not upload a document, and no S3 is provisioned in this demo.
+      - NEXT_PUBLIC_UPLOAD_TRANSPORT=database
+      # SMTP is a required var in Documenso's compose (`:?err`). No real SMTP is
+      # configured, so verification emails won't send — but the user/org rows are
+      # written to zeropg at signup BEFORE any email, which is what this proves.
+      - NEXT_PRIVATE_SMTP_TRANSPORT=smtp-auth
+      - NEXT_PRIVATE_SMTP_HOST=localhost
+      - NEXT_PRIVATE_SMTP_PORT=2500
+      - NEXT_PRIVATE_SMTP_FROM_NAME=Documenso on zeropg
+      - NEXT_PRIVATE_SMTP_FROM_ADDRESS=noreply@example.com
+    # The ONLY startup change: drop `prisma migrate deploy` (its native schema
+    # engine can't drive single-session PGlite; zeropg-db applies migrations
+    # in-process). Everything else is Documenso's stock startup: run the same
+    # server entrypoint the stock start.sh runs.
+    command:
+      - sh
+      - -c
+      - exec node build/server/main.js
+    working_dir: /app/apps/remix
+
+volumes:
+  documenso-zeropg-data:

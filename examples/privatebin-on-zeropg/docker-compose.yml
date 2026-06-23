@@ -1,0 +1,45 @@
+# PrivateBin (the real, unmodified official image) running on zeropg instead of a
+# Postgres server. Compared to PrivateBin's stock docker run, the ONLY changes are:
+#   1. a `zeropg-db` service replaces a `postgres:*` server
+#   2. conf.php points PrivateBin's Database (PDO) model at zeropg-db
+# No PrivateBin source is patched; the app image is the official one, untouched.
+
+name: privatebin-zeropg
+
+services:
+  zeropg-db:
+    build: ./zeropg-db
+    restart: unless-stopped
+    volumes:
+      - privatebin-zeropg-data:/data
+    ports:
+      - "5464:5432" # host access for verification with a `pg` client
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('net').connect(5432,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  privatebin:
+    image: privatebin/nginx-fpm-alpine:latest
+    restart: unless-stopped
+    read_only: true
+    depends_on:
+      zeropg-db:
+        condition: service_healthy
+    ports:
+      - "3104:8080" # PrivateBin nginx listens on 8080 inside the container
+    volumes:
+      # Inject the zeropg-pointed config. This file is the ONLY non-default thing.
+      - ./cfg/conf.php:/srv/cfg/conf.php:ro
+    tmpfs:
+      - /tmp:nodev,noexec,mode=1777
+      - /run:nodev,exec,mode=1777
+      - /srv/data:mode=1777
+
+volumes:
+  privatebin-zeropg-data:

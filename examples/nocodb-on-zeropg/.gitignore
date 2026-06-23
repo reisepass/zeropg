@@ -1,0 +1,9 @@
+zeropg-db/zeropg-client-*.tgz
+test/*.png
+test/probe*.mjs
+test/shot.mjs
+*.tgz
+zeropg-client-*.tgz
+data
+.pgdata*
+node_modules
