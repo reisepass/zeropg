@@ -22,10 +22,20 @@ matrix** — what breaks, why, and what the tooling should do about it.
 Across **880 linear migrations** (Rallly+Cal.com+Documenso) plus **two runtime-bootstrapped
 schemas** (NocoDB's 124-table Knex bootstrap, PrivateBin's PDO auto-create), **nothing
 hit a Postgres feature PGlite lacks.** Every blocker reduced to a missing *bundled*
-contrib extension. Advanced features that all worked on PGlite over the wire:
-PL/pgSQL functions, triggers, views, `GIN`-on-array indexes, `CREATE INDEX CONCURRENTLY`,
-composite-PK rewrites, multi-schema (NocoDB creates a Postgres schema per base),
-`gin_trgm_ops` (pg_trgm), `gen_random_uuid()` (pgcrypto), `citext` columns.
+contrib extension.
+
+### Confirmed-working Postgres surface (empirically verified — each checked to take effect, not just "no error")
+
+- **PL/pgSQL functions** (Cal.com: 30, one called returned the right value), **triggers** (28), **views** (3).
+- **GIN indexes**: built-in `array_ops` on `text[]` (Cal.com), and **`gin_trgm_ops` fully functional** (Documenso) — `EXPLAIN` shows a real *Bitmap Index Scan + Recheck*, `similarity()` returns correct ranked results. Not a seqscan-fallback / no-op.
+- **`CREATE INDEX CONCURRENTLY`** (Cal.com) — works; degenerates to a normal `CREATE INDEX` (single connection).
+- **Transactions**: `BEGIN ISOLATION LEVEL SERIALIZABLE`, `SAVEPOINT` + `ROLLBACK TO SAVEPOINT` (NocoDB, count correct after partial rollback).
+- **Advisory locks** `pg_try_advisory_lock`/`pg_advisory_unlock` (NocoDB — Knex's migration-lock primitive); **`LISTEN`/`NOTIFY`** (NocoDB).
+- **Multi-schema**: `CREATE SCHEMA` + `serial`/sequences, table-per-schema (NocoDB = a Postgres schema per base).
+- **In-place data migrations**: `DROP PRIMARY KEY` + composite-PK rewrite, `ALTER TABLE ADD COLUMN`, batched `INSERT ... SELECT` (NocoDB).
+- **contrib functions/types**: `gen_random_uuid()`, `gen_random_bytes()` (pgcrypto), `citext`, plus enums, CHECK constraints, partial indexes, generated defaults.
+
+`server_version` reports **18.3** (PGlite 0.5 tracks current Postgres).
 
 ## Limitation 1 — extensions are the ONLY recurring blocker (and they're bundled)
 
@@ -35,11 +45,24 @@ creates never exists, and every later migration referencing that table fails too
 "110 of 130 failed" is really "2 extensions missing." Cal.com (588) and NocoDB (124)
 needed **zero** extensions, so a large mature schema can be totally vanilla.
 
+**The exact mechanism (precise):** the error is `extension "X" is not available`, thrown at
+the `CREATE EXTENSION` line. `CREATE EXTENSION IF NOT EXISTS X` does **not** lazy-load — PGlite
+only has an extension if its JS contrib module was passed to `PGlite.create({ extensions })`,
+which injects the WASM bundle; then `CREATE EXTENSION IF NOT EXISTS` is a clean no-op. So the
+fix is always "preload the module," never an SQL change.
+
 → **Tooling action:** auto-detect required extensions by scanning the migration / bootstrap
 SQL — `CREATE EXTENSION`, and type/function tells (`citext` columns → citext;
-`gen_random_uuid()`/`digest()` → pgcrypto; `gin_trgm_ops`/`similarity()` → pg_trgm) — and
-load them automatically, so no human has to pre-list them. Today they're passed manually
-to `serveWire({ extensions })`.
+`gen_random_uuid()`/`gen_random_bytes()` → pgcrypto; `gin_trgm_ops`/`similarity()` → pg_trgm) —
+and wire the matching `@electric-sql/pglite/contrib/*` module into `serveWire({ extensions })`
+automatically. Today they're passed manually.
+
+**The hard wall (what PGlite genuinely can't do):** an extension PGlite does **not** ship.
+The bundled contrib set includes `citext`, `pgcrypto`, `pg_trgm`, `fuzzystrmatch`, and more
+(`@electric-sql/pglite/contrib/*`). `pgvector` is a separate package (`@electric-sql/pglite/vector`).
+**PostGIS and FDWs have no path** — an app whose schema requires them cannot run on PGlite.
+That is the one category to screen for and reject up front (it's also why Twenty/Khoj from the
+self-host research are pgvector-gated, and why a GIS app is out).
 
 ## Limitation 2 — Prisma's NATIVE query engine works at runtime (correction to a prior belief)
 
@@ -62,12 +85,16 @@ the repo HEAD. This guarantees schema ↔ client agreement.
 
 ## Limitation 4 — single-session serialization: slow, not broken (+ a read-after-write timing gotcha)
 
-PGlite is one session; pglite-socket serializes all connections onto it. Nothing broke —
-NocoDB's concurrent 124-table bootstrap and Cal.com's 104-row app-store seed both completed —
-but **writes can land seconds behind the HTTP response under load**: an independent verifier
-querying immediately after a signup `201` got `NOT FOUND`, because the row's commit was
-queued behind the app's boot/seed work on the single session. The rows did land (confirmed
-seconds later). → **Tooling/test action:** read-after-write verification must **poll/retry**,
+PGlite is one session; pglite-socket serializes all connections onto it. **Measured** (NocoDB):
+a `pg` Pool(max:10) firing 20 overlapping `pg_sleep(0.05)` queries completed in **1033ms** =
+exactly 20×50ms serialized — one writer, no deadlock, no "too many connections", no dropped
+query. So concurrency is a **throughput** limit, never a correctness one: NocoDB's concurrent
+124-table bootstrap and Cal.com's 104-row app-store seed both completed clean.
+
+The one operational gotcha: **writes can land seconds behind the HTTP response under load.** An
+independent verifier querying immediately after a signup `201` got `NOT FOUND`, because the
+row's commit was queued behind the app's boot/seed work on the single session; it appeared
+seconds later. → **Tooling/test action:** read-after-write verification must **poll/retry**,
 not assume immediate visibility, on a busy single-session instance. Concurrent transactional
 throughput is the real ceiling and the signal to graduate to a managed Postgres.
 
