@@ -57,12 +57,25 @@ SQL — `CREATE EXTENSION`, and type/function tells (`citext` columns → citext
 and wire the matching `@electric-sql/pglite/contrib/*` module into `serveWire({ extensions })`
 automatically. Today they're passed manually.
 
+**How extensions are delivered:** electric-sql pre-compiles each Postgres contrib extension to
+WASM and ships it as a `.tar.gz` bundle inside `@electric-sql/pglite/dist/`. The
+`@electric-sql/pglite/contrib/<name>` import is a one-line pointer to that bundle; passing it to
+`PGlite.create({ extensions })` extracts it into PGlite's in-WASM filesystem so `CREATE EXTENSION`
+can load it. **~33 contrib extensions ship** today: `amcheck, auto_explain, bloom, btree_gin,
+btree_gist, citext, cube, dict_int, dict_xsyn, earthdistance, file_fdw, fuzzystrmatch, hstore,
+intarray, isn, lo, ltree, pageinspect, pg_buffercache, pg_freespacemap, pg_stat_statements,
+pg_surgery, pg_trgm, pg_visibility, pg_walinspect, pgcrypto, postgres_fdw, seg, tablefunc, tcn,
+tsm_system_rows, tsm_system_time, unaccent, uuid_ossp`.
+
 **The hard wall (what PGlite genuinely can't do):** an extension PGlite does **not** ship.
-The bundled contrib set includes `citext`, `pgcrypto`, `pg_trgm`, `fuzzystrmatch`, and more
-(`@electric-sql/pglite/contrib/*`). `pgvector` is a separate package (`@electric-sql/pglite/vector`).
-**PostGIS and FDWs have no path** — an app whose schema requires them cannot run on PGlite.
-That is the one category to screen for and reject up front (it's also why Twenty/Khoj from the
-self-host research are pgvector-gated, and why a GIS app is out).
+- **`pgvector`** — not in contrib; it's a separate package (`@electric-sql/pglite/vector`), so it IS
+  reachable but you wire it differently. (This is why Twenty/Khoj from the self-host research are
+  pgvector-gated rather than impossible.)
+- **PostGIS** — genuinely not shipped (a large non-contrib extension). A GIS app is out.
+- **FDWs** — `file_fdw` and `postgres_fdw` bundles DO ship, so `CREATE EXTENSION` loads; whether they
+  *function* (file/network access) from the WASM sandbox is untested here — don't assume.
+- Anything needing a non-bundled extension → screen for `CREATE EXTENSION <x>` where `<x>` isn't in
+  the list above, and reject up front.
 
 ## Limitation 2 — Prisma's NATIVE query engine works at runtime (correction to a prior belief)
 
