@@ -1,5 +1,7 @@
 # zeropg
 
+## Not production ready, currently a set of experiments to find the most monimal way to run production postgres with scale to zero. 
+
 **Postgres that costs zero when nobody's using it.**
 
 A real Postgres database ([PGlite](https://pglite.dev) — Postgres compiled to WASM) running on scale-to-zero compute, with the data living in an object-storage bucket. No database server, no volume, no managed-Postgres bill. A single writer is enforced by a lease built on the bucket's own conditional writes, with fencing tokens making zombie writers physically unable to commit. When the app outgrows it, graduation to an always-on Postgres is `pg_dump | pg_restore` — it was real Postgres all along.
