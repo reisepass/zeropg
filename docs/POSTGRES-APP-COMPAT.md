@@ -14,6 +14,7 @@ matrix** — what breaks, why, and what the tooling should do about it.
 | Documenso | Prisma **native query engine** | 162 migrations | 52 | `pgcrypto`, `pg_trgm` | user + personal org graph |
 | NocoDB | Knex (`pg`) | **runtime self-bootstrap** | 124 | **none** | metadata + per-base data row |
 | PrivateBin | PHP `pdo_pgsql` (libpq) | **runtime self-create** | 3 | **none** | encrypted paste row |
+| cocoon (AT Proto PDS) | GORM + **`pgx` v5** (`?default_query_exec_mode=simple_protocol`) | **runtime AutoMigrate** | 13 | **none** | account row + record + repo MST blocks |
 
 (Cap was rejected before building — it is MySQL/PlanetScale, a dialect zeropg can't serve.)
 
@@ -129,6 +130,29 @@ connection lifecycles, so the second connection that prepares `sqlx_s_1` gets
 in transaction-pooling mode. `max_conn=1` does **not** fix it (sqlx still opens a second connection
 while pipelining). This blocks **nostr-rs-relay** (the Rust relay) entirely.
 
+**The blocker generalizes beyond sqlx — it's ANY named-prepared-statement driver.** Confirmed against
+**rsky-pds** (the Rust AT Proto PDS), which uses **Diesel** (not sqlx): Diesel also caches named
+server-side prepared statements per connection (`PQprepare`/`PQexecPrepared`) with no
+connection-string escape hatch, and is a long-standing pgBouncer-transaction-mode breaker
+(diesel-rs/diesel#1028). So the real screen is "does the driver name its server-side prepares and
+persist them across the pooled connection lifecycle," not "is it sqlx."
+
+**Escape hatch for `pgx` (Go) — DSN-only, no app patch.** Go's **`jackc/pgx` v5** defaults to
+`QueryExecModeCacheStatement`, which auto-prepares + caches with SHA-256-named statements → it WOULD
+collide. But unlike sqlx/Diesel, pgx exposes the mode as a **connection-string parameter**:
+`...?default_query_exec_mode=simple_protocol` makes pgx use the **simple protocol** (params sent as
+text, no server-side prepare at all), which is the pgx/Go equivalent of node-postgres's unnamed-
+statement path. As long as the app opens its pool from a DSN string (GORM's `postgres.Open(dsn)`,
+`pgxpool.New(ctx, dsn)`, `sql.Open("pgx", dsn)`), this is a **zero-code-change** fix. **Verified end
+to end with cocoon** (GORM+pgx AT Proto PDS): with `default_query_exec_mode=simple_protocol`, GORM
+AutoMigrate created all 13 tables over the wire with no `42P05`, and a full createAccount →
+createRecord → getRecord round-trip + the row/MST-blocks landing in the DB all worked, locally and on
+live Cloud Run. No GORM query misbehaved under the simple protocol (no type-inference/text-encoding
+edge cases observed across DDL, bytea/CBOR writes, composite-PK upserts, and indexed reads). Caveat:
+simple_protocol sends parameters as text, so an app with unusual explicit-type expectations could in
+principle differ — trust the round-trip, not the boot. Same idea applies to `pgx`'s `exec` mode and
+to GORM's `PreferSimpleProtocol: true` for apps that build the driver config in code.
+
 **Fix scope (assessed against `@electric-sql/pglite-socket@0.2.2` source):** it's a DEEP/architectural
 change, not a small patch. The socket layer frames messages only by length prefix and forwards each
 message as an opaque `Uint8Array` into `db.execProtocolRawStream` — it never decodes the message
@@ -138,8 +162,10 @@ wire-protocol parser (a medium-to-large new component). The one "small patch" av
 server tracks concurrent overlapping connections on the shared session, so clearing one connection's
 statements would nuke a peer's. True per-connection catalog isolation needs one PGlite session per
 connection (or a per-connection namespace), i.e. a change to the single-session model itself.
-→ **Tooling action:** screen apps for sqlx/named-prepared-statement drivers up front and reject them,
-the same way non-bundled extensions are screened (Limitation 1).
+→ **Tooling action:** screen apps for named-prepared-statement drivers up front. Reject the ones with
+no escape hatch (Rust **sqlx**, Rust **Diesel**) the same way non-bundled extensions are screened
+(Limitation 1). For **`pgx`/Go** apps, don't reject — inject `default_query_exec_mode=simple_protocol`
+into the DSN and let them through (verified with cocoon).
 
 ## nostream (Node nostr relay) — VERIFIED, including a Redis sidecar
 
@@ -183,6 +209,7 @@ timestamps advance past the publish time and a cold-restart instance restores an
 | Cal.com | 8 | email+password signup writes the row before email verification; heavy boot |
 | Documenso | 8 | email+password signup writes before verification; requires drawing/typing a signature pad |
 | nostream | 9 | no auth gate; sign+publish an EVENT over ws (nostr-tools), assert REQ streams it back; wait for the AUTH challenge before the first publish or the relay drops the racing frame |
+| cocoon (PDS) | 7 | invite-gated (or `COCOON_REQUIRE_INVITE=false`) email+password createAccount → createRecord → getRecord, all over plain XRPC HTTP, no OAuth/emailed code. The one external dep: account creation POSTs the genesis op to the hardcoded `https://plc.directory` (needs outbound internet, registers a real `did:plc`); reads/writes of existing accounts are fully self-contained |
 
 All four reached a real DB write with **no human-only step** (no OAuth, no emailed code). Apps
 that gate the first DB write behind OAuth or an emailed verification code are the ones to skip

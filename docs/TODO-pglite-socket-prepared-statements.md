@@ -6,6 +6,20 @@ apps, e.g. nostr-rs-relay), and anything else that breaks under pgBouncer
 transaction-pooling mode. This is the single highest-value pglite-socket
 enhancement surfaced by the "real apps on zeropg" exercise.
 
+> **The blocker is not sqlx-specific — it's any named-prepared-statement driver.**
+> Confirmed against **Diesel** too (Rust **rsky-pds** AT Proto PDS): Diesel caches
+> named prepares per connection with no URL escape hatch, same `42P05`, same
+> pgBouncer-txn-mode breakage. So this fix would unblock sqlx **and** Diesel (and
+> any future driver in that class).
+>
+> **`pgx` (Go) does NOT need this fix — it has a DSN-only escape hatch.** Set
+> `?default_query_exec_mode=simple_protocol` on the connection string and pgx uses
+> the simple protocol (no server-side prepares), the pgx equivalent of node-postgres's
+> unnamed path. **Verified end to end with cocoon** (GORM+pgx PDS) locally and on
+> Cloud Run. So the screen is: **Go/pgx apps → set `default_query_exec_mode=simple_protocol`,
+> let them through; Rust sqlx/Diesel → no URL escape hatch → still blocked until this
+> fix lands.** See `docs/POSTGRES-APP-COMPAT.md` Limitation 5.
+
 ## The problem
 
 zeropg exposes PGlite over the Postgres wire via `@electric-sql/pglite-socket`'s
@@ -110,3 +124,7 @@ for completeness only.
 - Compatibility findings + the unnamed-vs-named boundary: `docs/POSTGRES-APP-COMPAT.md`.
 - Current Nostr-on-zeropg pivot (nostream / node-postgres, which sidesteps this):
   tracked by the background `nostr-agent`.
+- AT Proto PDS on zeropg: **cocoon** (Go/pgx) sidesteps this via
+  `default_query_exec_mode=simple_protocol` and is deployed
+  (`examples/cloudrun/pds/`); **rsky-pds** (Rust/Diesel) is blocked by exactly this
+  issue and waits on the fix above.
