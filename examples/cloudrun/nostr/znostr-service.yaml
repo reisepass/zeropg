@@ -1,0 +1,80 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: znostr-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"        # single writer on the GCS datadir
+        autoscaling.knative.dev/minScale: "0"        # scale to zero (app + db as a unit, NO redis)
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"   # keep CPU while warm so the WAL-ship timer runs
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'  # app waits for db /healthz
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # znostr-relay (our minimal NIP-01 relay)
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/znostr-relay:latest
+          ports:
+            - name: http1
+              containerPort: 8010
+          env:
+            - name: PORT
+              value: "8010"
+            - name: DB_HOST
+              value: "127.0.0.1"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: "postgres"
+            - name: DB_PASSWORD
+              value: "postgres"
+            - name: DB_NAME
+              value: "postgres"
+            - name: RELAY_NAME
+              value: "znostr-zeropg"
+            - name: RELAY_DESC
+              value: "Minimal NIP-01 relay on zeropg (PGlite + GCS), scale-to-zero, no Redis"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8010
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 40
+        - name: db                                    # basic zeropg sidecar (no migrations, no extensions)
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/zeropg-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-znostr"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: PORT
+              value: "8081"
+            - name: APP_LABEL
+              value: "znostr"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 40
+  traffic:
+    - percent: 100
+      latestRevision: true

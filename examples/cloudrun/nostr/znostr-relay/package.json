@@ -1,0 +1,15 @@
+{
+  "name": "znostr-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "relay.mjs",
+  "scripts": {
+    "start": "node relay.mjs"
+  },
+  "dependencies": {
+    "nostr-tools": "^2.10.0",
+    "pg": "^8.13.0",
+    "ws": "^8.18.0"
+  }
+}
