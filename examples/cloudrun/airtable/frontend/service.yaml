@@ -1,0 +1,42 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: airtable-frontend
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "2"        # static, stateless: can scale freely
+        autoscaling.knative.dev/minScale: "0"        # scale to zero too (boots near-instant)
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 200
+      timeoutSeconds: 60
+      containers:
+        - name: app
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/airtable-frontend:latest
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            # The backend's public URL. config.js exposes this to the browser, and
+            # the entrypoint fires a server-side wake at it on instance start so the
+            # backend cold-starts in parallel.
+            - name: AIRTABLE_API
+              value: "https://airtable-zeropg-71428757273.europe-west1.run.app"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 20
+  traffic:
+    - percent: 100
+      latestRevision: true

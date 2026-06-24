@@ -1,0 +1,71 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: airtable-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"        # single writer on the GCS datadir
+        autoscaling.knative.dev/minScale: "0"        # scale to zero (app + db as a unit)
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"   # keep CPU while warm so the WAL-ship timer runs
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'  # app waits for db /healthz
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # airtable backend, ingress container
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/airtable-backend:latest
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            # pgx over the single-session zeropg wire. cache_describe => extended
+            # protocol with cached DESCRIBE but NO persisted named server-side
+            # prepared statements, so no 42P05 collision on the shared session.
+            # NOT simple_protocol (mis-infers JSONB types). Pool is 4 in code
+            # (>1: a pool of 1 can deadlock); the wire serialises onto one PGlite
+            # session regardless.
+            - name: DATABASE_URL
+              value: "postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable&default_query_exec_mode=cache_describe"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 40
+        - name: db                                    # zeropg sidecar: GCS-backed Postgres on localhost:5432
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/zeropg-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-airtable"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: PORT
+              value: "8081"                           # control/health face (/healthz)
+            - name: APP_LABEL
+              value: "airtable"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 60                      # allow up to ~3min for first initdb / restore
+  traffic:
+    - percent: 100
+      latestRevision: true
