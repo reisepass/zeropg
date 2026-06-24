@@ -1,0 +1,11 @@
+import { chromium } from 'playwright'
+const browser = await chromium.launch()
+const page = await browser.newPage()
+const resp = await page.goto('http://localhost:3000/register', { waitUntil: 'networkidle', timeout: 30000 })
+console.log('GET /register ->', resp.status(), '-> url', page.url())
+await page.waitForTimeout(1200)
+const inputs = await page.locator('input').evaluateAll((els) => els.map((e) => ({ type: e.type, name: e.name, placeholder: e.placeholder })))
+const buttons = await page.locator('button').evaluateAll((els) => els.map((e) => e.innerText.trim()).filter(Boolean))
+console.log('inputs:', JSON.stringify(inputs))
+console.log('buttons:', JSON.stringify(buttons))
+await browser.close()

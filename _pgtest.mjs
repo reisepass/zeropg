@@ -1,0 +1,10 @@
+import pg from 'pg'
+const c = new pg.Client({ connectionString: 'postgres://postgres:postgres@127.0.0.1:5602/postgres?sslmode=disable' })
+await c.connect()
+const r = await c.query('select version()')
+console.log('OK:', r.rows[0].version.slice(0,40))
+await c.query('create table if not exists _smoke(id int primary key, v text)')
+await c.query('insert into _smoke(id,v) values (1,$1) on conflict (id) do update set v=excluded.v', ['hello'])
+const r2 = await c.query('select v from _smoke where id=1')
+console.log('roundtrip:', r2.rows[0].v)
+await c.end()

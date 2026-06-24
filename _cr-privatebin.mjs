@@ -1,0 +1,17 @@
+import { chromium } from 'playwright'
+const URL = 'https://privatebin-zeropg-4sowr32yyq-ew.a.run.app'
+const SECRET = 'zeropg-cloudrun-gcs-' + Math.floor(Math.random()*1e9)
+const b = await chromium.launch(); const p = await b.newPage()
+const fivexx = []; p.on('response', r => { if (r.status() >= 500) fivexx.push(r.status()+' '+r.url()) })
+await p.goto(URL + '/', { waitUntil:'networkidle', timeout:60000 })
+await p.locator('#message').fill(SECRET)
+await p.locator('#sendbutton, button:has-text("Create"), button:has-text("Send")').first().click()
+await p.waitForTimeout(3000)
+const pasteUrl = p.url()
+console.log('paste URL:', pasteUrl)
+const p2 = await b.newPage()
+await p2.goto(pasteUrl, { waitUntil:'networkidle', timeout:60000 })
+await p2.waitForTimeout(2500)
+const shown = await p2.locator('#prettyprint, #cleartext, pre').first().innerText().catch(()=> '')
+console.log('round-trip match:', shown.includes(SECRET), '| 5xx:', fivexx.length?fivexx:'none')
+await b.close()
