@@ -105,7 +105,7 @@ spec:
             - name: ZEROPG_BUCKET
               value: "zeropg-experiments-euw1"
             - name: ZEROPG_PREFIX
-              value: "cloudrun-supabase-v4"
+              value: "cloudrun-supabase-v5"
             - name: ZEROPG_WIRE_PORT
               value: "5432"
             - name: ZEROPG_REST_PORT

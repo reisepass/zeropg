@@ -64,9 +64,6 @@ REVOKE ALL ON FUNCTION auth.jwt(), auth.uid(), auth.role(), auth.email() FROM PU
 GRANT EXECUTE ON FUNCTION auth.jwt(), auth.uid(), auth.role(), auth.email()
   TO anon, authenticated, service_role;
 
--- ---- pgvector (extension preloaded by the sidecar) ----
-CREATE EXTENSION IF NOT EXISTS vector;
-
 -- ---- demo table: todos, RLS scoped to the owner ----
 CREATE TABLE IF NOT EXISTS public.todos (
   id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -91,31 +88,3 @@ REVOKE ALL ON public.todos FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.todos TO authenticated;
 -- anon may read the table but RLS (user_id = auth.uid() = NULL for anon) hides all rows.
 GRANT SELECT ON public.todos TO anon;
-
--- ---- demo vector table: documents with embeddings ----
-CREATE TABLE IF NOT EXISTS public.documents (
-  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  user_id     uuid NOT NULL DEFAULT auth.uid(),
-  content     text NOT NULL,
-  embedding   vector(3)             -- tiny dim for the demo; real apps use 384/768/1536
-);
-ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.documents FORCE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS documents_own ON public.documents;
-CREATE POLICY documents_own ON public.documents
-  FOR ALL USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
-REVOKE ALL ON public.documents FROM PUBLIC;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.documents TO authenticated;
-
--- match_documents RPC: ANN search scoped to the caller's rows (RLS still applies
--- inside the function because it is SECURITY INVOKER).
-CREATE OR REPLACE FUNCTION public.match_documents(query_embedding vector(3), match_count int DEFAULT 5)
-  RETURNS TABLE (id bigint, content text, distance double precision)
-  LANGUAGE sql STABLE SECURITY INVOKER SET search_path = public, pg_catalog AS $$
-  SELECT d.id, d.content, (d.embedding <-> query_embedding) AS distance
-  FROM public.documents d
-  ORDER BY d.embedding <-> query_embedding
-  LIMIT match_count
-$$;
-REVOKE ALL ON FUNCTION public.match_documents(vector, int) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.match_documents(vector, int) TO authenticated;

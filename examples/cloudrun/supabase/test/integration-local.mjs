@@ -47,7 +47,7 @@ function waitHttp(url, pred, ms = 90_000) {
 }
 
 try {
-  // 1. db sidecar (host node) with bootstrap + pgvector + in-process PostgREST.
+  // 1. db sidecar (host node) with bootstrap + in-process PostgREST.
   const dbEnv = {
     ...process.env,
     ZEROPG_BUCKET: process.env.ZEROPG_BUCKET || 'zeropg-experiments-euw1',

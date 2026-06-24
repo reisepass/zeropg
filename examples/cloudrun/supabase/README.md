@@ -1,7 +1,7 @@
 # Stripped Supabase on zeropg (scale-to-zero)
 
 Self-hosted Supabase minus the heavy bits — **PostgREST** (REST API) + **GoTrue**
-(auth) + **pgvector** — on a Postgres that **scales to zero**. One Cloud Run
+(auth) — on a Postgres that **scales to zero**. One Cloud Run
 multi-container service: when no one is using it, everything (app + auth + db)
 sleeps and costs nothing; the first request wakes it and PGlite restores the
 database from a GCS bucket. Realtime subscriptions and edge functions are
@@ -14,7 +14,7 @@ Live: **https://supabase-scale-to-zero.0rs.org**
   browser ── HTTPS ──► │  app (ingress)            auth                  db (sidecar)        │
   supabase-js          │  Node proxy + shell  ──►  GoTrue  ──┐    ┌──►  PGlite + wire :5432  │
                        │  /rest/v1 ─► db /rest                ├─wire┤    + PostgREST (in-proc)│
-                       │  /auth/v1 ─► auth                    │     │    + pgvector           │
+                       │  /auth/v1 ─► auth                    │     │    (no extensions)      │
                        └─────────────────────────────────────┴─────┴── GCS bucket (durable) ─┘
 ```
 
@@ -50,7 +50,7 @@ kill-switch test under `test/`):
 
 | path | what |
 |---|---|
-| `zeropg-db/` | the DB sidecar: GCS-backed PGlite + wire + in-process PostgREST + pgvector. `bootstrap.sql` = Supabase roles, `auth` schema + `auth.uid()/role()/jwt()` helpers, RLS demo tables (`todos`, `documents` + `match_documents` RPC). |
+| `zeropg-db/` | the DB sidecar: GCS-backed PGlite + wire + in-process PostgREST (no Postgres extensions needed). `bootstrap.sql` = Supabase roles, `auth` schema + `auth.uid()/role()/jwt()` helpers, RLS demo table `todos`. |
 | `auth/` | GoTrue (`supabase/gotrue`) + a thin entrypoint that waits for the wire + `auth` schema. |
 | `frontend/` | tiny Node ingress: serves the shell instantly, mints the anon key, Kong-style reverse proxy so **stock supabase-js works unmodified**, `/api/wake` + `/api/ready`. `index.html` drives supabase-js: signup → login → RLS todos. |
 | `service.yaml` | the multi-container Cloud Run service. |
@@ -88,12 +88,13 @@ gcloud builds submit frontend  --tag $AR/supabase-frontend:latest
 gcloud run services replace service.yaml --region europe-west1
 ```
 
-> **NOTE — the `zeropg-db` image vendors local-built `@zeropg/*` tarballs** (`vendor/`)
-> rather than pulling them from npm. The published `@zeropg/objectstore-fs@0.0.1`
-> predates the PGlite `extensions` forwarding fix, so `CREATE EXTENSION vector` fails
-> with `extension "vector" is not available` on a ZeroPGServer datadir. Re-pack from
-> the monorepo if the packages change:
-> `cd zeropg-db/vendor && for p in blobstore lease objectstore-fs server; do npm pack ../../../../../packages/$p; done`
+> **NOTE — no Postgres extensions.** GoTrue + PostgREST + the demo schema were
+> verified to work with zero extensions, so the `zeropg-db` image installs the
+> PUBLISHED `@zeropg/*` packages from npm. (A `package.json` + `vendor/` with
+> local-built tarballs is kept on disk for reference: the published
+> `@zeropg/objectstore-fs@0.0.1` drops the PGlite `extensions` option, so if you
+> ever DO need `CREATE EXTENSION`, switch the Dockerfile back to the vendored
+> tarballs — see the `.dockerignore` note.)
 
 Email: the demo uses `GOTRUE_MAILER_AUTOCONFIRM=true` (no mail server). For real
 magic-link / email-confirm, set it false and configure the GoTrue SMTP-API / Resend

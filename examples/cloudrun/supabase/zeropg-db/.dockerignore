@@ -1,0 +1,6 @@
+# This stack needs no Postgres extensions, so the image installs the published
+# @zeropg/* packages directly. The vendored local tarballs + package.json are no
+# longer used (kept on disk only for reference / future extension needs); exclude
+# them from the build context.
+vendor
+package.json
