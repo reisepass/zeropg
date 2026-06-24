@@ -1,0 +1,13 @@
+{
+  "name": "zeropg-httpbin-app",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

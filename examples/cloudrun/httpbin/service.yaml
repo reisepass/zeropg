@@ -1,0 +1,83 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: httpbin-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"        # single writer on the GCS datadir
+        autoscaling.knative.dev/minScale: "0"        # scale to zero (app + db as a unit)
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"   # keep CPU while warm so the WAL-ship timer runs
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'  # app waits for db /healthz
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # the httpbin + requestbin BACKEND (ingress)
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/httpbin-app:latest
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            # PORT is injected by Cloud Run for the ingress container (== containerPort 8080).
+            - name: PGHOST
+              value: "127.0.0.1"
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: "postgres"
+            - name: PGPASSWORD
+              value: "postgres"
+            - name: PGDATABASE
+              value: "postgres"
+            # TTL / size bounding (cleanup rides on requests, no background worker)
+            - name: TTL_HOURS
+              value: "24"
+            - name: MAX_PER_BIN
+              value: "200"
+            - name: MAX_BODY_BYTES
+              value: "262144"
+            - name: SWEEP_EVERY_MS
+              value: "300000"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 40
+        - name: db                                    # zeropg sidecar: GCS-backed Postgres on localhost:5432
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/zeropg-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-httpbin"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: PORT
+              value: "8081"                           # control/health face (/healthz)
+            - name: APP_LABEL
+              value: "httpbin"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 60                      # allow up to ~3min for first initdb / restore
+  traffic:
+    - percent: 100
+      latestRevision: true

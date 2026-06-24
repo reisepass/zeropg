@@ -1,0 +1,41 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: httpbin-ui-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "2"        # stateless static UI; no single-writer constraint
+        autoscaling.knative.dev/minScale: "0"        # scale to zero (cold-starts in well under 1s)
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 200
+      timeoutSeconds: 60
+      containers:
+        - name: ui                                    # the SPLIT FRONTEND: no DB, renders instantly
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/httpbin-ui:latest
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            # PORT is injected by Cloud Run for the ingress container (== containerPort 8080).
+            # Public backend base URL (the capture + echo service). The browser
+            # talks to it directly; the page wakes it client-side on load.
+            - name: BACKEND_URL
+              value: "https://httpbin-scale-to-zero.0rs.org"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 20
+  traffic:
+    - percent: 100
+      latestRevision: true
