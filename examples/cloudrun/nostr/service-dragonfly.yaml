@@ -95,6 +95,11 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 60
         - name: redis                                 # Dragonfly sidecar (Redis-protocol), scales WITH the instance
+          # Verified cold start (autoscaling wake, blob-pglite/europe-west1):
+          #   Dragonfly: redis-ready ~0.64s, app serving ~14.2s, boot->HTTP200 14.51s
+          #   valkey:    redis-ready ~0.44s, app serving ~15.06s
+          # i.e. within noise; the db sidecar (GCS restore ~5s) + nostream app boot
+          # dominate, redis is never the long pole. Dragonfly is NOT slower to wake.
           # NOTE: Dragonfly is NOT on Docker Hub. Canonical images are
           # ghcr.io/dragonflydb/dragonfly and docker.dragonflydb.io/dragonflydb/dragonfly.
           # Mirrored into this project's Artifact Registry for a fast in-region pull.
