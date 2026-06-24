@@ -1,28 +1,26 @@
 #!/usr/bin/env bash
-# Multi-round cold-start harness for the scale-to-zero Next.js demos.
-# Each round hits the 3 apps cold; ~14min sleeps between rounds let instances
-# scale to zero so the next round is a real cold start. Appends every raw data
-# point to results/coldstart-apps.jsonl (don't-lose-info). Classify cold vs warm
-# in post: time_total >8s = cold, <2s = the instance hadn't scaled down yet.
+# Repeated cold-start harness for the live scale-to-zero app demos (calcom dropped).
+# Each round hits all apps cold; ~14min sleeps between rounds let instances scale to
+# zero so the next round is a genuine cold start. Every reading appends to
+# results/coldstart-apps.jsonl. Post-classify: time_total >8s = cold, <2s = was warm.
 RES=/Users/user/workspace/zeropg/results/coldstart-apps.jsonl
 declare -a APPS=(
-  "rallly|https://rallly-zeropg-71428757273.europe-west1.run.app|90"
-  "documenso|https://documenso-zeropg-71428757273.europe-west1.run.app|90"
-  "calcom|https://calcom-zeropg-71428757273.europe-west1.run.app|200"
+  "privatebin|https://privatebin-scale-to-zero.0rs.org|120"
+  "nocodb|https://nocodb-scale-to-zero.0rs.org|120"
+  "rallly|https://rallly-scale-to-zero.0rs.org|120"
+  "documenso|https://documenso-scale-to-zero.0rs.org|120"
+  "pds|https://pds-scale-to-zero.0rs.org|120"
 )
-hit(){ local app=$1 url=$2 mt=$3 rnd=$4
-  local out code t ts
+hit(){ local app=$1 url=$2 mt=$3 rnd=$4 out code t ts
   out=$(curl -o /dev/null -s -w "%{http_code} %{time_total}" --max-time "$mt" "$url" 2>/dev/null || echo "000 timeout")
   code=${out%% *}; t=${out##* }; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   echo "{\"ts\":\"$ts\",\"round\":$rnd,\"app\":\"$app\",\"http_code\":\"$code\",\"time_total_s\":$t}" >> "$RES"
-  echo "round$rnd $app -> code=$code t=${t}s"
 }
-# let the one-shot's warming scale back to zero before round 1
-sleep 840
-for rnd in 1 2 3; do
+sleep 840   # let current warmth scale to zero before round 1
+for rnd in 1 2 3 4; do
   for pair in "${APPS[@]}"; do
     IFS='|' read -r a u m <<< "$pair"; hit "$a" "$u" "$m" "$rnd"
   done
-  [ "$rnd" -lt 3 ] && sleep 840
+  [ "$rnd" -lt 4 ] && sleep 840
 done
-echo "## harness done"
+echo "## harness done $(date -u +%H:%M:%S)Z"
