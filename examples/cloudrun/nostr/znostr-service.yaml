@@ -24,8 +24,7 @@ spec:
             - name: http1
               containerPort: 8010
           env:
-            - name: PORT
-              value: "8010"
+            # PORT is injected by Cloud Run (reserved) and matches containerPort 8010.
             - name: DB_HOST
               value: "127.0.0.1"
             - name: DB_PORT
@@ -40,6 +39,8 @@ spec:
               value: "znostr-zeropg"
             - name: RELAY_DESC
               value: "Minimal NIP-01 relay on zeropg (PGlite + GCS), scale-to-zero, no Redis"
+            - name: DEPLOY_NONCE
+              value: "3"
           resources:
             limits:
               cpu: "1"
