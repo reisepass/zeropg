@@ -42,8 +42,9 @@ zeropg isn't just a storage demo — **real, unmodified open-source apps run on 
 | **NocoDB** | Airtable | [nocodb-scale-to-zero.0rs.org](https://nocodb-scale-to-zero.0rs.org) | none (124 self-bootstrapped) | [examples/cloudrun/nocodb](examples/cloudrun/nocodb) |
 | **Rallly** | Doodle | [rallly-scale-to-zero.0rs.org](https://rallly-scale-to-zero.0rs.org) | 130 (citext, pgcrypto) | [examples/cloudrun/rallly](examples/cloudrun/rallly) |
 | **Documenso** | DocuSign | [documenso-scale-to-zero.0rs.org](https://documenso-scale-to-zero.0rs.org) | 162 (pgcrypto, pg_trgm) | [examples/cloudrun/documenso](examples/cloudrun/documenso) |
-| **Cal.com** | Calendly | [calcom-scale-to-zero.0rs.org](https://calcom-scale-to-zero.0rs.org) | 588 (no extensions) | [examples/cloudrun/calcom](examples/cloudrun/calcom) |
 | **cocoon** | Bluesky PDS | [pds-scale-to-zero.0rs.org](https://pds-scale-to-zero.0rs.org) | 13 (GORM auto-migrate, no extensions) | [examples/cloudrun/pds](examples/cloudrun/pds) |
+
+(Cal.com was demoed and ran, but **dropped from the live set** — its cold start exceeded ~120 s, the heavy Next.js monorepo + on-boot app-store seed make it a poor scale-to-zero showcase. Example code stays in [examples/cloudrun/calcom](examples/cloudrun/calcom) for reference.)
 
 (The 4th column is migrations applied to the GCS-backed DB on first boot. First load after idle is a **real cold start** — **cocoon is the fastest at ~5s**, ~7s for PrivateBin, longer for the heavy Next.js apps as they boot; that's the scale-to-zero tradeoff, not an error.)
 
