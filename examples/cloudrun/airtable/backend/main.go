@@ -6,10 +6,11 @@
 // in well under a second.
 //
 // Data model (rows-as-JSONB, deliberately NOT table-per-user-table):
-//   tbl(id, base_id, name, position, created_at)            -- a user "table"
-//   col(id, tbl_id, name, type, position, opts jsonb, ...)  -- a typed column
-//   rec(id, tbl_id, data jsonb, created_at, updated_at, version) -- a row; cell
-//                                                                  values keyed by col id
+//
+//	tbl(id, base_id, name, position, created_at)            -- a user "table"
+//	col(id, tbl_id, name, type, position, opts jsonb, ...)  -- a typed column
+//	rec(id, tbl_id, data jsonb, created_at, updated_at, version) -- a row; cell
+//	                                                               values keyed by col id
 //
 // Why JSONB-rows: it avoids runtime DDL entirely. On a single serialized session
 // every CREATE TABLE / ALTER TABLE a user triggers would be catalog churn with
@@ -30,6 +31,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +43,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -83,16 +86,23 @@ var validTypes = map[string]bool{
 // ---- small id generator (no external dep): time-ordered + random suffix ----
 
 var (
-	idMu  sync.Mutex
-	idSeq uint32
+	idMu   sync.Mutex
+	idSeq  uint32
+	idBoot = randHex() // per-process random suffix: avoids cross-restart/instance collisions
 )
+
+func randHex() string {
+	b := make([]byte, 3)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
 
 func newID(prefix string) string {
 	idMu.Lock()
 	idSeq++
 	s := idSeq
 	idMu.Unlock()
-	return fmt.Sprintf("%s_%011x%04x", prefix, time.Now().UnixMicro(), s&0xffff)
+	return fmt.Sprintf("%s_%011x%04x%s", prefix, time.Now().UnixMicro(), s&0xffff, idBoot)
 }
 
 func main() {
@@ -113,14 +123,18 @@ func main() {
 	cfg.MaxConnLifetime = 30 * time.Minute
 
 	// Retry pool+schema bring-up: the db sidecar's wire can lag its /healthz
-	// briefly on cold restore, and the first real query can fail once.
+	// briefly on cold restore, and the first real query can fail once. Close any
+	// pool whose probe fails so we don't leak it across retries.
 	for i := 0; i < 60; i++ {
-		pool, err = pgxpool.NewWithConfig(ctx, cfg)
-		if err == nil {
-			if _, err = pool.Exec(ctx, "SELECT 1"); err == nil {
+		p, e := pgxpool.NewWithConfig(ctx, cfg)
+		if e == nil {
+			if _, e = p.Exec(ctx, "SELECT 1"); e == nil {
+				pool, err = p, nil
 				break
 			}
+			p.Close()
 		}
+		err = e
 		log.Printf("[airtable] waiting for db wire (try %d): %v", i+1, err)
 		time.Sleep(1 * time.Second)
 	}
@@ -347,14 +361,17 @@ func handleColumn(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 405, errors.New("method not allowed"))
 		return
 	}
-	// Remove the column def and strip its key from every row's JSONB so no
-	// orphan cell data lingers.
+	// Strip the column's key from every row AND delete the def in ONE statement.
+	// A single CTE avoids a handler-level interleaving window on the serialized
+	// wire (a PATCH slipping between a separate UPDATE and DELETE).
 	ctx := r.Context()
-	if _, err := pool.Exec(ctx, `UPDATE rec SET data = data - $1 WHERE tbl_id = (SELECT tbl_id FROM col WHERE id=$1)`, colID); err != nil {
-		// non-fatal: still delete the def
-		log.Printf("[airtable] strip col data: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `DELETE FROM col WHERE id=$1`, colID); err != nil {
+	if _, err := pool.Exec(ctx, `
+		WITH target AS (SELECT id, tbl_id FROM col WHERE id = $1),
+		stripped AS (
+			UPDATE rec SET data = data - (SELECT id FROM target)
+			WHERE tbl_id = (SELECT tbl_id FROM target)
+		)
+		DELETE FROM col WHERE id = $1`, colID); err != nil {
 		httpErr(w, 500, err)
 		return
 	}
@@ -476,11 +493,19 @@ func handleRow(w http.ResponseWriter, r *http.Request) {
 			valJSON, _ := json.Marshal(clean[body.ColID])
 			// jsonb_set with an explicit text[] path and ::jsonb value. Casting
 			// both params explicitly avoids cache_describe type-inference issues.
+			// The EXISTS guard ensures a column deleted between validation and
+			// this UPDATE can't get an orphan value written.
 			err = pool.QueryRow(ctx,
 				`UPDATE rec SET data = jsonb_set(data, ARRAY[$2]::text[], $3::jsonb, true),
 				 updated_at = now(), version = version + 1
-				 WHERE id = $1 RETURNING data, version`,
+				 WHERE id = $1
+				   AND EXISTS (SELECT 1 FROM col WHERE col.id = $2 AND col.tbl_id = rec.tbl_id)
+				 RETURNING data, version`,
 				recID, body.ColID, string(valJSON)).Scan(&raw, &version)
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpErr(w, 404, errors.New("row or column not found"))
+				return
+			}
 			if err != nil {
 				httpErr(w, 500, err)
 				return
