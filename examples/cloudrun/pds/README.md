@@ -64,13 +64,29 @@ service references them via `valueFrom.secretKeyRef`; the Cloud Run runtime SA h
 ```
 PW=$(gcloud secrets versions access latest --secret cocoon-admin-password --project blob-pglite)
 curl -s -u "admin:$PW" -X POST -H 'content-type: application/json' \
-  https://cocoon-pds-zeropg-71428757273.europe-west1.run.app/xrpc/com.atproto.server.createInviteCode \
+  https://pds-scale-to-zero.0rs.org/xrpc/com.atproto.server.createInviteCode \
   -d '{"useCount":5}'
 ```
 
 The returned code is written to `INVITE-CODE.local.txt` (gitignored) for live
 testing - it is never committed. To verify the gate yourself, hit
 `com.atproto.server.describeServer` and check `inviteCodeRequired: true`.
+
+## Custom domain (single-hostname, free) + the handle-resolution tradeoff
+
+The PDS is served at **https://pds-scale-to-zero.0rs.org** via a free Cloud Run
+domain mapping (Google-managed cert, no load balancer). `COCOON_HOSTNAME` /
+`COCOON_DID` are set to that host, so `describeServer` advertises
+`did:web:pds-scale-to-zero.0rs.org` and `/.well-known/did.json` serves it.
+
+Because this is a **single hostname (no wildcard)**, the account and its `did:plc`
+are fully real and the PDS serves them, but network **handle resolution** for a
+subdomain handle (`<name>.pds-scale-to-zero.0rs.org`) needs that subdomain to
+actually resolve - i.e. a wildcard cert/DNS, which we deferred to keep this $0.
+Workarounds: resolve by `did:plc` directly, or add a one-off
+`_atproto.<name>.pds-scale-to-zero.0rs.org TXT "did=<did:plc>"` record per handle.
+Offering `<handle>.pds-...` handles generally is the one feature that needs the
+paid wildcard path (Cloudflare ACM or a GCP HTTPS load balancer).
 
 ## Cold start (the headline metric)
 
@@ -112,4 +128,4 @@ gcloud run services add-iam-policy-binding cocoon-pds-zeropg \
   --project blob-pglite --region europe-west1 --member=allUsers --role=roles/run.invoker
 ```
 
-Live URL: https://cocoon-pds-zeropg-71428757273.europe-west1.run.app
+Live URL: https://pds-scale-to-zero.0rs.org

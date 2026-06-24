@@ -61,14 +61,14 @@ spec:
             # createAccount with an empty inviteCode returns InvalidInviteCode.
             - name: COCOON_REQUIRE_INVITE
               value: "true"
-            # The Cloud Run URL is deterministic for this project:
-            # https://<service>-71428757273.europe-west1.run.app
-            # The served did:web document + availableUserDomains use this host; the
-            # account identity is a did:plc, so it works regardless of hostname.
+            # Public identity = the nice domain (Cloud Run domain mapping ->
+            # pds-scale-to-zero.0rs.org, Google-managed cert). did:web + the handle
+            # suffix (availableUserDomains) use this host. Existing accounts are
+            # did:plc, so they survive the hostname change.
             - name: COCOON_HOSTNAME
-              value: "cocoon-pds-zeropg-71428757273.europe-west1.run.app"
+              value: "pds-scale-to-zero.0rs.org"
             - name: COCOON_DID
-              value: "did:web:cocoon-pds-zeropg-71428757273.europe-west1.run.app"
+              value: "did:web:pds-scale-to-zero.0rs.org"
           resources:
             limits:
               cpu: "1"
