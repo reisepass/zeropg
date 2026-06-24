@@ -92,16 +92,39 @@ the UI; if the backend is still cold, the app retries shortly.
 
 ## Cold start (the headline metric)
 
-Measured on **real Cloud Run** with the clean-idle method (services left fully
-untouched ~22 min so the scale-to-zero idle timer fully expires, then hit once,
-timed):
+Measured on **real Cloud Run** from the boot timeline of a fresh
+scale-from-zero instance that restored the DB from GCS. (Note: the public
+`/wake` endpoint gets hit by internet scanners within ~2-3 min of going live,
+which kept re-warming the instance and defeated the simple "idle 22 min then
+curl once" timing — by the time the timed curl landed, a scanner had already
+warmed it. So the authoritative number below is read from the Cloud Run
+**instance-boot logs** of a genuine cold start, which is scanner-proof.)
+
+| phase (backend cold start)                               | cumulative |
+|----------------------------------------------------------|------------|
+| instance start + wake request arrives                    | 0.00s      |
+| -> zeropg-db sidecar up (GCS restore complete)           | ~1.2s      |
+| -> db `/healthz` startup probe ok                        | ~3.3s      |
+| -> app: schema ready + listening on :8080                | ~5.6s      |
+| -> app TCP startup probe ok / first `/wake` served       | **~8.1s**  |
+
+So **end-to-end backend cold start is ~8.1s** (request in -> served). The app's
+own boot-to-ready is ~5.6s; the remainder is Cloud Run's container-dependency
+gating (the app waits on the db sidecar's health, and the app's TCP startup
+probe only re-checks on its probe interval). The **frontend** is a separate
+near-instant static Go binary, so its shell renders immediately while this runs.
 
 | measurement                                              | time     |
 |----------------------------------------------------------|----------|
-| frontend `GET /` (tiny static Go binary, cold)           | _PENDING_ |
-| backend `GET /wake` (app + zeropg-db sidecar + GCS restore), cold | _PENDING_ |
-| backend `GET /wake`, warm (immediately after)            | _PENDING_ |
+| backend cold start (app + zeropg-db sidecar + GCS restore), real Cloud Run | **~8.1s** |
+| backend `/wake` warm (real Cloud Run)                    | ~0.005s  |
+| frontend `GET /` warm (real Cloud Run)                   | ~0.2s    |
 | backend binary boot-to-`/healthz`, local docker sanity   | ~0.13s   |
+
+This is **~3.5x faster than NocoDB (~28s)** — the whole point — and in the same
+band as the PrivateBin (~7s) and cocoon PDS (~5s) examples. The headline win:
+the **frontend shell is up in ~0.2s** and fires the wake, so the ~8s backend
+cold start is hidden behind user think-time rather than a spinner.
 
 ## Layout
 
