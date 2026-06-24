@@ -42,6 +42,27 @@ NocoDB (~28s) are "it also runs" proof, not the front-page wow.
 Action: get real forced-cold numbers for Rallly/Documenso/Cal.com (we have the live
 URLs), fill the table, then curate the README's featured list by speed.
 
+## Measured cold starts (repeated harness, 2026-06-24) — raw in `results/coldstart-apps.jsonl`
+
+Client-perceived cold start (curl time to first response on a scaled-to-zero instance),
+4 rounds, calcom dropped. **Method caveat:** 14-min round spacing turned out to be right at
+Cloud Run's scale-to-zero boundary, so after round 1 warmed the instances, later rounds often
+hit them still-warm (<2 s). So valid cold reps per app = 1–2, not 4. (To get clean 3–4 reps,
+re-run with ~20–25 min spacing or a no-traffic-tag force-cold.)
+
+| demo | valid cold reps | reading(s) | verdict |
+|---|---|---|---|
+| **PrivateBin** | 2 | ~5.0, ~5.2 s | **fast, consistent — headline** |
+| **cocoon (PDS)** | 0 this run (stayed warm; prior ~5 s) | 0.2–0.3 s all rounds | fast (prior), needs a fresh cold rep to confirm |
+| **Rallly** | 2 | 21.2 s, 35.6 s | slow + **high variance** (21→36 s) |
+| **NocoDB** | 2 | 34.0, 34.1 s | slow but consistent (~34 s) |
+| **Documenso** | 1 | **112 s** | **near-calcom territory** — drop candidate; confirm with more reps |
+
+Takeaways: PrivateBin (~5 s) is the clean fast headline. cocoon prior ~5 s still stands but wasn't
+re-confirmed (warm all run). Rallly ~21–36 s and NocoDB ~34 s are "it runs" secondary. **Documenso
+at 112 s (one rep) is in the same drop-zone as calcom (>120 s)** — needs confirmation, but if it
+holds it should be dropped or pinned `minScale:1` too.
+
 ## Deferred experiment: single image vs multi-container sidecars (cold-start A/B)
 
 Question raised: is the multi-container sidecar model (app + zeropg-db + Dragonfly,

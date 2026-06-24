@@ -1,2 +1,22 @@
 {"ts":"2026-06-24T11:29Z","round":0,"app":"rallly","http_code":"200","time_total_s":21.16,"note":"one-shot; warm re-hit 0.19s (valid cold)"}
 {"ts":"2026-06-24T11:29Z","round":0,"app":"documenso","http_code":"302","time_total_s":0.26,"note":"instance was warm - INVALID, redoing"}
+{"ts":"2026-06-24T11:59:35Z","round":1,"app":"privatebin","http_code":"200","time_total_s":5.156464}
+{"ts":"2026-06-24T12:00:09Z","round":1,"app":"nocodb","http_code":"200","time_total_s":33.978271}
+{"ts":"2026-06-24T12:00:45Z","round":1,"app":"rallly","http_code":"200","time_total_s":35.643278}
+{"ts":"2026-06-24T12:02:37Z","round":1,"app":"documenso","http_code":"302","time_total_s":112.183990}
+{"ts":"2026-06-24T12:02:37Z","round":1,"app":"pds","http_code":"200","time_total_s":0.215383}
+{"ts":"2026-06-24T12:16:42Z","round":2,"app":"privatebin","http_code":"200","time_total_s":4.961448}
+{"ts":"2026-06-24T12:17:17Z","round":2,"app":"nocodb","http_code":"200","time_total_s":34.131101}
+{"ts":"2026-06-24T12:17:17Z","round":2,"app":"rallly","http_code":"200","time_total_s":0.398531}
+{"ts":"2026-06-24T12:17:17Z","round":2,"app":"documenso","http_code":"302","time_total_s":0.283352}
+{"ts":"2026-06-24T12:17:18Z","round":2,"app":"pds","http_code":"200","time_total_s":0.210082}
+{"ts":"2026-06-24T12:31:18Z","round":3,"app":"privatebin","http_code":"200","time_total_s":0.312820}
+{"ts":"2026-06-24T12:31:18Z","round":3,"app":"nocodb","http_code":"200","time_total_s":0.338879}
+{"ts":"2026-06-24T12:31:19Z","round":3,"app":"rallly","http_code":"200","time_total_s":0.431989}
+{"ts":"2026-06-24T12:31:19Z","round":3,"app":"documenso","http_code":"302","time_total_s":0.254466}
+{"ts":"2026-06-24T12:31:19Z","round":3,"app":"pds","http_code":"200","time_total_s":0.300236}
+{"ts":"2026-06-24T12:45:20Z","round":4,"app":"privatebin","http_code":"200","time_total_s":0.320024}
+{"ts":"2026-06-24T12:45:20Z","round":4,"app":"nocodb","http_code":"200","time_total_s":0.256567}
+{"ts":"2026-06-24T12:45:21Z","round":4,"app":"rallly","http_code":"200","time_total_s":0.397193}
+{"ts":"2026-06-24T12:45:21Z","round":4,"app":"documenso","http_code":"302","time_total_s":0.347915}
+{"ts":"2026-06-24T12:45:21Z","round":4,"app":"pds","http_code":"200","time_total_s":0.296489}
