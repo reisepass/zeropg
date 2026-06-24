@@ -148,10 +148,23 @@ to end with cocoon** (GORM+pgx AT Proto PDS): with `default_query_exec_mode=simp
 AutoMigrate created all 13 tables over the wire with no `42P05`, and a full createAccount →
 createRecord → getRecord round-trip + the row/MST-blocks landing in the DB all worked, locally and on
 live Cloud Run. No GORM query misbehaved under the simple protocol (no type-inference/text-encoding
-edge cases observed across DDL, bytea/CBOR writes, composite-PK upserts, and indexed reads). Caveat:
-simple_protocol sends parameters as text, so an app with unusual explicit-type expectations could in
-principle differ — trust the round-trip, not the boot. Same idea applies to `pgx`'s `exec` mode and
-to GORM's `PreferSimpleProtocol: true` for apps that build the driver config in code.
+edge cases observed across DDL, bytea/CBOR writes, composite-PK upserts, and indexed reads).
+
+**CORRECTION (from webhookx): `simple_protocol` is NOT the right default — use `cache_describe`.**
+simple_protocol sends every parameter as **text with no type info**, so it breaks any app that hands
+pgx a `[]byte` for a typed column: webhookx's JSONB columns (its ORM's `Value()` returns
+`json.Marshal(...)` → `[]byte`) were sent as a **bytea hex literal** and rejected with
+`22P02 invalid input syntax for type json`. cocoon only escaped this because it never fed a JSONB
+column raw bytes. The mode that works for **both** problems is
+**`?default_query_exec_mode=cache_describe`**: pgx still does a server-side *Describe* (so it gets
+correct per-column type OIDs → JSONB encodes right) but does **not** keep named prepared statements
+across the connection lifecycle, so there is **no `42P05`** either (verified with 200 hammered
+parameterized JSONB inserts, zero failures, on the live zeropg wire). So the refined rule is:
+**`cache_describe` is the safe pgx default on zeropg**; reach for `simple_protocol` only for an app
+with no typed-`[]byte` columns. (Also required for webhookx: a **connection pool > 1** — golang-migrate
+holds its advisory-lock connection across migration while bootstrap needs a second; pool=1 deadlocks.
+The wire accepts up to ~10 concurrent connections, serialized internally, so a small pool is safe.)
+Same modes apply via `pgx`'s exec-mode config or GORM's driver config for apps that build it in code.
 
 **Fix scope (assessed against `@electric-sql/pglite-socket@0.2.2` source):** it's a DEEP/architectural
 change, not a small patch. The socket layer frames messages only by length prefix and forwards each
@@ -164,8 +177,9 @@ statements would nuke a peer's. True per-connection catalog isolation needs one 
 connection (or a per-connection namespace), i.e. a change to the single-session model itself.
 → **Tooling action:** screen apps for named-prepared-statement drivers up front. Reject the ones with
 no escape hatch (Rust **sqlx**, Rust **Diesel**) the same way non-bundled extensions are screened
-(Limitation 1). For **`pgx`/Go** apps, don't reject — inject `default_query_exec_mode=simple_protocol`
-into the DSN and let them through (verified with cocoon).
+(Limitation 1). For **`pgx`/Go** apps, don't reject — inject **`default_query_exec_mode=cache_describe`**
+into the DSN and let them through (verified with cocoon AND webhookx; `cache_describe` is the safe
+default — see the CORRECTION above on why `simple_protocol` breaks JSONB).
 
 ## nostream (Node nostr relay) — VERIFIED, including a Redis sidecar
 

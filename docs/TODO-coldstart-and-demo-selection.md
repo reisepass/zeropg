@@ -27,7 +27,7 @@ restore overhead.
 | Documenso | TBD - measure | heavy Next.js (Remix) |
 | Cal.com | TBD - measure | heaviest Next.js monorepo; likely slowest |
 | nostream + zeropg + Dragonfly | **~14.5 s** (valkey ~15.0 s - a wash) | mostly nostream's own heavy Node boot; the zeropg part is the same ~5 s restore as everywhere |
-| webhookx + zeropg + Dragonfly | TBD - agent measuring | if it clears the driver wall + idles |
+| webhookx + zeropg + Dragonfly | ~4-5 s (fast restore) to ~35-40 s (slow restore) | Go app boots fast; variance is the GCS/PGlite restore. KEEP - first needs-Redis app proven |
 
 ### nostream + Dragonfly - measured findings (Agent A, live Cloud Run)
 - **Cold start ~14.5 s** (clean autoscaling wake, boot→HTTP 200). valkey baseline ~15.0 s → **Dragonfly vs valkey is a wash** (redis ready 0.64 s vs 0.44 s; the ~5 s GCS restore + heavy nostream Node boot dominate).
