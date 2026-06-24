@@ -10,8 +10,10 @@
 #      (golang-migrate, idempotent), then `webhookx start`. Marker-gated so a
 #      warm restart that finds the schema present skips straight to start.
 #   2. nothing else patched: the single-session-wire compatibility is achieved
-#      purely via the DSN (default_query_exec_mode=simple_protocol) and a pool
-#      size of 1, both set as env in service.yaml. No app code changes.
+#      purely via the DSN (default_query_exec_mode=cache_describe) and a pool
+#      size greater than 1, both set as env in service.yaml. No app code changes.
+#      (cache_describe, NOT simple_protocol: the latter mis-encodes JSONB; pool
+#      must be >1 or the migrator deadlocks. See service.yaml comments + README.)
 ARG WEBHOOKX_REF=v1.1.0
 
 FROM golang:1.26.2 AS build

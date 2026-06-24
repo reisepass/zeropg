@@ -65,12 +65,22 @@ PGPASSWORD="${DB_PASS}" psql \
 # Idempotent: `admin sync` reconciles to the declared state on every boot.
 ADMIN_ADDR="${WEBHOOKX_DEMO_ADMIN_ADDR:-http://127.0.0.1:9601}"
 if [ -n "${WEBHOOKX_DEMO_ENDPOINT_URL:-}" ]; then
+  # Guard the env-provided URL before splicing it into YAML: reject anything
+  # multi-line, and single-quote it (doubling any embedded single quotes) so a
+  # value with YAML-significant characters can't inject extra fields.
+  case "${WEBHOOKX_DEMO_ENDPOINT_URL}" in
+    *$'\n'*|*$'\r'*)
+      echo "[webhookx-entrypoint] FATAL: WEBHOOKX_DEMO_ENDPOINT_URL must be single-line" >&2
+      exit 1
+      ;;
+  esac
+  DEMO_URL_YAML="$(printf '%s' "${WEBHOOKX_DEMO_ENDPOINT_URL}" | sed "s/'/''/g")"
   cat > /tmp/webhookx-demo.yml <<YAML
 endpoints:
   - name: demo-endpoint
     enabled: true
     request:
-      url: ${WEBHOOKX_DEMO_ENDPOINT_URL}
+      url: '${DEMO_URL_YAML}'
       method: POST
       timeout: 10000
     retry:

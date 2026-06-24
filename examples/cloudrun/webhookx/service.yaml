@@ -66,13 +66,14 @@ spec:
             # proxy is the public webhook ingress on the Cloud Run port.
             - name: WEBHOOKX_PROXY_LISTEN
               value: "0.0.0.0:9600"
-            # admin + status bind to all interfaces so an in-container setup step
-            # (and the startup probe) can reach them; Cloud Run still only routes
-            # the proxy port externally.
+            # admin + status stay on loopback: the in-container self-config step
+            # reaches them at 127.0.0.1, and Cloud Run only probes/routes the proxy
+            # port (9600). Keeping them off 0.0.0.0 avoids exposing the unauthenticated
+            # admin API to anything sharing the instance's network namespace.
             - name: WEBHOOKX_ADMIN_LISTEN
-              value: "0.0.0.0:9601"
+              value: "127.0.0.1:9601"
             - name: WEBHOOKX_STATUS_LISTEN
-              value: "0.0.0.0:9602"
+              value: "127.0.0.1:9602"
             # delivery worker on (standalone). Keep its pool modest: the wire is
             # single-session, so we don't want hundreds of concurrent DB writers.
             - name: WEBHOOKX_WORKER_ENABLED
