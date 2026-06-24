@@ -20,3 +20,5 @@
 {"ts":"2026-06-24T12:45:21Z","round":4,"app":"rallly","http_code":"200","time_total_s":0.397193}
 {"ts":"2026-06-24T12:45:21Z","round":4,"app":"documenso","http_code":"302","time_total_s":0.347915}
 {"ts":"2026-06-24T12:45:21Z","round":4,"app":"pds","http_code":"200","time_total_s":0.296489}
+{"ts":"2026-06-24T14:35:12Z","round":5,"app":"pds","http_code":"200","time_total_s":0.442616,"note":"clean 20min-idle cold"}
+{"ts":"2026-06-24T14:35:42Z","round":5,"app":"documenso","http_code":"302","time_total_s":29.861096,"note":"clean 20min-idle cold"}
