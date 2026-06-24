@@ -31,10 +31,17 @@ END $$;
 -- these from the JWT. Grant membership so the role switch is permitted.
 GRANT anon, authenticated, service_role TO postgres;
 
+-- Lock down the public schema: the live-session search_path is `public, auth`
+-- (public first), so an untrusted role that could CREATE in public could shadow
+-- an unqualified name. Revoke CREATE from PUBLIC + the API roles; USAGE only.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE CREATE ON SCHEMA public FROM anon, authenticated, service_role;
 GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
 
 -- ---- auth schema + helpers ----
 CREATE SCHEMA IF NOT EXISTS auth;
+REVOKE CREATE ON SCHEMA auth FROM PUBLIC;
+REVOKE CREATE ON SCHEMA auth FROM anon, authenticated, service_role;
 GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;
 
 CREATE OR REPLACE FUNCTION auth.jwt() RETURNS jsonb
@@ -53,6 +60,7 @@ CREATE OR REPLACE FUNCTION auth.email() RETURNS text
   LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
   SELECT auth.jwt() ->> 'email'
 $$;
+REVOKE ALL ON FUNCTION auth.jwt(), auth.uid(), auth.role(), auth.email() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION auth.jwt(), auth.uid(), auth.role(), auth.email()
   TO anon, authenticated, service_role;
 
@@ -68,6 +76,9 @@ CREATE TABLE IF NOT EXISTS public.todos (
   inserted_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE public.todos ENABLE ROW LEVEL SECURITY;
+-- FORCE so even the table owner is subject to RLS (defense in depth: no future
+-- owner-context function can bypass the policy).
+ALTER TABLE public.todos FORCE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS todos_select_own ON public.todos;
 DROP POLICY IF EXISTS todos_modify_own ON public.todos;
@@ -76,6 +87,7 @@ CREATE POLICY todos_select_own ON public.todos
 CREATE POLICY todos_modify_own ON public.todos
   FOR ALL USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
 
+REVOKE ALL ON public.todos FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.todos TO authenticated;
 -- anon may read the table but RLS (user_id = auth.uid() = NULL for anon) hides all rows.
 GRANT SELECT ON public.todos TO anon;
@@ -88,9 +100,11 @@ CREATE TABLE IF NOT EXISTS public.documents (
   embedding   vector(3)             -- tiny dim for the demo; real apps use 384/768/1536
 );
 ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.documents FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS documents_own ON public.documents;
 CREATE POLICY documents_own ON public.documents
   FOR ALL USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+REVOKE ALL ON public.documents FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.documents TO authenticated;
 
 -- match_documents RPC: ANN search scoped to the caller's rows (RLS still applies
@@ -103,4 +117,5 @@ CREATE OR REPLACE FUNCTION public.match_documents(query_embedding vector(3), mat
   ORDER BY d.embedding <-> query_embedding
   LIMIT match_count
 $$;
+REVOKE ALL ON FUNCTION public.match_documents(vector, int) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.match_documents(vector, int) TO authenticated;

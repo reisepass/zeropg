@@ -71,22 +71,38 @@ async function readiness() {
   return out
 }
 
-// Generic streaming-ish reverse proxy (buffers body; demo-scale payloads).
+// Hop-by-hop / proxy-sensitive request headers we never forward to the backends.
+const BLOCKED_REQ_HEADERS = new Set([
+  'host', 'connection', 'content-length', 'transfer-encoding', 'upgrade',
+  'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection',
+  'te', 'trailer',
+])
+const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 1_000_000) // 1MB cap (single-writer DB)
+
+// Generic reverse proxy (buffers body; demo-scale payloads).
 async function proxy(req, res, targetBase, stripPrefix) {
   const url = new URL(req.url, 'http://localhost')
   const rest = url.pathname.slice(stripPrefix.length) || '/'
   const target = `${targetBase}${rest}${url.search}`
   const headers = {}
   for (const [k, v] of Object.entries(req.headers)) {
-    const lk = k.toLowerCase()
-    if (lk === 'host' || lk === 'connection' || lk === 'content-length') continue
+    if (BLOCKED_REQ_HEADERS.has(k.toLowerCase())) continue
     headers[k] = Array.isArray(v) ? v.join(', ') : v
   }
   const method = req.method || 'GET'
   let body
   if (method !== 'GET' && method !== 'HEAD') {
     const chunks = []
-    for await (const c of req) chunks.push(c)
+    let total = 0
+    for await (const c of req) {
+      total += c.length
+      if (total > MAX_BODY_BYTES) {
+        res.writeHead(413, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'request body too large' }))
+        return
+      }
+      chunks.push(c)
+    }
     body = Buffer.concat(chunks)
   }
   let upstream
@@ -99,10 +115,13 @@ async function proxy(req, res, targetBase, stripPrefix) {
   }
   const respHeaders = {}
   upstream.headers.forEach((v, k) => {
-    if (k.toLowerCase() === 'content-encoding' || k.toLowerCase() === 'transfer-encoding') return
+    const lk = k.toLowerCase()
+    // fetch may transparently decompress; drop framing headers and set our own length.
+    if (lk === 'content-encoding' || lk === 'transfer-encoding' || lk === 'content-length') return
     respHeaders[k] = v
   })
   const buf = Buffer.from(await upstream.arrayBuffer())
+  respHeaders['content-length'] = String(buf.length)
   res.writeHead(upstream.status, respHeaders)
   res.end(buf)
 }
@@ -138,13 +157,14 @@ const server = createServer(async (req, res) => {
       return json(res, 200, await readiness())
     }
 
-    // Kong-style supabase layout
-    if (path.startsWith('/rest/v1')) {
+    // Kong-style supabase layout (exact prefix: /rest/v1 or /rest/v1/...)
+    const isPrefix = (p) => path === p || path.startsWith(`${p}/`)
+    if (isPrefix('/rest/v1')) {
       wakeDb()
       // -> db sidecar's /rest proxy (which forwards to local PostgREST)
       return proxy(req, res, `${DB_CONTROL}/rest`, '/rest/v1')
     }
-    if (path.startsWith('/auth/v1')) {
+    if (isPrefix('/auth/v1')) {
       wakeDb()
       return proxy(req, res, GOTRUE_URL, '/auth/v1')
     }
