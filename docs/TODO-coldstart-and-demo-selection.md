@@ -6,6 +6,13 @@ are both *nice* and *boot fast* to be the main/featured demos; demote or drop th
 slow ones.** Cold start is the selection criterion, because the whole pitch is
 "scale to zero and wake fast."
 
+NOTE: cold start = the app's **own** boot weight + zeropg's ~5 s restore constant +
+~0 for the Redis sidecar. It's an **app property**, not a zeropg ranking. Don't pit
+unrelated apps against each other (a Nostr relay vs a PDS is meaningless) - just
+check each is snappy *enough for its own use case*. The only apples-to-apples
+comparisons are same-app part-swaps (e.g. Dragonfly vs valkey) and zeropg's own
+restore overhead.
+
 ## Known cold-start numbers so far (boot -> serving, forced fresh instance)
 
 | demo | cold start | notes |
@@ -19,7 +26,7 @@ slow ones.** Cold start is the selection criterion, because the whole pitch is
 | Rallly | TBD - measure | heavy Next.js |
 | Documenso | TBD - measure | heavy Next.js (Remix) |
 | Cal.com | TBD - measure | heaviest Next.js monorepo; likely slowest |
-| nostream + zeropg + Dragonfly | **~14.5 s** (valkey ~15.0 s - a wash) | Node app boot + GCS restore dominate; redis never the long pole. Secondary, not headline |
+| nostream + zeropg + Dragonfly | **~14.5 s** (valkey ~15.0 s - a wash) | mostly nostream's own heavy Node boot; the zeropg part is the same ~5 s restore as everywhere |
 | webhookx + zeropg + Dragonfly | TBD - agent measuring | if it clears the driver wall + idles |
 
 ### nostream + Dragonfly - measured findings (Agent A, live Cloud Run)

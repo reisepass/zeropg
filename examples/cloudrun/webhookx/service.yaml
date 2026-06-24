@@ -1,0 +1,160 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: webhookx-zeropg
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"        # single writer on the GCS datadir
+        autoscaling.knative.dev/minScale: "0"        # scale to zero (app + db + dragonfly as a unit)
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/cpu-throttling: "false"   # keep CPU while warm so the worker + WAL-ship timers run
+        run.googleapis.com/container-dependencies: '{"app":["db","dragonfly"]}'  # app waits for db /healthz + dragonfly
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: app                                   # webhookx, ingress container (proxy = webhook ingress)
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/webhookx-app:latest
+          ports:
+            - name: http1
+              containerPort: 9600                     # proxy listen; Cloud Run routes inbound webhooks here
+          env:
+            # --- Postgres -> the zeropg `db` sidecar over localhost ---
+            - name: WEBHOOKX_DATABASE_HOST
+              value: "127.0.0.1"
+            - name: WEBHOOKX_DATABASE_PORT
+              value: "5432"
+            - name: WEBHOOKX_DATABASE_USERNAME
+              value: "postgres"
+            - name: WEBHOOKX_DATABASE_PASSWORD
+              value: "postgres"
+            - name: WEBHOOKX_DATABASE_DATABASE
+              value: "postgres"
+            # cache_describe => pgx extended protocol that caches the column-type
+            # DESCRIBE but does NOT persist named server-side prepared statements,
+            # so no 42P05 on the single-session wire. NOTE: do NOT use
+            # simple_protocol here — it can't infer column types, so JSONB columns
+            # fed a []byte (entity Value() => json.Marshal) are sent as a bytea hex
+            # literal and rejected with "invalid input syntax for type json"
+            # (22P02). cache_describe keeps proper JSONB encoding.
+            - name: WEBHOOKX_DATABASE_PARAMETERS
+              value: "application_name=webhookx&sslmode=disable&connect_timeout=10&default_query_exec_mode=cache_describe"
+            # Small pool. MUST be >1: webhookx's migrator holds the advisory-lock
+            # connection across `client.Up()` while initDefaultWorkspace() acquires
+            # a second connection from the same pool — pool=1 deadlocks. The zeropg
+            # wire accepts up to 10 concurrent connections (PGlite serializes them),
+            # so 4 is safe.
+            - name: WEBHOOKX_DATABASE_MAX_POOL_SIZE
+              value: "4"
+            # --- Redis -> the dragonfly sidecar over localhost ---
+            # Top-level redis: cache, rate limiter, delivery task queue (sorted set).
+            - name: WEBHOOKX_REDIS_HOST
+              value: "127.0.0.1"
+            - name: WEBHOOKX_REDIS_PORT
+              value: "6379"
+            # Proxy ingest queue (Redis stream) has its OWN redis config block.
+            - name: WEBHOOKX_PROXY_QUEUE_REDIS_HOST
+              value: "127.0.0.1"
+            - name: WEBHOOKX_PROXY_QUEUE_REDIS_PORT
+              value: "6379"
+            # --- listeners ---
+            # proxy is the public webhook ingress on the Cloud Run port.
+            - name: WEBHOOKX_PROXY_LISTEN
+              value: "0.0.0.0:9600"
+            # admin + status bind to all interfaces so an in-container setup step
+            # (and the startup probe) can reach them; Cloud Run still only routes
+            # the proxy port externally.
+            - name: WEBHOOKX_ADMIN_LISTEN
+              value: "0.0.0.0:9601"
+            - name: WEBHOOKX_STATUS_LISTEN
+              value: "0.0.0.0:9602"
+            # delivery worker on (standalone). Keep its pool modest: the wire is
+            # single-session, so we don't want hundreds of concurrent DB writers.
+            - name: WEBHOOKX_WORKER_ENABLED
+              value: "true"
+            - name: WEBHOOKX_WORKER_POOL_SIZE
+              value: "1000"
+            - name: WEBHOOKX_WORKER_POOL_CONCURRENCY
+              value: "4"
+            - name: WEBHOOKX_ANONYMOUS_REPORTS
+              value: "false"
+            # Demo self-config: on boot the entrypoint syncs a source (/ingest)
+            # + an endpoint forwarding "demo.ping" events to this public sink (a
+            # request-capture Cloud Run service we control). Remove for a real
+            # deployment and configure via the admin API instead.
+            - name: WEBHOOKX_DEMO_ENDPOINT_URL
+              value: "https://wx-capture-sink-71428757273.europe-west1.run.app/capture"
+          resources:
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          startupProbe:
+            tcpSocket:
+              port: 9600
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 40
+        - name: db                                    # zeropg sidecar: GCS-backed Postgres on localhost:5432
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/zeropg-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-webhookx"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: PORT
+              value: "8081"                           # control/health face (/healthz)
+            - name: APP_LABEL
+              value: "webhookx"
+            - name: ZEROPG_RESTART_NONCE
+              value: "1"                              # bump to force a cold restart (restore-from-GCS test)
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 60                      # allow up to ~3min for first initdb / restore
+        - name: dragonfly                             # Redis-compatible queue; scales WITH the instance
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/dragonfly:latest
+          # Ephemeral: webhookx's Redis queue (sorted-set delay queue + ingest
+          # stream) is a DERIVED cache. Event+Attempt rows are written to zeropg
+          # (durable in GCS) BEFORE tasks hit Redis; on a cold boot the worker's
+          # 60s loadPending rebuilds the queue from attempts.status='INIT'. So no
+          # S3/GCS snapshot persistence is needed.
+          args:
+            - "dragonfly"
+            - "--logtostderr"
+            - "--port=6379"
+            # Listen on all interfaces (no --bind): Cloud Run's TCP startup probe
+            # for a sidecar does not reach a 127.0.0.1-only bind. The app still
+            # connects over localhost (shared netns).
+            # Dragonfly refuses to start unless maxmemory >= proactor_threads*256MiB.
+            # Pin to 1 thread so 256mb is accepted on a small Cloud Run sidecar.
+            - "--proactor_threads=1"
+            - "--maxmemory=256mb"
+            - "--force_epoll"                         # Cloud Run gVisor lacks io_uring
+            - "--dbfilename="                         # disable snapshots (ephemeral)
+          resources:
+            limits:
+              cpu: "1"
+              memory: 384Mi
+          startupProbe:
+            tcpSocket:
+              port: 6379
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 20
+  traffic:
+    - percent: 100
+      latestRevision: true

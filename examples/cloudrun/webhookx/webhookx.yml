@@ -1,0 +1,37 @@
+# Declarative config for the zeropg demo, applied via:
+#   webhookx admin sync --addr http://127.0.0.1:9601 webhookx.yml
+# (run inside the app container, or port-forward the admin API).
+#
+# One source (HTTP ingress at /ingest, POST) and one endpoint that forwards
+# matching events to a destination URL. The endpoint subscribes to the
+# "demo.ping" event type; an inbound POST whose JSON body has
+# {"event_type":"demo.ping", ...} fans out to the endpoint.
+endpoints:
+  - name: demo-endpoint
+    enabled: true
+    request:
+      # Replaced at deploy time with the request-capture URL we control.
+      url: https://REPLACE_ME/capture
+      method: POST
+      timeout: 10000
+    retry:
+      strategy: fixed
+      config:
+        attempts: [0, 30, 60]
+    events:
+      - demo.ping
+
+sources:
+  - name: demo-source
+    type: http
+    async: false
+    enabled: true
+    config:
+      http:
+        path: /ingest
+        methods:
+          - POST
+        response:
+          code: 200
+          content_type: application/json
+          body: '{"message":"accepted"}'
