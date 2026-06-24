@@ -180,18 +180,49 @@ open a REQ subscription → the event streams back + EOSE. Durability proven by 
   over the wire (a `knex migrate:latest` step, not the SQL-folder migrate sidecar). Needs contrib
   **`uuid_ossp`** (`CREATE EXTENSION "uuid-ossp" … version "1.1"`) and **`btree_gin`** (the
   kind/tags/created_at GIN index) — both bundled.
-- **Redis is mandatory, not optional.** It's on the EVENT hot path (rate limiter + dedup cache via
-  `messageHandlerFactory`→`getCache()`/`rateLimiterFactory`). It is NOT used for cross-worker event
-  fan-out — that's done with Node **cluster IPC** (`worker.send`/`process.on('message')`), so
-  `WORKER_COUNT` does not remove the Redis need. The minimal viable story: run a small **valkey**
-  sidecar (`valkey/valkey:8-alpine`, `--save "" --appendonly no`) that scales WITH the instance, so
-  the whole service (app + zeropg-db + valkey) still scales to **zero as a unit** — not an always-on
-  external Redis. This is the first example here needing a *second* stateful sidecar.
+- **Redis: usable two ways.** It's only on the EVENT hot path (rate limiter + dedup cache via
+  `messageHandlerFactory`→`getCache()`/`rateLimiterFactory`); cross-worker fan-out is Node **cluster
+  IPC** (`worker.send`/`process.on('message')`), not Redis. So:
+  - *With a Redis sidecar (clean):* run a small **valkey** (`valkey/valkey:8-alpine`,
+    `--save "" --appendonly no`) that scales WITH the instance, so app + zeropg-db + valkey still
+    scale to **zero as a unit** — not an always-on external Redis. This is the verified live config.
+  - *Without Redis (works, but noisy):* `WORKER_COUNT=1` + a settings.yaml that empties EVERY
+    `rateLimits` array (`limits.{connection,message,event,invoice,admissionCheck}.rateLimits: []`)
+    makes the hot path never call the cache, and a real round-trip succeeds with no Redis present
+    (verified locally). BUT nostream's `redis` client still auto-reconnects forever and the worker's
+    `unhandledRejection` handler logs every `ECONNREFUSED` — functional but a continuous error spam.
+    Making it *clean* needs a code patch (a `NO_REDIS` stub for `getCacheClient`), at which point you
+    are no longer running the unmodified upstream. → If you want truly-no-Redis, prefer `znostr-relay`.
 - **Boot gotcha**: nostream's settings watcher `fs.watch()`es `$NOSTR_CONFIG_DIR/settings.yaml` and
   crashes if it's missing (its `createSettings` never actually writes it on a fresh dir). The app
   image must seed `settings.yaml` from `resources/default-settings.yaml` before boot.
 
 Example: `examples/cloudrun/nostr/` (nostream-app built from source + nostr-db sidecar + valkey).
+
+## znostr-relay — our own minimal NIP-01 relay, zeropg-native, NO Redis (VERIFIED)
+
+When "no Redis at all, scale-to-zero as a single unit" is the goal, a purpose-built relay beats
+bending nostream. `examples/cloudrun/nostr/znostr-relay/` is ~330 lines: Node + `ws` +
+**node-postgres** (UNNAMED statements → clears the sqlx wall by construction) + `@noble`-backed
+`verifyEvent`, single process, the DB is the only state. It self-bootstraps its schema at boot (no
+migration tool, **no contrib extensions** — only built-in types + a `gin (jsonb)` tag index), so it
+rides the **basic** `zeropg-db-sidecar` (same image as PrivateBin/NocoDB).
+
+Implements NIP-01 (EVENT/REQ/CLOSE + the standard filter set: ids/authors/kinds/since/until/limit/
+`#<tag>`), live fan-out to open subscriptions, replaceable (0/3/10000–19999) and
+parameterized-replaceable (30000–39999 by d-tag) semantics, ephemeral (20000–29999, served not
+stored), NIP-09 deletion (kind 5), and basic NIP-45 COUNT. Verified with an 11-check local suite
+(publish, every filter type, live broadcast, replaceable-keeps-newest, invalid-sig rejection, row +
+tag projection read from the DB) and **live on Cloud Run**
+(`wss://znostr-zeropg-71428757273.europe-west1.run.app`): publish → `OK true`, REQ streams it back +
+EOSE, and the event **survived a forced cold restart** (revision `znostr-zeropg-00003-bp4`) that
+restored only from `gs://zeropg-experiments-euw1/cloudrun-znostr/`. No Redis anywhere.
+
+**Boot ordering gotcha (applies to any app on the basic sidecar):** the `zeropg-db` sidecar's
+`/healthz` (control port) returns 200 before its Postgres wire has finished restoring, so a connect
+in the first few seconds gets `ECONNREFUSED 127.0.0.1:5432`. An app that connects at boot (znostr
+bootstraps its schema before listening) must **retry with backoff**, not crash, or Cloud Run fails
+the startup probe. (The migrate sidecar avoids this by polling its own `/up` before touching the wire.)
 
 ## Limitation 6 — a verifier reaching the live wire
 
@@ -209,6 +240,7 @@ timestamps advance past the publish time and a cold-restart instance restores an
 | Cal.com | 8 | email+password signup writes the row before email verification; heavy boot |
 | Documenso | 8 | email+password signup writes before verification; requires drawing/typing a signature pad |
 | nostream | 9 | no auth gate; sign+publish an EVENT over ws (nostr-tools), assert REQ streams it back; wait for the AUTH challenge before the first publish or the relay drops the racing frame |
+| znostr-relay | 10 | our own relay; no auth, no AUTH-challenge race; publish→OK→REQ→EVENT+EOSE; read row + tag projection straight from the DB |
 | cocoon (PDS) | 7 | invite-gated (or `COCOON_REQUIRE_INVITE=false`) email+password createAccount → createRecord → getRecord, all over plain XRPC HTTP, no OAuth/emailed code. The one external dep: account creation POSTs the genesis op to the hardcoded `https://plc.directory` (needs outbound internet, registers a real `did:plc`); reads/writes of existing accounts are fully self-contained |
 
 All four reached a real DB write with **no human-only step** (no OAuth, no emailed code). Apps
