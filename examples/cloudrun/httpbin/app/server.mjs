@@ -161,27 +161,40 @@ function headerObject(req) {
 }
 
 // Read the body with a hard byte cap. Returns { text, encoding, truncated }.
+// Over the cap we STOP buffering but keep draining the stream — we must NOT
+// destroy the socket, or the response (the capture 200) gets reset before the
+// client can read it. server.requestTimeout bounds a slow/huge upload. Success
+// is `end`; an early client disconnect (`aborted`) rejects rather than silently
+// inserting a misleading partial capture.
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
     let truncated = false
+    let done = false
     req.on('data', (c) => {
+      if (done) return
+      const before = size
       size += c.length
-      if (size <= MAX_BODY_BYTES) {
-        chunks.push(c)
-      } else if (!truncated) {
-        truncated = true
-        // keep what fits; stop buffering more
-        const remain = MAX_BODY_BYTES - (size - c.length)
-        if (remain > 0) chunks.push(c.subarray(0, remain))
-        req.destroy() // stop the upload; we have our cap
+      if (before < MAX_BODY_BYTES) {
+        const remain = MAX_BODY_BYTES - before
+        chunks.push(c.length <= remain ? c : c.subarray(0, remain))
+      }
+      if (size > MAX_BODY_BYTES) truncated = true // keep draining; do not destroy
+    })
+    req.on('end', finish)
+    req.on('aborted', () => {
+      if (!done) {
+        done = true
+        reject(new Error('request aborted'))
       }
     })
-    req.on('end', () => finish())
-    req.on('close', () => finish())
-    req.on('error', (e) => reject(e))
-    let done = false
+    req.on('error', (e) => {
+      if (!done) {
+        done = true
+        reject(e)
+      }
+    })
     function finish() {
       if (done) return
       done = true
