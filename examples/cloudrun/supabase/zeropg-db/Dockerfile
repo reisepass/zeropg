@@ -34,9 +34,10 @@ RUN npm install --omit=dev --no-audit --no-fund \
       @electric-sql/pglite@^0.5 \
       @electric-sql/pglite-socket@^0.2 \
       @electric-sql/pglite-pgvector@^0.0.4 \
+      pg@^8.13 \
  && npm cache clean --force
 
-COPY server.mjs ./
+COPY server.mjs bootstrap.sql ./
 
 ENV NODE_ENV=production
 ENV ZEROPG_POSTGREST_BIN=/usr/local/bin/postgrest

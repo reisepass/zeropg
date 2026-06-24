@@ -1,69 +1,103 @@
 // The zeropg "database" sidecar for the stripped Supabase stack on Cloud Run.
 //
-// It is the standard ZeroPGServer (GCS-backed, scale-to-zero PGlite over the
-// pglite-socket Postgres wire on 127.0.0.1:5432) with two additions for this
-// stack:
+// = standard ZeroPGServer (GCS-backed scale-to-zero PGlite + Postgres wire on
+// 127.0.0.1:5432 + GCS persistence) PLUS, for this stack:
 //
-//   1. PGVECTOR PRELOADED. Supabase ships pgvector; PGlite reaches it via the
-//      separate npm package `@electric-sql/pglite-pgvector` (NOT contrib/*), so
-//      we import { vector } and hand it to ZeroPG.open({ extensions }). Without
-//      this, `CREATE EXTENSION vector` errors with `extension "vector" is not
-//      available` (PGlite only loads an extension whose JS module was injected).
-//      pgcrypto is also preloaded: GoTrue's auth schema and gen_random_uuid()
-//      style defaults want it, and it is cheap.
+//   1. PGVECTOR PRELOADED (@electric-sql/pglite-pgvector — the separate npm pkg,
+//      NOT contrib/*) + pgcrypto. So `CREATE EXTENSION vector` works.
 //
-//   2. BUILT-IN POSTGREST ON. @zeropg/server can spawn the PostgREST Haskell
-//      binary itself, pointed at the local wire, with the single-session
-//      kill-switch already applied in packages/server/src/postgrest.ts:
-//        PGRST_DB_PREPARED_STATEMENTS=false  (no 42P05 on the shared session)
-//        PGRST_DB_POOL=1
-//      So REST CRUD over the zeropg wire works with no extra container. The
-//      REST API is reverse-proxied by the frontend container under /rest.
+//   2. BUILT-IN POSTGREST ON. @zeropg/server spawns the PostgREST Haskell binary
+//      against the local wire with the single-session kill-switch already applied
+//      (PGRST_DB_PREPARED_STATEMENTS=false + pool=1 => no 42P05). The frontend
+//      reverse-proxies REST under /rest/v1. JWT verification + the role switch are
+//      configured by passing PGRST_JWT_SECRET in this container's env (PostgrestProcess
+//      inherits process.env).
+//
+//   3. BOOTSTRAP SCHEMA from bootstrap.sql (roles, auth schema + helpers, RLS demo
+//      tables). Applied via schemaSql BEFORE PostgREST introspects and before GoTrue
+//      connects.
+//
+//   4. LIVE-SESSION search_path. ALTER ROLE/DATABASE SET search_path does NOT take
+//      effect on pglite-socket's multiplexed single session (the session is opened
+//      once and reused), so GoTrue's UNQUALIFIED runtime queries would miss the auth
+//      schema. We set it once on the live session over the wire after boot:
+//        SET search_path TO public, auth
+//      which is session-global and persists for all wire connections (verified).
+//      `public` first keeps PostgREST's public tables resolving on the same session.
 //
 // Env:
-//   ZEROPG_BUCKET     GCS bucket (durable home)        [required]
-//   ZEROPG_PREFIX     per-app key prefix in the bucket [default 'supabase']
-//   PORT              HTTP control/health + REST-proxy face (Cloud Run sets it)
-//   ZEROPG_WIRE_PORT  Postgres wire port on localhost  [default 5432]
-//   ZEROPG_REST_PORT  local PostgREST port             [default 3000]
+//   ZEROPG_BUCKET     GCS bucket (durable home)          [required]
+//   ZEROPG_PREFIX     per-app key prefix in the bucket   [default 'supabase']
+//   PORT              HTTP control/health + /rest proxy face (Cloud Run sets it)
+//   ZEROPG_WIRE_PORT  Postgres wire port on localhost    [default 5432]
+//   ZEROPG_REST_PORT  local PostgREST port               [default 3000]
 //   ZEROPG_POSTGREST  'off' to disable built-in PostgREST
-//   ZEROPG_REST_SCHEMAS  schemas PostgREST exposes      [default 'public']
-//   ZEROPG_SCHEMA_SQL    optional bootstrap SQL run after restore
+//   PGRST_JWT_SECRET  HS256 secret PostgREST verifies JWTs with (share with GoTrue)
+//   ZEROPG_SEARCH_PATH  live-session search_path          [default 'public, auth']
 
 import { ZeroPGServer } from '@zeropg/server'
 import { GcsBlobStore } from '@zeropg/blobstore'
 import { vector } from '@electric-sql/pglite-pgvector'
 import { pgcrypto } from '@electric-sql/pglite/contrib/pgcrypto'
+import pg from 'pg'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+
+const { Client } = pg
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 const bucket = process.env.ZEROPG_BUCKET
 if (!bucket) throw new Error('ZEROPG_BUCKET is required')
 const prefix = process.env.ZEROPG_PREFIX || 'supabase'
+const WIRE = Number(process.env.ZEROPG_WIRE_PORT || 5432)
+const CTRL = Number(process.env.PORT || 8081)
+const SEARCH_PATH = process.env.ZEROPG_SEARCH_PATH || 'public, auth'
+
+const bootstrapSql = await readFile(join(__dirname, 'bootstrap.sql'), 'utf8')
 
 const store = new GcsBlobStore({ bucket, prefix })
 
-const server = await ZeroPGServer.start({
+await ZeroPGServer.start({
   store,
   holder: process.env.ZEROPG_HOLDER || process.env.K_REVISION || 'cloudrun',
-  port: Number(process.env.PORT || 8081),
+  port: CTRL,
   wireHost: '127.0.0.1',
-  wirePort: Number(process.env.ZEROPG_WIRE_PORT || 5432),
+  wirePort: WIRE,
   restPort: Number(process.env.ZEROPG_REST_PORT || 3000),
-  // Built-in PostgREST is ON unless ZEROPG_POSTGREST=off. The 42P05 kill-switch
-  // (prepared-statements=false, pool=1) lives in the server package already.
   postgrest: !/^(off|false|0)$/i.test(process.env.ZEROPG_POSTGREST ?? ''),
   restSchemas: process.env.ZEROPG_REST_SCHEMAS || 'public',
-  // pgvector for the Supabase vector layer; pgcrypto for auth/uuid defaults.
   extensions: { vector, pgcrypto },
-  schemaSql: process.env.ZEROPG_SCHEMA_SQL || undefined,
+  schemaSql: bootstrapSql,
   label: process.env.APP_LABEL || 'supabase zeropg-db',
 })
 
-console.log(
-  `[zeropg-db] up: GCS=${bucket}/${prefix} wire=127.0.0.1:${process.env.ZEROPG_WIRE_PORT || 5432} ` +
-    `rest=127.0.0.1:${process.env.ZEROPG_REST_PORT || 3000} control=:${process.env.PORT || 8081} ` +
-    `(PGlite + pgvector + pgcrypto)`,
-)
+// After boot, pin the search_path on the LIVE shared session so GoTrue's
+// unqualified runtime queries resolve into `auth`. Poll /ready first.
+async function setLiveSearchPath() {
+  const t0 = Date.now()
+  while (Date.now() - t0 < 120_000) {
+    try {
+      const b = await (await fetch(`http://127.0.0.1:${CTRL}/ready`)).json()
+      if (b.ready) break
+      if (b.phase === 'error') throw new Error(`db boot error: ${b.error}`)
+    } catch (e) {
+      if (String(e).includes('db boot error')) throw e
+    }
+    await new Promise((r) => setTimeout(r, 200))
+  }
+  const c = new Client({ host: '127.0.0.1', port: WIRE, user: 'postgres', database: 'postgres', ssl: false })
+  await c.connect()
+  await c.query(`SET search_path TO ${SEARCH_PATH}`)
+  await c.end()
+  console.log(`[zeropg-db] live-session search_path set to: ${SEARCH_PATH}`)
+}
+setLiveSearchPath().catch((e) => {
+  console.error('[zeropg-db] failed to set live-session search_path:', e)
+  process.exit(1)
+})
 
-// Keep a reference so the process does not get GC-surprised; ZeroPGServer holds
-// its own timers but this makes intent explicit.
-void server
+console.log(
+  `[zeropg-db] up: GCS=${bucket}/${prefix} wire=127.0.0.1:${WIRE} ` +
+    `rest=127.0.0.1:${process.env.ZEROPG_REST_PORT || 3000} control=:${CTRL} (PGlite + pgvector + pgcrypto)`,
+)
