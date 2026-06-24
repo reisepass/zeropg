@@ -255,6 +255,16 @@ CREATE TABLE IF NOT EXISTS _collections (
 	}
 	// Backfill list_rule on older datadirs that predate the column.
 	_, _ = s.pool.Exec(ctx, `ALTER TABLE _collections ADD COLUMN IF NOT EXISTS list_rule text NOT NULL DEFAULT 'auth'`)
+
+	// Backfill the per-record `owner` column on any record tables created by an
+	// older version that predated it (otherwise selectCols' "owner" 42703s).
+	// Drain the names first (cursor-while-DDL would deadlock on single-session PGlite).
+	names, err := s.collectionNames(ctx)
+	if err == nil {
+		for _, n := range names {
+			_, _ = s.pool.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS owner text`, quoteIdent("rec_"+n)))
+		}
+	}
 	return nil
 }
 
