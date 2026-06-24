@@ -1,0 +1,23 @@
+{
+  "name": "supabase-zeropg-db",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "zeropg DB sidecar for the stripped Supabase stack. Uses LOCAL-built @zeropg/* tarballs (vendor/) because the published 0.0.1 predates the PGlite `extensions` forwarding fix — without it CREATE EXTENSION vector fails with 'extension not available' on a ZeroPGServer datadir.",
+  "dependencies": {
+    "@zeropg/blobstore": "file:vendor/zeropg-blobstore-0.0.1.tgz",
+    "@zeropg/lease": "file:vendor/zeropg-lease-0.0.1.tgz",
+    "@zeropg/objectstore-fs": "file:vendor/zeropg-objectstore-fs-0.0.1.tgz",
+    "@zeropg/server": "file:vendor/zeropg-server-0.0.1.tgz",
+    "@electric-sql/pglite": "^0.5",
+    "@electric-sql/pglite-socket": "^0.2",
+    "@electric-sql/pglite-pgvector": "^0.0.4",
+    "pg": "^8.13"
+  },
+  "overrides": {
+    "@zeropg/blobstore": "file:vendor/zeropg-blobstore-0.0.1.tgz",
+    "@zeropg/lease": "file:vendor/zeropg-lease-0.0.1.tgz",
+    "@zeropg/objectstore-fs": "file:vendor/zeropg-objectstore-fs-0.0.1.tgz",
+    "@zeropg/server": "file:vendor/zeropg-server-0.0.1.tgz"
+  }
+}

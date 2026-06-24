@@ -28,13 +28,14 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# Install @zeropg/* from LOCAL-built tarballs (vendor/), NOT npm. The published
+# @zeropg/objectstore-fs@0.0.1 calls PGlite.create({ dataDir }) WITHOUT forwarding
+# `extensions`, so CREATE EXTENSION vector fails ("extension not available") on a
+# ZeroPGServer datadir. The local build forwards extensions (verified). package.json
+# uses file: deps + overrides so the inter-package ^0.0.1 refs resolve to the tarballs.
+COPY package.json ./
+COPY vendor ./vendor
 RUN npm install --omit=dev --no-audit --no-fund \
-      @zeropg/server@0.0.1 \
-      @zeropg/blobstore@0.0.1 \
-      @electric-sql/pglite@^0.5 \
-      @electric-sql/pglite-socket@^0.2 \
-      @electric-sql/pglite-pgvector@^0.0.4 \
-      pg@^8.13 \
  && npm cache clean --force
 
 COPY server.mjs bootstrap.sql ./
