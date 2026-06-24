@@ -42,12 +42,25 @@ spec:
             # outbound firehose connection, so nothing keeps the instance warm.
             - name: COCOON_RELAYS
               value: ""
+            # Admin password + session secret live in Google Secret Manager, never
+            # in this public repo. Mint invite codes (admin Basic auth) with:
+            #   PW=$(gcloud secrets versions access latest --secret cocoon-admin-password --project blob-pglite)
+            #   curl -u "admin:$PW" -X POST -H 'content-type: application/json' \
+            #     https://<host>/xrpc/com.atproto.server.createInviteCode -d '{"useCount":5}'
             - name: COCOON_ADMIN_PASSWORD
-              value: "cocoon-admin-pw"
+              valueFrom:
+                secretKeyRef:
+                  name: cocoon-admin-password
+                  key: latest
             - name: COCOON_SESSION_SECRET
-              value: "cloudrun-cocoon-session-secret-0123456789"
+              valueFrom:
+                secretKeyRef:
+                  name: cocoon-session-secret
+                  key: latest
+            # Public PDSs get spammed: require an invite code for account creation.
+            # createAccount with an empty inviteCode returns InvalidInviteCode.
             - name: COCOON_REQUIRE_INVITE
-              value: "false"
+              value: "true"
             # The Cloud Run URL is deterministic for this project:
             # https://<service>-71428757273.europe-west1.run.app
             # The served did:web document + availableUserDomains use this host; the
@@ -65,6 +78,12 @@ spec:
           env:
             - name: ZEROPG_BUCKET
               value: "zeropg-experiments-euw1"
+            # Reuse the existing GCS snapshot (fast restore). The zeropg sidecar's
+            # proven path is restore-from-snapshot; a fresh/empty prefix forces an
+            # initdb that doesn't come up within Cloud Run's sidecar start window.
+            # Signups here are now invite-gated and the admin password was rotated,
+            # so no new invite codes can be minted; none were ever created on this
+            # datadir (it ran with signups open, which needs no codes).
             - name: ZEROPG_PREFIX
               value: "cloudrun-pds"
             - name: ZEROPG_WIRE_PORT

@@ -17,6 +17,9 @@ SELFHOST-CANDIDATES.md
 .env
 *.env
 
+# cocoon PDS invite token (mint locally; never commit) - testers use it to sign up live
+examples/cloudrun/pds/INVITE-CODE.local.txt
+
 # loadtest-service build artifacts (bundled at deploy)
 experiments/loadtest-service/dist/
 

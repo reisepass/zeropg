@@ -43,8 +43,11 @@ zeropg isn't just a storage demo — **real, unmodified open-source apps run on 
 | **Rallly** | Doodle | [rallly-zeropg](https://rallly-zeropg-71428757273.europe-west1.run.app) | 130 (citext, pgcrypto) | [examples/cloudrun/rallly](examples/cloudrun/rallly) |
 | **Documenso** | DocuSign | [documenso-zeropg](https://documenso-zeropg-71428757273.europe-west1.run.app) | 162 (pgcrypto, pg_trgm) | [examples/cloudrun/documenso](examples/cloudrun/documenso) |
 | **Cal.com** | Calendly | [calcom-zeropg](https://calcom-zeropg-71428757273.europe-west1.run.app) | 588 (no extensions) | [examples/cloudrun/calcom](examples/cloudrun/calcom) |
+| **cocoon** | Bluesky PDS | [cocoon-pds-zeropg](https://cocoon-pds-zeropg-71428757273.europe-west1.run.app) | 13 (GORM auto-migrate, no extensions) | [examples/cloudrun/pds](examples/cloudrun/pds) |
 
-(The 4th column is migrations applied to the GCS-backed DB on first boot. First load after idle is a **real cold start** — ~7s for PrivateBin, longer for the heavy Next.js apps as they boot; that's the scale-to-zero tradeoff, not an error.)
+(The 4th column is migrations applied to the GCS-backed DB on first boot. First load after idle is a **real cold start** — **cocoon is the fastest at ~5s**, ~7s for PrivateBin, longer for the heavy Next.js apps as they boot; that's the scale-to-zero tradeoff, not an error.)
+
+**cocoon** is a scale-to-zero [AT Protocol](https://atproto.com) PDS (the server behind a Bluesky account). It's notable because cocoon's driver (Go `pgx`) uses **named server-side prepared statements** - the class that normally collides on the single-session zeropg wire (`42P05`, the sqlx/Diesel wall) - but `pgx` lets you switch to the simple protocol with a **DSN param only** (`?default_query_exec_mode=simple_protocol`), so it runs with no app patch. Public signups are **invite-gated** (PDSs get spammed); see [examples/cloudrun/pds](examples/cloudrun/pds).
 
 **The only change per app** (the app image is the official one, untouched):
 

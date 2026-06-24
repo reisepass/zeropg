@@ -50,6 +50,28 @@ there, so creating an account needs outbound internet and registers a real
 `did:plc`. Record write/read and reads of existing accounts need no external
 infra, so cold-start of an existing PDS is fully self-contained.
 
+## Signups are invite-gated (public PDSs get spammed)
+
+`COCOON_REQUIRE_INVITE=true`, so `com.atproto.server.createAccount` rejects an
+empty/invalid `inviteCode` with `InvalidInviteCode` (verified live: no code -> 400,
+bogus code -> 400, valid minted code -> 200 with a real `did:plc` + `accessJwt`).
+
+The admin password and session secret are **not** in this repo - they live in
+Google Secret Manager (`cocoon-admin-password`, `cocoon-session-secret`) and the
+service references them via `valueFrom.secretKeyRef`; the Cloud Run runtime SA has
+`roles/secretmanager.secretAccessor` on them. Mint an invite code (admin Basic auth):
+
+```
+PW=$(gcloud secrets versions access latest --secret cocoon-admin-password --project blob-pglite)
+curl -s -u "admin:$PW" -X POST -H 'content-type: application/json' \
+  https://cocoon-pds-zeropg-71428757273.europe-west1.run.app/xrpc/com.atproto.server.createInviteCode \
+  -d '{"useCount":5}'
+```
+
+The returned code is written to `INVITE-CODE.local.txt` (gitignored) for live
+testing - it is never committed. To verify the gate yourself, hit
+`com.atproto.server.describeServer` and check `inviteCodeRequired: true`.
+
 ## Cold start (the headline metric)
 
 Measured from the Cloud Run boot timeline of a fresh instance that restored the
