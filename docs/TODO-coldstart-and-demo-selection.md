@@ -19,8 +19,14 @@ slow ones.** Cold start is the selection criterion, because the whole pitch is
 | Rallly | TBD - measure | heavy Next.js |
 | Documenso | TBD - measure | heavy Next.js (Remix) |
 | Cal.com | TBD - measure | heaviest Next.js monorepo; likely slowest |
-| nostream + zeropg + Dragonfly | TBD - agent measuring | + Dragonfly-vs-valkey delta |
+| nostream + zeropg + Dragonfly | **~14.5 s** (valkey ~15.0 s - a wash) | Node app boot + GCS restore dominate; redis never the long pole. Secondary, not headline |
 | webhookx + zeropg + Dragonfly | TBD - agent measuring | if it clears the driver wall + idles |
+
+### nostream + Dragonfly - measured findings (Agent A, live Cloud Run)
+- **Cold start ~14.5 s** (clean autoscaling wake, boot→HTTP 200). valkey baseline ~15.0 s → **Dragonfly vs valkey is a wash** (redis ready 0.64 s vs 0.44 s; the ~5 s GCS restore + heavy nostream Node boot dominate).
+- Confirms the parallel-boot reasoning **on real Cloud Run**, not just local: the Redis sidecar adds ~0 to the critical path.
+- **But for ephemeral cache, valkey:8-alpine is the more minimal pick** - 17.5 MB vs Dragonfly 53.6 MB image, runs at 128mb/256Mi with zero tuning. Dragonfly needs a **256 MiB/thread memory floor**, explicit `--bind=0.0.0.0` (else the Cloud Run TCP probe fails), and lives on `ghcr.io` not Docker Hub.
+- → **Dragonfly's real value is the DURABLE Redis case (persistence/throughput), not ephemeral cache.** That's exactly what the webhookx demo tests next.
 
 Provisional headline set (fast + nice): **cocoon PDS (~5s), PrivateBin (~7s), the
 small storage demos (~4s).** Heavy Next.js apps (Cal.com/Documenso/Rallly) and
