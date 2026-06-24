@@ -418,17 +418,18 @@ func (s *server) handleListUsers(w http.ResponseWriter, r *http.Request, _ *user
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
 		var id, email string
 		var created time.Time
 		if err := rows.Scan(&id, &email, &created); err != nil {
+			rows.Close()
 			writeJSON(w, 500, map[string]any{"error": err.Error()})
 			return
 		}
 		out = append(out, map[string]any{"id": id, "email": email, "created": created})
 	}
+	rows.Close() // release the conn before the count query (single-session safety)
 	var total int
 	_ = s.pool.QueryRow(r.Context(), `SELECT count(*) FROM _users`).Scan(&total)
 	writeJSON(w, 200, map[string]any{"users": out, "totalItems": total, "maxUsers": s.ret.MaxUsers})
@@ -501,24 +502,40 @@ var emailRe = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 var urlRe = regexp.MustCompile(`^https?://`)
 
 func (s *server) handleListCollections(w http.ResponseWriter, r *http.Request, _ *userClaims) {
+	// IMPORTANT: fully drain the cursor BEFORE issuing the per-collection count
+	// queries. Issuing a new query while a cursor is still open serializes badly
+	// against the single-session PGlite wire (the new query blocks behind the open
+	// cursor at the one session) and can deadlock/desync under concurrency.
 	rows, err := s.pool.Query(r.Context(), `SELECT name, fields, list_rule, created FROM _collections ORDER BY created`)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
-	out := []map[string]any{}
+	type collRow struct {
+		name, listRule string
+		fields         []fieldDef
+		created        time.Time
+	}
+	var crs []collRow
 	for rows.Next() {
-		var name, listRule string
-		var fields []fieldDef
-		var created time.Time
-		if err := rows.Scan(&name, &fields, &listRule, &created); err != nil {
+		var cr collRow
+		if err := rows.Scan(&cr.name, &cr.fields, &cr.listRule, &cr.created); err != nil {
+			rows.Close()
 			writeJSON(w, 500, map[string]any{"error": err.Error()})
 			return
 		}
+		crs = append(crs, cr)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	out := []map[string]any{}
+	for _, cr := range crs {
 		var count int
-		_ = s.pool.QueryRow(r.Context(), fmt.Sprintf(`SELECT count(*) FROM %s`, quoteIdent("rec_"+name))).Scan(&count)
-		out = append(out, map[string]any{"name": name, "fields": fields, "list_rule": listRule, "created": created, "records": count})
+		_ = s.pool.QueryRow(r.Context(), fmt.Sprintf(`SELECT count(*) FROM %s`, quoteIdent("rec_"+cr.name))).Scan(&count)
+		out = append(out, map[string]any{"name": cr.name, "fields": cr.fields, "list_rule": cr.listRule, "created": cr.created, "records": count})
 	}
 	writeJSON(w, 200, map[string]any{"collections": out})
 }
