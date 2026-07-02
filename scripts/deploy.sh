@@ -12,7 +12,7 @@ set -euo pipefail
 PROJECT=blob-pglite
 REGION=europe-west1
 REPO=zeropg
-BUCKET=zeropg-experiments-euw1
+BUCKET="${BUCKET:-zeropg-experiments-euw1}"
 SA=blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/service:latest"
 
