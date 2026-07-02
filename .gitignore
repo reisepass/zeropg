@@ -36,3 +36,6 @@ examples/*/generated/
 # prisma-spike generated migrations + scratch
 experiments/prisma-spike/prisma/migrations/
 experiments/prisma-spike/dbpush.ts
+
+# local marketing prep - never commit (personal/company channel drafts)
+local-writing/
