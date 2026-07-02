@@ -75,6 +75,12 @@ POSTGRES-APP-COMPAT.md Limitation 5).
 - On Cloud Run, don't route `/healthz` on the app's public port (the edge intercepts it);
   use another path like `/livez`. Don't set `PORT` yourself on the ingress container. Pin
   app images by `@sha256` digest to force revision rolls.
+- The wire does not carry the streaming `COPY ... FROM stdin` sub-protocol: restoring a
+  default-format pg_dump INTO a pglite-socket endpoint wedges the session. Use
+  `pg_dump --inserts` for zeropg-to-zeropg transfers; dumping OUT (graduation) uses the
+  fast COPY default with no issue ([GRADUATION.md](GRADUATION.md) caveat 3). Client
+  tools must also be >= the PGlite Postgres major (18+) or pg_dump aborts on version
+  mismatch.
 - GCS caps writes per object name at ~1/s: sustained strict-commit writers group-commit
   and pace (handled in the driver; visible as latency, not errors).
 - A write every <15 minutes keeps the instance awake forever: you get always-on prices
