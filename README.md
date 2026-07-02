@@ -95,6 +95,12 @@ migrations, Prisma native query engine, [live](https://documenso-scale-to-zero.0
 dropped from the live set (>120s cold start; code stays in
 [examples/cloudrun/calcom](examples/cloudrun/calcom)).
 
+> All public demo databases are **wiped nightly at 04:10 UTC** (a Cloud Run job
+> fences each demo's bucket, drops the schemas, and lets the app rebuild itself
+> on its next boot - the reset runs on the same lease/fencing machinery the
+> demos are testing; see [scripts/nightly-reset](scripts/nightly-reset/reset.ts)).
+> Treat anything you type into them as gone by tomorrow.
+
 **The only change per app** (the app image is the official one, untouched):
 
 1. Replace the `postgres:` service with the **`zeropg-db` sidecar**: a
@@ -209,7 +215,7 @@ in [STATUS.md](STATUS.md).
 | E3/E3b | cold-start distributions; memory tiers (500MB DB runs in 1GiB) | ✅ |
 | E4 | live lifecycle hazards: revision switches, SIGTERM flush, zombie fencing | ✅ |
 | E6 | cold-backup disaster matrix (crash mid-backup, full primary wipe → byte-identical rebuild) | ✅ |
-| E5 soak + cost | 72h realistic traffic, reconciled against the real bill | pending (cost numbers are modeled from measured constants) |
+| E5 soak + cost | 72h realistic traffic, reconciled against the real bill | 🔄 running since 2026-07-03 ([runbook](docs/E5-SOAK.md)); cost numbers stay modeled until it reconciles |
 
 ## Limits, cost, exit
 

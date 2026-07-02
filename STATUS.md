@@ -44,7 +44,7 @@ Durable strict write on the 50MB demo: ~200ms server-side (scan 1.3ms + segment 
 
 ## Next steps, in order
 
-1. **E5 - 72h soak + real billing** (traffic generator exists as a plan in EXPERIMENTS.md; GC tool ready in `scripts/gc.ts`). Validate COST-MODEL.md line-by-line against the bill.
+1. **E5 - 72h soak + real billing** — 🔄 RUNNING since 2026-07-03: dedicated service `zeropg-e5-soak` + bucket `zeropg-e5-soak-euw1`, deterministic long-tail burst driver on a 20-min Cloud Scheduler cadence, continuous md5 + durable-watermark integrity checks, kills mixed in. Runbook + reconciliation procedure: `docs/E5-SOAK.md`. After 72h+: reconcile COST-MODEL.md line-by-line against the bill, run `scripts/gc.ts`, update the scoreboards.
 2. **v2 GCS ops** (COST-MODEL.md status section): `compose`-based segment folding (32:1 server-side, zero instance CPU), restore-budget-driven compaction, appendable-objects watch.
 3. R2/S3 drivers (the `BlobStore` + `CostModel` interfaces are ready; R2 is the cost-optimal target).
 4. Read replicas / CDN hydration story (R2 first — free egress).
@@ -55,3 +55,4 @@ Durable strict write on the 50MB demo: ~200ms server-side (scan 1.3ms + segment 
 - GCP: project `blob-pglite`, region `europe-west1`, bucket `zeropg-experiments-euw1` (soft delete OFF — verified; keep it off, it would bill 7 days of storage on every GC'd snapshot).
 - Deploys: `scripts/deploy.sh <svc> <prefix> <label> [flags]`, `SKIP_BUILD=1` to reuse the image. Demo durability via `DURABILITY=sleep|interval|strict`.
 - Branching: `tsx scripts/branch.ts <src> <dest>` (server-side copy; 500MB in 0.34s). GC: `tsx scripts/gc.ts <prefix> [--dry-run]`.
+- **Nightly demo reset** (since 2026-07-03): Cloud Run job `nightly-demo-reset` + Cloud Scheduler daily 04:10 UTC wipes every public demo DB (fence-takeover → drop schemas / truncate → commit → roll service → smoke). Code: `scripts/nightly-reset/reset.ts`; deploy: `scripts/deploy-nightly-reset.sh`. Excluded: cocoon PDS (real AT-Proto identities), nostream/webhookx (not publicly promoted), Tigris/R2/IBM demos (other clouds). Run a subset by executing the job with `DEMOS_FILTER=<names>`.
