@@ -3,8 +3,9 @@
 // = standard ZeroPGServer (GCS-backed scale-to-zero PGlite + Postgres wire on
 // 127.0.0.1:5432 + GCS persistence) PLUS, for this stack:
 //
-//   1. PGVECTOR PRELOADED (@electric-sql/pglite-pgvector — the separate npm pkg,
-//      NOT contrib/*) + pgcrypto. So `CREATE EXTENSION vector` works.
+//   1. NO extensions. GoTrue + PostgREST + the demo schema need none (verified:
+//      GoTrue migrates + signup works with zero extensions). This lets the image
+//      install the PUBLISHED @zeropg/* packages directly — no vendored tarballs.
 //
 //   2. BUILT-IN POSTGREST ON. @zeropg/server spawns the PostgREST Haskell binary
 //      against the local wire with the single-session kill-switch already applied
@@ -37,8 +38,6 @@
 
 import { ZeroPGServer } from '@zeropg/server'
 import { GcsBlobStore } from '@zeropg/blobstore'
-import { vector } from '@electric-sql/pglite-pgvector'
-import { pgcrypto } from '@electric-sql/pglite/contrib/pgcrypto'
 import pg from 'pg'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
@@ -67,7 +66,6 @@ await ZeroPGServer.start({
   restPort: Number(process.env.ZEROPG_REST_PORT || 3000),
   postgrest: !/^(off|false|0)$/i.test(process.env.ZEROPG_POSTGREST ?? ''),
   restSchemas: process.env.ZEROPG_REST_SCHEMAS || 'public',
-  extensions: { vector, pgcrypto },
   schemaSql: bootstrapSql,
   label: process.env.APP_LABEL || 'supabase zeropg-db',
 })
@@ -99,5 +97,5 @@ setLiveSearchPath().catch((e) => {
 
 console.log(
   `[zeropg-db] up: GCS=${bucket}/${prefix} wire=127.0.0.1:${WIRE} ` +
-    `rest=127.0.0.1:${process.env.ZEROPG_REST_PORT || 3000} control=:${CTRL} (PGlite + pgvector + pgcrypto)`,
+    `rest=127.0.0.1:${process.env.ZEROPG_REST_PORT || 3000} control=:${CTRL} (PGlite, no extensions)`,
 )

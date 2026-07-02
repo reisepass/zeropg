@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Supabase on zeropg — scale-to-zero</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 0; background: #0b0f17; color: #e6edf3; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .sub { color: #8b95a5; margin: 0 0 20px; font-size: 13px; }
+    .card { background: #131927; border: 1px solid #232b3b; border-radius: 12px; padding: 18px; margin: 14px 0; }
+    label { display: block; font-size: 12px; color: #8b95a5; margin: 8px 0 4px; }
+    input { width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid #2a3344; background: #0d1320; color: #e6edf3; font-size: 14px; }
+    button { padding: 9px 14px; border-radius: 8px; border: 0; background: #2f6feb; color: #fff; font-weight: 600; cursor: pointer; font-size: 14px; }
+    button.secondary { background: #232b3b; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .row { display: flex; gap: 8px; align-items: end; }
+    .row > div { flex: 1; }
+    .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; }
+    .pill.up { background: #133a1f; color: #4ade80; }
+    .pill.down { background: #3a1313; color: #f87171; }
+    .pill.wait { background: #3a2f13; color: #fbbf24; }
+    ul { list-style: none; padding: 0; margin: 8px 0 0; }
+    li { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #1c2433; }
+    li .body { flex: 1; }
+    li.done .body { text-decoration: line-through; color: #6b7686; }
+    .muted { color: #6b7686; font-size: 12px; }
+    code { background: #0d1320; padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+    #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 11px; color: #8b95a5; max-height: 140px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Supabase on zeropg <span id="status" class="pill wait" data-testid="status">booting…</span></h1>
+    <p class="sub">Stripped self-hosted Supabase (PostgREST + GoTrue) on a Postgres that scales to zero. The shell renders instantly; the database restores from GCS behind it.</p>
+
+    <div class="card" id="auth-card">
+      <div class="row">
+        <div><label>email</label><input id="email" type="email" placeholder="you@example.com" autocomplete="username" /></div>
+        <div><label>password</label><input id="password" type="password" placeholder="••••••••" autocomplete="current-password" /></div>
+      </div>
+      <div style="margin-top:12px; display:flex; gap:8px;">
+        <button id="signup" data-testid="signup" disabled>Sign up</button>
+        <button id="login" class="secondary" data-testid="login" disabled>Log in</button>
+        <button id="logout" class="secondary" data-testid="logout" style="display:none;">Log out</button>
+      </div>
+      <p class="muted" id="who" data-testid="who" style="margin-top:10px;"></p>
+    </div>
+
+    <div class="card" id="todos-card" style="display:none;">
+      <strong>Your todos</strong> <span class="muted">(RLS: you only ever see your own rows)</span>
+      <div class="row" style="margin-top:10px;">
+        <div><input id="newtask" placeholder="new task…" data-testid="newtask" /></div>
+        <button id="add" data-testid="add">Add</button>
+      </div>
+      <ul id="todos" data-testid="todos"></ul>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+    const $ = (s) => document.querySelector(s)
+    const logEl = $('#log')
+    const log = (m) => { logEl.textContent += m + '\n'; logEl.scrollTop = logEl.scrollHeight; console.log(m) }
+    const statusEl = $('#status')
+    const setStatus = (txt, cls) => { statusEl.textContent = txt; statusEl.className = 'pill ' + cls }
+
+    // 1. Fetch config (anon key + base url). This call also WAKES the db sidecar.
+    log('fetching /api/config (wakes backend)…')
+    const cfg = await (await fetch('/api/config')).json()
+    const supabase = createClient(cfg.url, cfg.anonKey, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, storageKey: 'zeropg-supabase' },
+    })
+    log('supabase-js client created against ' + cfg.url)
+
+    // 2. Poll readiness; the shell is already interactive. Enable auth when ready.
+    async function waitReady() {
+      for (let i = 0; i < 120; i++) {
+        try {
+          const r = await (await fetch('/api/ready')).json()
+          if (r.ready) { setStatus('ready', 'up'); return true }
+          setStatus(`waking (db:${r.db ? 'up' : '…'} auth:${r.auth ? 'up' : '…'})`, 'wait')
+        } catch {}
+        await new Promise((res) => setTimeout(res, 1000))
+      }
+      setStatus('backend timeout', 'down'); return false
+    }
+
+    let session = null
+    function renderAuth() {
+      const signedIn = !!session
+      $('#signup').disabled = !ready || signedIn
+      $('#login').disabled = !ready || signedIn
+      $('#logout').style.display = signedIn ? '' : 'none'
+      $('#signup').style.display = signedIn ? 'none' : ''
+      $('#login').style.display = signedIn ? 'none' : ''
+      $('#todos-card').style.display = signedIn ? '' : 'none'
+      $('#who').textContent = signedIn ? ('signed in as ' + session.user.email + ' (uid ' + session.user.id + ')') : ''
+    }
+
+    async function loadTodos() {
+      const { data, error } = await supabase.from('todos').select('id,task,done').order('id')
+      if (error) { log('select todos error: ' + error.message); return }
+      const ul = $('#todos'); ul.innerHTML = ''
+      for (const t of data) {
+        const li = document.createElement('li')
+        li.className = t.done ? 'done' : ''
+        li.dataset.testid = 'todo'
+        li.innerHTML = `<input type="checkbox" ${t.done ? 'checked' : ''}/><span class="body">${t.task}</span>`
+        li.querySelector('input').onchange = async (e) => {
+          await supabase.from('todos').update({ done: e.target.checked }).eq('id', t.id); loadTodos()
+        }
+        ul.appendChild(li)
+      }
+      log('loaded ' + data.length + ' todos (RLS-scoped to you)')
+    }
+
+    $('#add').onclick = async () => {
+      const task = $('#newtask').value.trim(); if (!task) return
+      const { error } = await supabase.from('todos').insert({ task })
+      if (error) { log('insert error: ' + error.message); return }
+      $('#newtask').value = ''; loadTodos()
+    }
+
+    $('#signup').onclick = async () => {
+      const email = $('#email').value, password = $('#password').value
+      log('signUp ' + email + '…')
+      const { data, error } = await supabase.auth.signUp({ email, password })
+      if (error) { log('signUp error: ' + error.message); return }
+      session = data.session
+      if (!session) { log('signed up; now logging in…'); return $('#login').onclick() }
+      log('signed up + session established'); renderAuth(); loadTodos()
+    }
+    $('#login').onclick = async () => {
+      const email = $('#email').value, password = $('#password').value
+      log('signInWithPassword ' + email + '…')
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+      if (error) { log('login error: ' + error.message); return }
+      session = data.session; log('logged in'); renderAuth(); loadTodos()
+    }
+    $('#logout').onclick = async () => { await supabase.auth.signOut(); session = null; log('logged out'); renderAuth() }
+
+    let ready = false
+    const { data: { session: existing } } = await supabase.auth.getSession()
+    session = existing
+    renderAuth()
+    ready = await waitReady()
+    renderAuth()
+    if (session) loadTodos()
+  </script>
+</body>
+</html>
