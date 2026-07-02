@@ -12,11 +12,11 @@ real Postgres the whole time.**
 |---|---|---|---|
 | 1 | [posts/01-the-idea.md](posts/01-the-idea.md) | the idea manifesto: zero-idle-cost Postgres + a boring exit | [twitter/thread-01](twitter/thread-01-the-idea.md) |
 | 2 | [posts/02-the-cold-start-equation.md](posts/02-the-cold-start-equation.md) | cold ≈ restore + app boot; the DB is not the bottleneck, your framework is | [twitter/thread-02](twitter/thread-02-cold-start.md) |
-| 3 | [posts/03-the-bucket-is-the-database.md](posts/03-the-bucket-is-the-database.md) | one conditional PUT is the whole commit protocol | |
+| 3 | [posts/03-the-bucket-is-the-database.md](posts/03-the-bucket-is-the-database.md) | one conditional PUT is the whole commit protocol | [twitter/thread-03](twitter/thread-03-bucket-is-the-database.md) |
 | 4 | [posts/04-bugs-the-crash-harness-caught.md](posts/04-bugs-the-crash-harness-caught.md) | war stories: the silent-data-loss bug and 13 friends | [twitter/thread-04](twitter/thread-04-war-stories.md) |
-| 5 | [posts/05-durability-is-a-dial.md](posts/05-durability-is-a-dial.md) | ack-from-memory vs ack-from-bucket is a per-workload choice | |
-| 6 | [posts/06-unmodified-apps.md](posts/06-unmodified-apps.md) | 8 real apps ran unmodified; the only recurring blocker was bundled extensions | |
-| 7 | [posts/07-the-break-even-math.md](posts/07-the-break-even-math.md) | it is request spacing, not request count, that bills | |
+| 5 | [posts/05-durability-is-a-dial.md](posts/05-durability-is-a-dial.md) | ack-from-memory vs ack-from-bucket is a per-workload choice | [twitter/thread-05](twitter/thread-05-durability-dial.md) |
+| 6 | [posts/06-unmodified-apps.md](posts/06-unmodified-apps.md) | 8 real apps ran unmodified; the only recurring blocker was bundled extensions | [twitter/thread-06](twitter/thread-06-unmodified-apps.md) |
+| 7 | [posts/07-the-break-even-math.md](posts/07-the-break-even-math.md) | it is request spacing, not request count, that bills | [twitter/thread-07](twitter/thread-07-break-even.md) |
 
 Publishing notes:
 
