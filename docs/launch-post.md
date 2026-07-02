@@ -1,6 +1,12 @@
 # zeropg: a Postgres that costs zero when nobody's using it
 
-*Draft launch post — numbers measured live on Cloud Run + GCS, June 2026.*
+> **SUPERSEDED (2026-07-02).** This early draft predates v1 incremental WAL shipping
+> being the headline, the 8-app compatibility campaign, and the cold-start model. The
+> current, publishable series lives in [`../content/`](../content/README.md); the
+> updated anchor post is [`../content/posts/01-the-idea.md`](../content/posts/01-the-idea.md).
+> Kept for the record; some numbers below are v0-era.
+
+*Draft launch post - numbers measured live on Cloud Run + GCS, June 2026.*
 
 Here is a Postgres database with no database server behind it:
 
@@ -29,7 +35,7 @@ And still, "every write durable before ack" is the wrong default for an app that
 - **Exit politely.** Cloud Run rate-limits containers that exit non-zero (429s for tens of seconds — crash-restart backoff). Intentional restarts must exit 0.
 - **Boot patiently.** During a revision switch the new instance boots while the old one still holds the lease. Failing the boot is wrong; waiting out the TTL (≤90s) makes deploys seamless.
 
-## Honest limits
+## Limits, stated plainly
 
 One writer. Database must fit in instance memory. v0 strict writes are slow on big DBs (that's what WAL shipping fixes). And cold starts are real — 3.5s small, ~11s at 500MB — fine for side projects, internal tools, per-tenant DBs, preview envs; wrong for a checkout path.
 
