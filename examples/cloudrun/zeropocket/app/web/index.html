@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>zeropocket — admin</title>
+<style>
+  /* Palette adapted from PocketBase's admin: dark sidebar, light content,
+     accent blue, IBM-Plex-ish system stack (no web-font fetch, for fast paint). */
+  :root{
+    --sidebar:#25272d; --sidebar-alt:#2d2f36; --sidebar-line:#3a3d45;
+    --sidebar-txt:#e6e9ef; --sidebar-mut:#9aa1ad;
+    --bg:#f4f6f8; --surface:#ffffff; --surface-alt:#f8f9fa; --line:#e4e8ec; --line2:#dce0e5;
+    --txt:#25272d; --mut:#687278; --disabled:#a2a9ae;
+    --accent:#1055c9; --accent-d:#0e49ad; --accent-soft:#e7eefb;
+    --success:#22a96d; --danger:#c33751; --warning:#e57534;
+    --radius:6px; --sidebar-w:240px;
+    --font: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;}
+  body{font-family:var(--font);font-size:14px;line-height:1.5;color:var(--txt);background:var(--bg);}
+  a{color:var(--accent);text-decoration:none;}
+  button{font:inherit;cursor:pointer;border:0;border-radius:var(--radius);padding:8px 14px;background:var(--accent);color:#fff;transition:background .12s;}
+  button:hover{background:var(--accent-d);}
+  button.ghost{background:transparent;border:1px solid var(--line2);color:var(--txt);}
+  button.ghost:hover{background:var(--surface-alt);}
+  button.danger{background:transparent;border:1px solid var(--danger);color:var(--danger);}
+  button.danger:hover{background:var(--danger);color:#fff;}
+  button.sm{padding:4px 9px;font-size:12px;}
+  button:disabled{opacity:.5;cursor:not-allowed;}
+  input,select,textarea{font:inherit;width:100%;padding:8px 10px;border:1px solid var(--line2);border-radius:var(--radius);background:var(--surface);color:var(--txt);}
+  input:focus,select:focus,textarea:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
+  label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin:10px 0 4px;}
+  code{font-family:var(--mono);font-size:12px;background:var(--surface-alt);border:1px solid var(--line);border-radius:4px;padding:1px 5px;word-break:break-all;}
+  .mut{color:var(--mut);} .danger-txt{color:var(--danger);} .ok-txt{color:var(--success);}
+  .hidden{display:none !important;}
+
+  /* layout */
+  #app{display:flex;min-height:100vh;}
+  aside{width:var(--sidebar-w);background:var(--sidebar);color:var(--sidebar-txt);display:flex;flex-direction:column;position:fixed;top:0;bottom:0;left:0;}
+  aside .brand{padding:18px 18px 12px;display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--sidebar-line);}
+  aside .brand .logo{width:28px;height:28px;border-radius:7px;background:linear-gradient(135deg,#1055c9,#22a96d);display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:15px;}
+  aside .brand b{font-size:15px;}
+  aside .brand small{display:block;color:var(--sidebar-mut);font-size:10.5px;font-weight:500;letter-spacing:.02em;}
+  aside nav{padding:10px 8px;overflow-y:auto;flex:1;}
+  aside .navlabel{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--sidebar-mut);padding:12px 10px 5px;}
+  aside .navitem{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:var(--radius);color:var(--sidebar-txt);cursor:pointer;font-size:13.5px;}
+  aside .navitem:hover{background:var(--sidebar-alt);}
+  aside .navitem.active{background:var(--accent);color:#fff;}
+  aside .navitem .count{margin-left:auto;font-size:11px;color:var(--sidebar-mut);background:rgba(255,255,255,.08);padding:0 6px;border-radius:999px;}
+  aside .navitem.active .count{color:#fff;background:rgba(255,255,255,.2);}
+  aside .ico{width:16px;text-align:center;opacity:.85;}
+  aside .foot{padding:12px;border-top:1px solid var(--sidebar-line);font-size:12px;color:var(--sidebar-mut);}
+  aside .foot .email{color:var(--sidebar-txt);word-break:break-all;}
+  main{margin-left:var(--sidebar-w);flex:1;display:flex;flex-direction:column;min-width:0;}
+  header.bar{height:56px;background:var(--surface);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;padding:0 22px;position:sticky;top:0;z-index:5;}
+  header.bar h1{font-size:16px;margin:0;font-weight:600;}
+  header.bar .sub{color:var(--mut);font-size:12px;}
+  #status{margin-left:auto;font-size:11.5px;padding:3px 10px;border-radius:999px;border:1px solid var(--line2);color:var(--mut);display:flex;gap:6px;align-items:center;}
+  #status .dot{width:7px;height:7px;border-radius:50%;background:var(--disabled);}
+  #status.ready{color:var(--success);border-color:var(--success);} #status.ready .dot{background:var(--success);}
+  #status.warming{color:var(--warning);border-color:var(--warning);} #status.warming .dot{background:var(--warning);animation:pulse 1s infinite;}
+  #status.error{color:var(--danger);border-color:var(--danger);} #status.error .dot{background:var(--danger);}
+  @keyframes pulse{50%{opacity:.3;}}
+  .content{padding:22px;max-width:1200px;width:100%;}
+
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:18px;margin-bottom:16px;}
+  .card h2{font-size:14px;margin:0 0 14px;font-weight:600;}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;}
+  .row>div{flex:1;min-width:150px;}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
+  .grow{flex:1;}
+
+  table{width:100%;border-collapse:collapse;font-size:13px;background:var(--surface);}
+  thead th{text-align:left;padding:9px 12px;border-bottom:2px solid var(--line2);color:var(--mut);font-weight:600;font-size:12px;white-space:nowrap;cursor:pointer;user-select:none;}
+  thead th:hover{color:var(--txt);}
+  thead th .arrow{font-size:10px;opacity:.6;}
+  tbody td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;}
+  tbody tr:hover{background:var(--surface-alt);}
+  .tablewrap{border:1px solid var(--line);border-radius:9px;overflow:hidden;overflow-x:auto;}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;border:1px solid var(--line2);color:var(--mut);}
+  .pill.public{color:var(--success);border-color:var(--success);background:#eafaf2;}
+  .pill.auth{color:var(--accent);border-color:var(--accent);background:var(--accent-soft);}
+  .tag{display:inline-block;font-size:10.5px;background:var(--surface-alt);border:1px solid var(--line2);border-radius:4px;padding:0 5px;color:var(--mut);margin-left:6px;}
+
+  .fieldrow{display:flex;gap:8px;margin-bottom:7px;align-items:center;}
+  .fieldrow input{flex:2;} .fieldrow select{flex:1;} .fieldrow .opts{flex:2;}
+  .msg{margin-top:8px;font-size:13px;} .msg.err{color:var(--danger);} .msg.ok{color:var(--success);}
+  .empty{padding:30px;text-align:center;color:var(--mut);}
+  .pager{display:flex;gap:8px;align-items:center;margin-top:12px;justify-content:flex-end;font-size:13px;}
+  .stat{display:inline-flex;flex-direction:column;background:var(--surface-alt);border:1px solid var(--line);border-radius:var(--radius);padding:9px 14px;margin:0 10px 10px 0;min-width:120px;}
+  .stat b{font-size:20px;} .stat span{font-size:11px;color:var(--mut);}
+
+  /* auth (login) screen */
+  #login{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(1200px 600px at 50% -10%, #2d2f36 0%, #1c1d22 60%);}
+  #login .box{width:380px;background:var(--surface);border-radius:12px;padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.35);}
+  #login .logo{width:46px;height:46px;border-radius:11px;background:linear-gradient(135deg,#1055c9,#22a96d);display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:22px;margin-bottom:14px;}
+  #login h1{font-size:19px;margin:0 0 2px;} #login p.sub{margin:0 0 18px;color:var(--mut);font-size:13px;}
+  #login .actions{display:flex;gap:10px;margin-top:16px;} #login .actions button{flex:1;}
+</style>
+</head>
+<body>
+
+<!-- LOGIN (rendered instantly, zero DB) -->
+<div id="login">
+  <div class="box">
+    <div class="logo">z</div>
+    <h1>zeropocket</h1>
+    <p class="sub">PocketBase-style backend on zeropg · scale-to-zero Postgres</p>
+    <label>Email</label>
+    <input id="email" type="email" placeholder="you@example.com" autocomplete="username" />
+    <label>Password</label>
+    <input id="password" type="password" placeholder="min 6 characters" autocomplete="current-password" />
+    <div class="actions">
+      <button id="loginBtn">Log in</button>
+      <button id="registerBtn" class="ghost">Create account</button>
+    </div>
+    <div id="authMsg" class="msg err"></div>
+    <p class="mut" style="font-size:12px;margin-top:16px;">First time? Create an account to get an admin session. This is a public demo with default data-retention limits.</p>
+  </div>
+</div>
+
+<!-- APP SHELL -->
+<div id="app" class="hidden">
+  <aside>
+    <div class="brand">
+      <div class="logo">z</div>
+      <div><b>zeropocket</b><small>NOT PocketBase · runs on zeropg</small></div>
+    </div>
+    <nav>
+      <div class="navlabel">Data</div>
+      <div id="navCollections"></div>
+      <div class="navitem" data-route="new-collection"><span class="ico">＋</span> New collection</div>
+      <div class="navlabel">Manage</div>
+      <div class="navitem" data-route="users"><span class="ico">◔</span> Users</div>
+      <div class="navitem" data-route="settings"><span class="ico">⚙</span> Settings</div>
+    </nav>
+    <div class="foot">
+      <div class="email" id="footEmail"></div>
+      <a href="#" id="logoutBtn" style="color:var(--sidebar-mut);">Log out →</a>
+    </div>
+  </aside>
+  <main>
+    <header class="bar">
+      <h1 id="viewTitle">Collections</h1>
+      <span class="sub" id="viewSub"></span>
+      <span id="status"><span class="dot"></span><span class="lbl">connecting…</span></span>
+    </header>
+    <div class="content" id="view"></div>
+  </main>
+</div>
+
+<script>
+const $ = (s,r=document)=>r.querySelector(s);
+const el = (t,a={},...kids)=>{const e=document.createElement(t);for(const k in a){if(a[k]==null)continue;if(k==='class')e.className=a[k];else if(k==='html')e.innerHTML=a[k];else if(k.startsWith('on'))e.addEventListener(k.slice(2),a[k]);else e.setAttribute(k,a[k]);}for(const k of kids.flat()){if(k!=null)e.append(k.nodeType?k:document.createTextNode(k));}return e;};
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+let token = localStorage.getItem('zp_token')||'';
+let me = JSON.parse(localStorage.getItem('zp_me')||'null');
+let collections = [];
+
+async function api(method, path, body){
+  const h={'Content-Type':'application/json'};
+  if(token) h['Authorization']='Bearer '+token;
+  const res=await fetch(path,{method,headers:h,body:body?JSON.stringify(body):undefined});
+  let data=null; try{data=await res.json();}catch(_){}
+  if(!res.ok) throw new Error((data&&data.error)||(method+' '+path+' → '+res.status));
+  return data;
+}
+
+// WAKE backend the instant the page loads (fire-and-forget); UI never waits on it.
+fetch('/api/wake',{method:'POST'}).catch(()=>{});
+
+// status poller
+async function pollStatus(){
+  const s=$('#status'); if(!s)return;
+  try{
+    const h=await (await fetch('/api/health')).json();
+    const lbl=s.querySelector('.lbl');
+    if(h.db==='ready'){lbl.textContent='db ready';s.className='ready';}
+    else if(h.db==='warming'){lbl.textContent='db warming…';s.className='warming';setTimeout(pollStatus,900);}
+    else{lbl.textContent='db error';s.className='error';}
+  }catch(_){const lbl=s.querySelector('.lbl');if(lbl)lbl.textContent='offline';s.className='error';setTimeout(pollStatus,2000);}
+}
+
+// ---------- auth ----------
+async function doAuth(path){
+  $('#authMsg').textContent='';
+  try{
+    const r=await api('POST',path,{email:$('#email').value.trim(),password:$('#password').value});
+    token=r.token; me=r.user;
+    localStorage.setItem('zp_token',token); localStorage.setItem('zp_me',JSON.stringify(me));
+    enterApp();
+  }catch(e){$('#authMsg').textContent=e.message;}
+}
+$('#loginBtn').onclick=()=>doAuth('/api/auth/login');
+$('#registerBtn').onclick=()=>doAuth('/api/auth/register');
+$('#password').addEventListener('keydown',e=>{if(e.key==='Enter')doAuth('/api/auth/login');});
+
+function logout(){token='';me=null;localStorage.clear();location.hash='';location.reload();}
+
+function enterApp(){
+  $('#login').classList.add('hidden');
+  $('#app').classList.remove('hidden');
+  $('#footEmail').textContent = me?me.email:'';
+  $('#logoutBtn').onclick=e=>{e.preventDefault();logout();};
+  pollStatus();
+  loadCollections().then(()=>route());
+}
+
+// ---------- router (hash-based; every view has a URL) ----------
+window.addEventListener('hashchange',route);
+function go(h){location.hash=h;}
+function route(){
+  if(!token){return;}
+  const h=(location.hash||'#/collections').slice(1);
+  const parts=h.split('/').filter(Boolean); // e.g. ['c','posts']
+  setActiveNav(h);
+  if(parts[0]==='c'&&parts[1]) return viewRecords(parts[1]);
+  if(parts[0]==='new-collection') return viewNewCollection();
+  if(parts[0]==='users') return viewUsers();
+  if(parts[0]==='settings') return viewSettings();
+  return viewCollectionsHome();
+}
+function setActiveNav(h){
+  document.querySelectorAll('aside .navitem').forEach(n=>{
+    const r=n.dataset.route, c=n.dataset.coll;
+    let on=false;
+    if(c) on = h==='/c/'+c;
+    else if(r==='new-collection') on = h==='/new-collection';
+    else if(r==='users') on = h==='/users';
+    else if(r==='settings') on = h==='/settings';
+    n.classList.toggle('active',on);
+  });
+}
+
+// ---------- collections ----------
+async function loadCollections(){
+  try{ const r=await api('GET','/api/collections'); collections=r.collections||[]; renderNav(); }
+  catch(e){ /* shown per-view */ }
+}
+function renderNav(){
+  const box=$('#navCollections'); box.innerHTML='';
+  if(!collections.length){ box.append(el('div',{class:'navitem mut',style:'cursor:default;opacity:.6;'},'No collections yet')); }
+  for(const c of collections){
+    const item=el('div',{class:'navitem','data-coll':c.name,onclick:()=>go('/c/'+c.name)},
+      el('span',{class:'ico'},'▤'), c.name, el('span',{class:'count'},String(c.records||0)));
+    box.append(item);
+  }
+  document.querySelectorAll('aside .navitem[data-route]').forEach(n=>n.onclick=()=>go('/'+n.dataset.route));
+}
+
+function setTitle(t,sub){ $('#viewTitle').textContent=t; $('#viewSub').textContent=sub||''; }
+
+function viewCollectionsHome(){
+  setTitle('Collections','your data tables on real Postgres');
+  const v=$('#view'); v.innerHTML='';
+  const stats=el('div',{},
+    el('div',{class:'stat'},el('b',{},String(collections.length)),el('span',{},'collections')),
+    el('div',{class:'stat'},el('b',{},String(collections.reduce((a,c)=>a+(c.records||0),0))),el('span',{},'total records')),
+  );
+  v.append(stats);
+  if(!collections.length){
+    v.append(el('div',{class:'card'},el('div',{class:'empty'},'No collections yet. ',el('a',{href:'#/new-collection'},'Create your first collection'),' →')));
+    return;
+  }
+  const rows=collections.map(c=>el('tr',{},
+    el('td',{},el('a',{href:'#/c/'+c.name,style:'font-weight:600;'},c.name)),
+    el('td',{html:c.fields.map(f=>'<span class="tag">'+esc(f.name)+':'+esc(f.type)+'</span>').join(' ')||'<span class="mut">no fields</span>'}),
+    el('td',{},el('span',{class:'pill '+c.list_rule},c.list_rule==='public'?'public read':'auth only')),
+    el('td',{class:'mut'},String(c.records||0)),
+    el('td',{},el('button',{class:'ghost sm',onclick:()=>go('/c/'+c.name)},'open')),
+  ));
+  v.append(el('div',{class:'tablewrap'},el('table',{},
+    el('thead',{},el('tr',{},el('th',{},'Name'),el('th',{},'Fields'),el('th',{},'List access'),el('th',{},'Records'),el('th',{}))),
+    el('tbody',{},rows))));
+}
+
+// ---------- new collection ----------
+const FIELD_TYPES=['text','number','bool','email','url','date','select','relation','json'];
+function fieldRowEl(){
+  const wrap=el('div',{class:'fieldrow'});
+  const nameI=el('input',{placeholder:'field name (e.g. title)'});
+  const typeS=el('select',{},...FIELD_TYPES.map(t=>el('option',{value:t},t)));
+  const opts=el('input',{class:'opts hidden',placeholder:'options or target (comma-sep)'});
+  const reqWrap=el('label',{style:'display:flex;align-items:center;gap:5px;font-size:11px;margin:0;white-space:nowrap;'});
+  const reqCb=el('input',{type:'checkbox',style:'width:auto;'});
+  reqWrap.append(reqCb,'req');
+  const rm=el('button',{class:'ghost sm',type:'button',onclick:()=>wrap.remove()},'✕');
+  typeS.onchange=()=>{ opts.classList.toggle('hidden', !(typeS.value==='select'||typeS.value==='relation'));
+    opts.placeholder = typeS.value==='select'?'options a,b,c':'target collection name'; };
+  wrap.append(nameI,typeS,opts,reqWrap,rm);
+  wrap._read=()=>{
+    const t=typeS.value, f={name:nameI.value.trim(),type:t,required:reqCb.checked};
+    if(t==='select') f.options=opts.value.split(',').map(x=>x.trim()).filter(Boolean);
+    if(t==='relation') f.relation=opts.value.trim();
+    return f.name?f:null;
+  };
+  return wrap;
+}
+function viewNewCollection(){
+  setTitle('New collection','creates a real Postgres table');
+  const v=$('#view'); v.innerHTML='';
+  const card=el('div',{class:'card'});
+  const nameI=el('input',{placeholder:'posts'});
+  const ruleS=el('select',{},el('option',{value:'auth'},'auth only (default) — login required to read'),el('option',{value:'public'},'public read — anyone can list/view records'));
+  const fields=el('div',{});
+  const addBtn=el('button',{class:'ghost sm',type:'button',onclick:()=>fields.append(fieldRowEl())},'+ add field');
+  fields.append(fieldRowEl());
+  const msg=el('div',{class:'msg err'});
+  const create=el('button',{onclick:async()=>{
+    msg.className='msg err'; msg.textContent='';
+    const fs=[...fields.querySelectorAll('.fieldrow')].map(r=>r._read()).filter(Boolean);
+    try{ await api('POST','/api/collections',{name:nameI.value.trim(),list_rule:ruleS.value,fields:fs});
+      await loadCollections(); go('/c/'+nameI.value.trim().toLowerCase());
+    }catch(e){msg.textContent=e.message;}
+  }},'Create collection');
+  card.append(
+    el('label',{},'Collection name'),nameI,
+    el('label',{},'List/view access rule'),ruleS,
+    el('label',{},'Fields'),fields,el('div',{style:'margin-top:6px;'},addBtn),
+    el('div',{style:'margin-top:16px;'},create),msg);
+  v.append(card);
+  v.append(el('div',{class:'card mut',style:'font-size:12.5px;'},
+    el('b',{},'Field types: '),'text, number, bool, email, url, date, json, select (allowed values), relation (id pointing at another collection). Each becomes a typed Postgres column.'));
+}
+
+// ---------- records ----------
+let recState={coll:null,sort:'-created',filter:'',page:1};
+async function viewRecords(name){
+  const coll=collections.find(c=>c.name===name);
+  if(!coll){ setTitle('Records'); $('#view').innerHTML='<div class="card empty">Collection not found.</div>'; return; }
+  if(recState.coll!==name){ recState={coll:name,sort:'-created',filter:'',page:1}; }
+  setTitle(name, coll.list_rule==='public'?'public read':'auth only');
+  const v=$('#view'); v.innerHTML='';
+
+  // add-record form
+  const addCard=el('div',{class:'card'});
+  addCard.append(el('h2',{},'Add record'));
+  const inputs={};
+  const formRow=el('div',{class:'row'});
+  for(const f of coll.fields){
+    const wrap=el('div',{});
+    wrap.append(el('label',{html:esc(f.name)+' <span class="tag">'+esc(f.type)+'</span>'+(f.required?' *':'')}));
+    let inp;
+    if(f.type==='bool'){ inp=el('select',{},el('option',{value:'false'},'false'),el('option',{value:'true'},'true')); }
+    else if(f.type==='select'){ inp=el('select',{},...(f.options||[]).map(o=>el('option',{value:o},o))); }
+    else if(f.type==='relation'){ inp=el('input',{placeholder:'record id in '+f.relation}); }
+    else if(f.type==='json'){ inp=el('textarea',{rows:'2',placeholder:'{"k":"v"}'}); }
+    else if(f.type==='number'){ inp=el('input',{type:'number',step:'any'}); }
+    else if(f.type==='date'){ inp=el('input',{type:'datetime-local'}); }
+    else { inp=el('input',{type:f.type==='email'?'email':'text'}); }
+    inputs[f.name]={inp,type:f.type}; wrap.append(inp); formRow.append(wrap);
+  }
+  const addBtn=el('div',{style:'flex:0 0 auto;'},el('label',{html:'&nbsp;'}),el('button',{onclick:()=>addRecord(name,coll,inputs,addMsg)},'Add'));
+  formRow.append(addBtn);
+  const addMsg=el('div',{class:'msg err'});
+  addCard.append(formRow,addMsg);
+  if(coll.fields.length===0) formRow.prepend(el('div',{class:'mut'},'This collection has no fields. A record will still get id/created.'));
+  v.append(addCard);
+
+  // toolbar: search + access toggle + delete collection
+  const tb=el('div',{class:'toolbar'});
+  const search=el('input',{class:'grow',placeholder:"filter e.g.  title ~ hello   |   votes > 10   |   published = true",value:recState.filter,style:'max-width:480px;'});
+  search.addEventListener('keydown',e=>{if(e.key==='Enter'){recState.filter=search.value.trim();recState.page=1;loadRecs(name,coll);}});
+  const searchBtn=el('button',{class:'ghost sm',onclick:()=>{recState.filter=search.value.trim();recState.page=1;loadRecs(name,coll);}},'search');
+  const clearBtn=el('button',{class:'ghost sm',onclick:()=>{recState.filter='';search.value='';recState.page=1;loadRecs(name,coll);}},'clear');
+  const accessBtn=el('button',{class:'ghost sm',onclick:()=>toggleAccess(name,coll)}, coll.list_rule==='public'?'make auth-only':'make public');
+  const dropBtn=el('button',{class:'danger sm',style:'margin-left:auto;',onclick:()=>dropCollection(name)},'drop collection');
+  tb.append(search,searchBtn,clearBtn,accessBtn,dropBtn);
+  v.append(tb);
+
+  const tableHost=el('div',{id:'recTableHost'});
+  v.append(tableHost);
+  loadRecs(name,coll);
+}
+
+function valFor(inp,type){
+  const raw = inp.value;
+  if(type==='bool') return raw==='true';
+  if(type==='number'){ if(raw==='')return undefined; return Number(raw); }
+  if(type==='json'){ if(raw.trim()==='')return undefined; try{return JSON.parse(raw);}catch(_){throw new Error('invalid json in a field');} }
+  if(type==='date'){ if(!raw)return undefined; return new Date(raw).toISOString(); }
+  if(raw==='') return undefined;
+  return raw;
+}
+async function addRecord(name,coll,inputs,msg){
+  msg.className='msg err'; msg.textContent='';
+  const body={};
+  try{
+    for(const f of coll.fields){ const {inp,type}=inputs[f.name]; const v=valFor(inp,type); if(v!==undefined) body[f.name]=v; }
+  }catch(e){ msg.textContent=e.message; return; }
+  try{ await api('POST','/api/collections/'+name+'/records',body);
+    for(const f of coll.fields){ const {inp,type}=inputs[f.name]; if(type!=='bool'&&type!=='select')inp.value=''; }
+    await loadCollections(); const c=collections.find(x=>x.name===name); loadRecs(name,c||coll);
+    msg.className='msg ok'; msg.textContent='added';
+  }catch(e){ msg.textContent=e.message; }
+}
+async function loadRecs(name,coll){
+  const host=$('#recTableHost'); if(!host)return;
+  host.innerHTML='<div class="card mut">loading…</div>';
+  try{
+    const qs=new URLSearchParams({perPage:'30',page:String(recState.page),sort:recState.sort});
+    if(recState.filter) qs.set('filter',recState.filter);
+    const r=await api('GET','/api/collections/'+name+'/records?'+qs.toString());
+    renderRecTable(host,name,coll,r);
+  }catch(e){ host.innerHTML='<div class="card danger-txt">'+esc(e.message)+'</div>'; }
+}
+function renderRecTable(host,name,coll,r){
+  host.innerHTML='';
+  const cols=['id',...coll.fields.map(f=>f.name),'created'];
+  if(!r.items.length){ host.append(el('div',{class:'tablewrap'},el('div',{class:'empty'},recState.filter?'No records match the filter.':'No records yet — add one above.'))); renderPager(host,name,coll,r); return; }
+  const head=el('tr',{}, ...cols.map(c=>{
+    const cur=recState.sort.replace('-',''); const desc=recState.sort.startsWith('-');
+    const arrow = cur===c ? (desc?' ▼':' ▲') : '';
+    return el('th',{onclick:()=>{ recState.sort = (cur===c&&!desc)?'-'+c : c; loadRecs(name,coll); },html:esc(c)+'<span class="arrow">'+arrow+'</span>'});
+  }), el('th',{}));
+  const body=r.items.map(it=>el('tr',{}, ...cols.map(c=>{
+    if(c==='id') return el('td',{},el('code',{},it[c]));
+    return el('td',{},fmtCell(it[c]));
+  }), el('td',{},el('button',{class:'danger sm',onclick:()=>delRecord(name,coll,it.id)},'del'))));
+  host.append(el('div',{class:'tablewrap'},el('table',{},el('thead',{},head),el('tbody',{},body))));
+  renderPager(host,name,coll,r);
+}
+function fmtCell(v){
+  if(v===null||v===undefined) return el('span',{class:'mut'},'—');
+  if(typeof v==='object') return el('code',{},JSON.stringify(v));
+  if(typeof v==='boolean') return el('span',{class:'pill '+(v?'public':'')},String(v));
+  return document.createTextNode(String(v));
+}
+function renderPager(host,name,coll,r){
+  const pages=Math.max(1,Math.ceil(r.totalItems/r.perPage));
+  const pager=el('div',{class:'pager'},
+    el('span',{class:'mut'},r.totalItems+' record(s) · page '+r.page+'/'+pages),
+    el('button',{class:'ghost sm',disabled:r.page<=1?'true':null,onclick:()=>{if(recState.page>1){recState.page--;loadRecs(name,coll);}}},'‹ prev'),
+    el('button',{class:'ghost sm',disabled:r.page>=pages?'true':null,onclick:()=>{if(recState.page<pages){recState.page++;loadRecs(name,coll);}}},'next ›'));
+  host.append(pager);
+}
+async function delRecord(name,coll,id){
+  try{ await api('DELETE','/api/collections/'+name+'/records/'+id); await loadCollections(); loadRecs(name,collections.find(c=>c.name===name)||coll); }
+  catch(e){ alert(e.message); }
+}
+async function toggleAccess(name,coll){
+  const next=coll.list_rule==='public'?'auth':'public';
+  try{ await api('PATCH','/api/collections/'+name,{list_rule:next}); await loadCollections(); viewRecords(name); }
+  catch(e){ alert(e.message); }
+}
+async function dropCollection(name){
+  if(!confirm('Drop collection "'+name+'" and its table + all records?'))return;
+  try{ await api('DELETE','/api/collections/'+name); await loadCollections(); go('/collections'); }
+  catch(e){ alert(e.message); }
+}
+
+// ---------- users ----------
+async function viewUsers(){
+  setTitle('Users','the auth collection');
+  const v=$('#view'); v.innerHTML='<div class="card mut">loading…</div>';
+  try{
+    const r=await api('GET','/api/users');
+    v.innerHTML='';
+    v.append(el('div',{},
+      el('div',{class:'stat'},el('b',{},String(r.totalItems)),el('span',{},'users')),
+      el('div',{class:'stat'},el('b',{},r.maxUsers?String(r.maxUsers):'∞'),el('span',{},'max (cap)')),
+    ));
+    const rows=r.users.map(u=>el('tr',{},
+      el('td',{},el('code',{},u.id)),
+      el('td',{html:esc(u.email)+(u.id===me.id?' <span class="tag">you</span>':'')}),
+      el('td',{class:'mut'},new Date(u.created).toLocaleString()),
+      el('td',{},u.id===me.id?'':el('button',{class:'danger sm',onclick:()=>delUser(u.id)},'delete')),
+    ));
+    v.append(el('div',{class:'tablewrap'},el('table',{},
+      el('thead',{},el('tr',{},el('th',{},'id'),el('th',{},'email'),el('th',{},'created'),el('th',{}))),
+      el('tbody',{},rows))));
+  }catch(e){ v.innerHTML='<div class="card danger-txt">'+esc(e.message)+'</div>'; }
+}
+async function delUser(id){ if(!confirm('Delete this user?'))return; try{await api('DELETE','/api/users/'+id);viewUsers();}catch(e){alert(e.message);} }
+
+// ---------- settings ----------
+async function viewSettings(){
+  setTitle('Settings','backend + data-retention policy');
+  const v=$('#view'); v.innerHTML='<div class="card mut">loading…</div>';
+  try{
+    const r=await api('GET','/api/settings');
+    const rt=r.retention;
+    v.innerHTML='';
+    v.append(el('div',{class:'card'},el('h2',{},'Backend'),
+      el('div',{class:'mut'},'app'),el('b',{},r.app),
+      el('div',{class:'mut',style:'margin-top:8px;'},'storage'),el('div',{},r.backend)));
+    const rows=[
+      ['Per-collection cap','keep newest N records per collection',rt.per_collection_max||'off'],
+      ['Max age','delete records older than',rt.max_age_days?rt.max_age_days+' days':'off'],
+      ['Global cap','hard limit on total records',rt.global_max||'off'],
+      ['Per-account cap','max records one account may own',rt.per_account_max||'off'],
+      ['Max users','registration closes past this many users',rt.max_users||'off'],
+      ['Max collections','cap on number of collections',rt.max_collections||'off'],
+    ].map(([k,d,vv])=>el('tr',{},el('td',{},el('b',{},k)),el('td',{class:'mut'},d),el('td',{},String(vv))));
+    v.append(el('div',{class:'card'},el('h2',{},'Data retention (enforced lazily, on by default)'),
+      el('p',{class:'mut',style:'margin-top:-6px;'},'This is a public demo, so retention is ON to keep the GCS-backed disk bounded. Limits are env-configurable. Pruning happens inline on insert plus a cheap throttled sweep on read — never a background worker, so the instance still scales to zero.'),
+      el('div',{class:'tablewrap'},el('table',{},el('thead',{},el('tr',{},el('th',{},'Policy'),el('th',{},'Meaning'),el('th',{},'Value'))),el('tbody',{},rows)))));
+  }catch(e){ v.innerHTML='<div class="card danger-txt">'+esc(e.message)+'</div>'; }
+}
+
+// boot
+if(token&&me){ enterApp(); } else { pollStatus(); }
+</script>
+</body>
+</html>

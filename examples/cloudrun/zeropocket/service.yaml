@@ -1,0 +1,77 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: pocketbase-scale-to-zero
+  labels:
+    zeropg-demo: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "1"        # single writer on the GCS datadir
+        autoscaling.knative.dev/minScale: "0"        # scale to zero
+        run.googleapis.com/startup-cpu-boost: "true" # extra CPU during cold start
+        run.googleapis.com/cpu-throttling: "false"   # keep CPU while warm so the db WAL-ship timer runs
+        run.googleapis.com/container-dependencies: '{"app":["db"]}'  # app waits for db /healthz
+    spec:
+      serviceAccountName: blob-pglite-dev@blob-pglite.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        # zeropocket: the PocketBase-style Go binary. Ingress container (serves the
+        # Cloud Run port). Serves the admin UI from memory (no DB) for an instant
+        # cold render; opens the db pool lazily in the background.
+        - name: app
+          # Pinned by digest so `gcloud run services replace` always rolls a new
+          # revision (an identical :latest tag is a no-op and won't redeploy).
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/pocketbase-zeropg@sha256:f7f5f2be7a5716149776fa49da2ca223996f7fea8a7cfb3109fafc512148062e
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            # NOTE: PORT is reserved/injected by Cloud Run for the ingress
+            # container (set to containerPort 8080); do not declare it here.
+            # cache_describe => pgx extended protocol with cached DESCRIBE, no
+            # persisted NAMED prepared statements => no 42P05 on the single-session
+            # PGlite wire (and, unlike simple_protocol, JSONB encodes correctly).
+            # pool_max_conns>1 so concurrent requests don't serialize on one conn.
+            - name: DATABASE_URL
+              value: "postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable&default_query_exec_mode=cache_describe&pool_max_conns=4"
+            # JWT signing secret lives in Secret Manager, never in this public repo.
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pocketbase-jwt-secret
+                  key: latest
+          resources:
+            limits:
+              cpu: "1"
+              memory: 256Mi
+        # zeropg sidecar: GCS-backed Postgres on localhost:5432.
+        - name: db
+          image: europe-west1-docker.pkg.dev/blob-pglite/zeropg/zeropg-db-sidecar:latest
+          env:
+            - name: ZEROPG_BUCKET
+              value: "zeropg-experiments-euw1"
+            - name: ZEROPG_PREFIX
+              value: "cloudrun-pocketbase"
+            - name: ZEROPG_WIRE_PORT
+              value: "5432"
+            - name: PORT
+              value: "8081"
+            - name: APP_LABEL
+              value: "pocketbase-zeropg"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 40                      # allow up to ~2min for first restore/initdb
+  traffic:
+    - percent: 100
+      latestRevision: true
