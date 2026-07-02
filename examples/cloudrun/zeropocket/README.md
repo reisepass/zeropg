@@ -26,11 +26,16 @@ Cloud Run, scaled to **zero** — in one static Go binary with an embedded admin
   **lazily/inline** (prune-on-insert + throttled sweep), never a background worker, so the
   instance still scales to zero.
 
-**Live:** https://pocketbase-scale-to-zero.0rs.org  (run.app:
-https://pocketbase-scale-to-zero-71428757273.europe-west1.run.app)
-
-> The Cloud Run service/domain are still named `pocketbase-*` for infra continuity, but the
-> app, module, and UI are all branded **zeropocket** — it is not affiliated with PocketBase.
+**Live demo: TAKEN DOWN (2026-07-02).** The deployed Cloud Run service and the
+`pocketbase-scale-to-zero.0rs.org` domain mapping were deleted: the name wrongly implied
+the demo WAS PocketBase, and it is not affiliated with PocketBase in any way. The code
+stays as a reference: the measured ~3.5s cold start (the fastest full app we ran, equal
+to the bare restore) remains valid data in
+[docs/COLDSTART-MODEL.md](../../../docs/COLDSTART-MODEL.md), and the patterns here
+(typed collections as real Postgres tables, JWT auth, lazy retention pruning, instant
+zero-DB first paint, `/api/wake`) are the intended base for the zeroSupabase studio
+frontend specced in
+[docs/DIY-zeroSupabaseStudioFrontend.md](../../../docs/DIY-zeroSupabaseStudioFrontend.md).
 
 ## Why this is a re-implementation, not a PocketBase fork
 

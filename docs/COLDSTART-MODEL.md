@@ -36,7 +36,7 @@ platform's container floor). Everything beyond that is the app's own boot weight
 
 - A **static binary** (Go, Rust) makes cold start equal the restore: **~3.5-5s**, the
   same as the bare storage demo. That is the scale-to-zero sweet spot, and it is why
-  the headline demos are zeropocket, cocoon, and PrivateBin, not the Next.js apps.
+  the headline demos are the Go-tier apps (cocoon, PrivateBin), not the Next.js apps.
 - Heavy Node/Next.js apps still run correctly; they just pay their own 20-35s boot on
   every wake. They are compatibility proof, not showcases.
 - **Sidecars are free.** A Redis sidecar (valkey or Dragonfly) boots in ~70-600ms in

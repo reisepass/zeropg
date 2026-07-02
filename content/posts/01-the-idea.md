@@ -58,8 +58,8 @@ Protocol PDS all run against zeropg with only a Docker/config change: swap the
 `postgres:` service for a sidecar, point `DATABASE_URL` at localhost. 880 real
 migrations applied. All live, all scaling to zero, all with the database in a bucket:
 the [PDS](https://pds-scale-to-zero.0rs.org) cold-starts in ~5 seconds,
-[PrivateBin](https://privatebin-scale-to-zero.0rs.org) in ~5, and a PocketBase-style
-backend we wrote in Go ([zeropocket](https://pocketbase-scale-to-zero.0rs.org)) in ~3.5.
+[PrivateBin](https://privatebin-scale-to-zero.0rs.org) in ~5, and a small Go backend we
+wrote as a stress test measured ~3.5s, the same as the bare database demo.
 
 ## The part that makes it safe to recommend: the exit
 

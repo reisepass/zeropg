@@ -77,7 +77,6 @@ frameworks pay their own 20-35s on top. The fast tier:
 
 | app | what it is | cold start | live | source |
 |---|---|---|---|---|
-| **zeropocket** | PocketBase-style backend (collections, auth, admin SPA) we built in Go on zeropg. NOT PocketBase, no SQLite anywhere | **~3.5s** | [pocketbase-scale-to-zero.0rs.org](https://pocketbase-scale-to-zero.0rs.org) | [examples/cloudrun/zeropocket](examples/cloudrun/zeropocket) |
 | **webhookx** | webhook gateway (Go), first needs-Redis app: valkey sidecar scales to zero with it | ~4-5s | (not public) | [examples/cloudrun/webhookx](examples/cloudrun/webhookx) |
 | **httpbin + requestbin** | our own request-echo + capture bins (Go), TTL retention built in | Go-tier | [httpbin-ui-scale-to-zero.0rs.org](https://httpbin-ui-scale-to-zero.0rs.org) | [examples/cloudrun/httpbin](examples/cloudrun/httpbin) |
 | **cocoon** | a Bluesky-compatible AT Protocol PDS (Go, GORM+pgx). Your own PDS, DB in a bucket | ~5s (rarely cold: real AT-Proto traffic keeps it warm) | [pds-scale-to-zero.0rs.org](https://pds-scale-to-zero.0rs.org) | [examples/cloudrun/pds](examples/cloudrun/pds) |
