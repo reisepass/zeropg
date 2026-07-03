@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zeroSupabaseStudio</title>
+  <link rel="icon" href="/studio/favicon.svg" />
+  <link rel="stylesheet" href="/studio/styles.css" />
+</head>
+<body>
+  <!-- Instant shell: paints immediately, before any backend call. -->
+  <div id="app">
+    <aside id="sidebar" class="sidebar" hidden>
+      <div class="brand">zero<span>Studio</span></div>
+      <nav class="nav">
+        <a class="nav-item" data-route="/studio" data-testid="nav-home" href="/studio">Home</a>
+        <a class="nav-item" data-route="/studio/editor" data-testid="nav-editor" href="/studio/editor">Table editor</a>
+        <a class="nav-item" data-route="/studio/sql" data-testid="nav-sql" href="/studio/sql">SQL editor</a>
+        <a class="nav-item" data-route="/studio/logs" data-testid="nav-logs" href="/studio/logs">Logs</a>
+        <a class="nav-item" data-route="/studio/settings" data-testid="nav-settings" href="/studio/settings">Settings</a>
+      </nav>
+      <div class="sidebar-foot">
+        <button id="conn-open" class="btn btn-ghost" data-testid="conn-open">Connect</button>
+        <button id="logout" class="btn btn-ghost" data-testid="logout-btn">Sign out</button>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header id="topbar" class="topbar" hidden>
+        <div id="crumb" class="crumb"></div>
+        <div class="topbar-right">
+          <span id="status-pill" class="pill" data-testid="status-pill">connecting</span>
+        </div>
+      </header>
+      <section id="view" class="view" data-testid="view">
+        <div class="loading">Loading zeroSupabaseStudio...</div>
+      </section>
+    </main>
+  </div>
+
+  <!-- connection modal (hidden until opened) -->
+  <div id="conn-modal" class="modal" data-testid="conn-modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Connection & API keys</h2>
+        <button id="conn-close" class="btn btn-ghost" data-testid="conn-close">Close</button>
+      </div>
+      <div id="conn-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <script type="module" src="/studio/app.js"></script>
+</body>
+</html>
