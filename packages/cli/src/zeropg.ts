@@ -14,6 +14,8 @@ import { spawn } from 'node:child_process'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { resolveDatabaseUrl } from '@zeropg/client'
 import { migrateDev, migrateDeploy, listMigrations, type MigrateContext } from './migrate.js'
+import { runFleet } from './fleet/index.js'
+import { runConsole } from './console/index.js'
 
 interface Parsed {
   positionals: string[]
@@ -69,6 +71,14 @@ Usage:
   zeropg migrate status [--migrations <dir>]
       List migrations on disk.
 
+  zeropg fleet <cmd>
+      Manage your deployed scale-to-zero instances across cloud accounts:
+      ls, status, wake, url, export, migrate, context. All commands take
+      --json (for agents). See: zeropg fleet help
+
+  zeropg console [--port <n>]
+      Local web console over the same fleet discovery (localhost only).
+
 Defaults: --schema prisma/schema.prisma  --migrations prisma/migrations  --data .zeropg/dev`
 
 /**
@@ -113,6 +123,15 @@ async function main(): Promise<void> {
   }
   const { positionals, flags } = parse(argv)
   const [group, sub] = positionals
+
+  if (group === 'fleet') {
+    await runFleet(positionals.slice(1), flags)
+    return
+  }
+  if (group === 'console') {
+    await runConsole(flags)
+    return
+  }
 
   if (flags.help || group === 'help' || !group) {
     console.log(USAGE)

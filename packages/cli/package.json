@@ -14,6 +14,18 @@
   "dependencies": {
     "@zeropg/client": "*"
   },
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.5.2",
+    "@electric-sql/pglite-socket": ">=0.2.2",
+    "@zeropg/blobstore": "*",
+    "@zeropg/objectstore-fs": "*"
+  },
+  "peerDependenciesMeta": {
+    "@electric-sql/pglite": { "optional": true },
+    "@electric-sql/pglite-socket": { "optional": true },
+    "@zeropg/blobstore": { "optional": true },
+    "@zeropg/objectstore-fs": { "optional": true }
+  },
   "engines": {
     "node": ">=22"
   }
