@@ -5,7 +5,7 @@
 
 import type { FleetContext, Instance, InstanceStatus } from './types.js'
 import { addContext, loadConfig, removeContext, resolveContexts } from './contexts.js'
-import { listInstances } from './gcloud.js'
+import { listInstances, rollService } from './gcloud.js'
 import { probeStatus, wakeAndWait } from './probe.js'
 import { exportToFile, migrateTo } from './export.js'
 
@@ -24,9 +24,13 @@ Fleet (all commands take --json, and --context <name> | --project X --region Y):
   zeropg fleet wake <service>          wake and wait until ready
   zeropg fleet url <service>           connection endpoints (HTTP faces)
   zeropg fleet export <service> --out <file.sql>
-                                       pg_dump to a file (boots the DB locally
-                                       from its bucket; fences the cloud
-                                       instance until its next request)
+                                       pg_dump to a file. Flushes the live
+                                       instance (POST /flush), boots the DB
+                                       locally from its bucket via lease
+                                       takeover, then rolls the service
+                                       (--no-roll to skip). Refuses if pending
+                                       writes cannot be flushed (old image);
+                                       --accept-data-loss overrides.
   zeropg fleet migrate <service> --to <postgres-url> --yes
                                        graduation: stream pg_dump | psql into a
                                        managed Postgres you provisioned
@@ -49,6 +53,21 @@ async function discoverAll(flags: Flags): Promise<{ instances: Instance[]; error
     else errors.push({ context: contexts[i].name, error: r.reason instanceof Error ? r.reason.message : String(r.reason) })
   })
   return { instances, errors }
+}
+
+/** After a local lease takeover the deployed instance is a fenced zombie until
+ *  it restarts; roll a new revision so it recovers immediately (--no-roll to
+ *  skip, e.g. when decommissioning after a migrate). */
+async function rollAfterTakeover(inst: Instance, flags: Flags, json: boolean): Promise<boolean> {
+  if (flags['no-roll'] === true) return false
+  try {
+    await rollService(inst)
+    if (!json) console.log(`✓ rolled ${inst.name} so the fenced instance restarts cleanly`)
+    return true
+  } catch (e) {
+    console.error(`! could not roll ${inst.name} (${e instanceof Error ? e.message : e}); it recovers on its next cold start`)
+    return false
+  }
 }
 
 async function findInstance(name: string, flags: Flags): Promise<Instance> {
@@ -223,8 +242,9 @@ export async function runFleet(positionals: string[], flags: Flags): Promise<voi
         console.log(`exporting ${inst.name} from gs://${inst.bucket}/${inst.prefix}`)
         console.log(`(takes the writer lease: the cloud instance is fenced until its next boot)`)
       }
-      await exportToFile(inst, out)
-      if (json) console.log(JSON.stringify({ service: inst.name, out, ok: true }, null, 2))
+      await exportToFile(inst, out, { acceptDataLoss: flags['accept-data-loss'] === true })
+      const rolled = await rollAfterTakeover(inst, flags, json)
+      if (json) console.log(JSON.stringify({ service: inst.name, out, ok: true, rolled }, null, 2))
       else console.log(`✓ dumped to ${out}`)
       return
     }
@@ -240,8 +260,9 @@ export async function runFleet(positionals: string[], flags: Flags): Promise<voi
       }
       const inst = await findInstance(arg, flags)
       if (!json) console.log(`migrating ${inst.name}: pg_dump (from gs://${inst.bucket}/${inst.prefix}) | psql -> target`)
-      await migrateTo(inst, to)
-      if (json) console.log(JSON.stringify({ service: inst.name, migrated: true }, null, 2))
+      await migrateTo(inst, to, { acceptDataLoss: flags['accept-data-loss'] === true })
+      const rolled = await rollAfterTakeover(inst, flags, json)
+      if (json) console.log(JSON.stringify({ service: inst.name, migrated: true, rolled }, null, 2))
       else {
         console.log(`✓ restored into target. Next: repoint your app's DATABASE_URL, then archive the bucket state.`)
         console.log(`  Full runbook: docs/GRADUATION.md`)

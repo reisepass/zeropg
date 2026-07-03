@@ -310,6 +310,14 @@ export class ZeroPGServer {
     // SQL over HTTP — kept alongside the wire + REST faces.
     if (path === '/sql' && req.method === 'POST') return this.sql(req, res)
 
+    // Commit pending state to the bucket NOW. With 'sleep' durability an awake
+    // instance holds writes in memory until close(); its lease also lapses
+    // while idle (no background renewal), so a takeover (deploy roll, fleet
+    // export, nightly reset) fences it and the eventual shutdown flush is
+    // rejected — lostPendingWrites. This endpoint lets an admin tool quiesce
+    // the instance before taking the lease.
+    if (path === '/flush' && req.method === 'POST') return this.flushNow(res)
+
     // PostgREST reverse proxy: everything under /rest -> the local PostgREST.
     if (path === '/rest' || path.startsWith('/rest/')) return this.proxyRest(req, res, url)
 
@@ -340,6 +348,23 @@ export class ZeroPGServer {
     } catch (e) {
       const status = e instanceof FencedError || e instanceof LockedError ? 423 : 400
       return this.json(res, status, { error: e instanceof Error ? e.message : String(e) })
+    }
+  }
+
+  private async flushNow(res: ServerResponse) {
+    if (!this.db || this.phase !== 'ready') return this.json(res, 503, this.readinessBody())
+    try {
+      await this.flushWireWrites('flush-endpoint')
+      const commit = await this.db.flush()
+      return this.json(res, 200, {
+        flushed: true,
+        committed: !!commit,
+        commitSeq: commit?.commitSeq ?? null,
+        pendingFlush: this.db.pendingFlush,
+      })
+    } catch (e) {
+      const status = e instanceof FencedError || e instanceof LockedError ? 423 : 500
+      return this.json(res, status, { flushed: false, error: e instanceof Error ? e.message : String(e) })
     }
   }
 

@@ -126,6 +126,23 @@ export async function listInstances(ctx: FleetContext): Promise<Instance[]> {
   return out.sort((a, b) => a.name.localeCompare(b.name))
 }
 
+/** Roll a new revision by bumping ZEROPG_RESTART_NONCE (same mechanism as
+ *  scripts/nightly-reset): after a local lease takeover (export/migrate) the
+ *  still-running cloud instance is a fenced zombie whose writes fail until it
+ *  restarts, so we restart it. */
+export async function rollService(inst: Instance): Promise<void> {
+  const base = `projects/${inst.project}/locations/${inst.region}/services/${inst.name}`
+  const svc = await api<{ template: { containers: Array<{ env?: RunEnvVar[] }> } }>(base)
+  const nonce = String(Date.now())
+  for (const c of svc.template.containers) {
+    c.env = c.env ?? []
+    const existing = c.env.find((e) => e.name === 'ZEROPG_RESTART_NONCE')
+    if (existing) existing.value = nonce
+    else c.env.push({ name: 'ZEROPG_RESTART_NONCE', value: nonce })
+  }
+  await api(`${base}?updateMask=template`, { method: 'PATCH', body: JSON.stringify({ template: svc.template }) })
+}
+
 /** True when allUsers holds roles/run.invoker, i.e. the endpoint is public.
  *  zeropg has no auth of its own today, so this is the security posture. */
 export async function isPublicInvoker(inst: Instance): Promise<boolean | null> {
