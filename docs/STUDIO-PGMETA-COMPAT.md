@@ -251,3 +251,33 @@ node examples/cloudrun/supabase/test/killswitch-pgmeta.mjs
 # or against an already-running postgres-meta (skips Docker):
 PG_META_URL=http://127.0.0.1:8080 node examples/cloudrun/supabase/test/killswitch-pgmeta.mjs
 ```
+
+## Addendum: findings from building the Studio (`examples/cloudrun/supabase/studio`)
+
+Three more single-session behaviors surfaced while implementing the SQL editor and
+its per-submission reset. All verified directly against PGlite behind the wire.
+
+- **`COPY ... FROM STDIN` wedges the wire (new landmine).** Submitting it puts the
+  session into copy-in mode waiting for copy data that never arrives; on PGlite this
+  raises a **FATAL `08P01` "protocol synchronization was lost"** that tears the
+  connection down - a genuine shared-session wedge, distinct from an ordinary long
+  autocommit query. The editor blocks `COPY ... FROM STDIN` specifically. **`COPY ...
+  TO STDOUT` is harmless** (returns immediately) and is allowed.
+- **`DISCARD ALL` is the correct reset primitive, but must be sent alone.** It clears
+  everything the older `RESET ROLE; RESET ALL` baseline missed - SESSION-level advisory
+  locks, temp objects, prepared statements, LISTEN channels, SESSION AUTHORIZATION -
+  verified (a held `pg_advisory_lock` is released, a temp table dropped, a prepared
+  statement deallocated). BUT `DISCARD ALL` **cannot run inside a transaction block**,
+  and node-postgres sends a multi-statement string (`DISCARD ALL; SET search_path TO
+  public`) as one implicit transaction, so the combined form fails with **`25001`**.
+  Send `DISCARD ALL` as its own single-statement query, then `SET search_path TO
+  public` separately. The studio now uses `DISCARD ALL` (two statements) as its reset
+  baseline instead of `RESET ROLE; RESET ALL`.
+- **Procedural transaction control is a no-op, not a bypass.** `DO $$ BEGIN COMMIT;
+  END $$;` (the "smuggle a COMMIT past the txn-control guard inside a dollar-quoted
+  body" concern) executes without error and leaves **no dangling transaction** - a
+  fresh client is not blocked afterward. So `DO` / `CALL` do not need to be blocked to
+  keep the shared session safe; only the top-level transaction-control statements do.
+
+Reproduce: `node examples/cloudrun/supabase/studio/test/run.mjs` (boots wire +
+postgres-meta + the studio BFF once and runs the full Playwright suite headless).
