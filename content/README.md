@@ -17,6 +17,7 @@ real Postgres the whole time.**
 | 5 | [posts/05-durability-is-a-dial.md](posts/05-durability-is-a-dial.md) | ack-from-memory vs ack-from-bucket is a per-workload choice | [twitter/thread-05](twitter/thread-05-durability-dial.md) |
 | 6 | [posts/06-unmodified-apps.md](posts/06-unmodified-apps.md) | 8 real apps ran unmodified; the only recurring blocker was bundled extensions | [twitter/thread-06](twitter/thread-06-unmodified-apps.md) |
 | 7 | [posts/07-the-break-even-math.md](posts/07-the-break-even-math.md) | it is request spacing, not request count, that bills | [twitter/thread-07](twitter/thread-07-break-even.md) |
+| 8 | [posts/08-the-sqlite-slot.md](posts/08-the-sqlite-slot.md) | the SQLite slot can hold real Postgres; laptop -> free tier -> managed, no rewrite at any step | [twitter/thread-08](twitter/thread-08-sqlite-slot.md) |
 
 Publishing notes:
 
