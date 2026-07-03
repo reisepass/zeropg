@@ -206,7 +206,7 @@ This is a single-shared-session property of zeropg, not a postgres-meta bug.
 1. **Do not rely on `statement_timeout` / `?statementTimeoutSecs`.** Do not rely on it
    to cancel a running PGlite query. Treat every submitted query as uninterruptible
    once started.
-2. **Guard the *wait* client-side, and label it honestly:** keep
+2. **Guard the *wait* client-side, and label it accurately:** keep
    `PG_QUERY_TIMEOUT_SECS` low (15-30s) so a hung request returns to the user. A
    client-side timeout is **not a rollback or cancel signal** - the underlying query
    keeps running in PGlite until it finishes on its own. The UI must report it as
