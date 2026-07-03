@@ -228,6 +228,10 @@ in [STATUS.md](STATUS.md).
 - **[docs/GRADUATION.md](docs/GRADUATION.md)**: the exit runbook. `pg_dump` over the
   wire, restore into any managed Postgres, change one connection string. The exit being
   boring is the whole point.
+- **[docs/FLEET.md](docs/FLEET.md)**: `zeropg fleet` - every instance you have, across
+  cloud accounts, live-discovered from the cloud APIs (no registry, no hosted anything).
+  `ls/status/wake/url/export/migrate`, all `--json` so an AI agent can run your fleet;
+  `zeropg console` is the same view on localhost.
 
 ## Docs index
 

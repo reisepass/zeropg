@@ -1,8 +1,13 @@
 # @zeropg/cli
 
-The `zeropg` CLI: a Prisma-migration workflow for zeropg / PGlite that needs
-**no external Postgres** and does **not** use Prisma's native `migrate dev`
-engine (which can't drive single-session PGlite — see the rationale below).
+The `zeropg` CLI. Two halves:
+
+- **Local dev**: a Prisma-migration workflow for zeropg / PGlite that needs
+  **no external Postgres** and does **not** use Prisma's native `migrate dev`
+  engine (which can't drive single-session PGlite - see the rationale below).
+- **Fleet admin**: `zeropg fleet` + `zeropg console` manage every *deployed*
+  zeropg instance across your cloud accounts - live discovery, health, wake,
+  export, migrate-to-managed. See [docs/FLEET.md](../../docs/FLEET.md).
 
 ## Commands
 

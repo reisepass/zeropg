@@ -60,6 +60,7 @@ gcloud run deploy "$SERVICE" \
   --memory=1Gi \
   --timeout=60 \
   --cpu-boost \
+  --labels "zeropg=1" \
   --set-env-vars "ZEROPG_BUCKET=${BUCKET},ZEROPG_PREFIX=${DB_PREFIX},APP_LABEL=${APP_LABEL},ZEROPG_DURABILITY=${DURABILITY:-sleep}" \
   "$@"
 
