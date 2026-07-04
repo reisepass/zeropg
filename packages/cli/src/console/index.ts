@@ -10,7 +10,11 @@ import { listInstances } from '../fleet/gcloud.js'
 import { probeStatus, wakeAndWait } from '../fleet/probe.js'
 import type { Instance } from '../fleet/types.js'
 
-async function discover(): Promise<{ instances: Instance[]; errors: Array<{ context: string; error: string }> }> {
+async function discover(): Promise<{
+  instances: Instance[]
+  errors: Array<{ context: string; error: string }>
+  contextCount: number
+}> {
   const cfg = loadConfig()
   const instances: Instance[] = []
   const errors: Array<{ context: string; error: string }> = []
@@ -19,7 +23,7 @@ async function discover(): Promise<{ instances: Instance[]; errors: Array<{ cont
     if (r.status === 'fulfilled') instances.push(...r.value)
     else errors.push({ context: cfg.contexts[i].name, error: r.reason instanceof Error ? r.reason.message : String(r.reason) })
   })
-  return { instances, errors }
+  return { instances, errors, contextCount: cfg.contexts.length }
 }
 
 async function findByName(service: string, context: string | null): Promise<Instance | null> {
@@ -79,7 +83,10 @@ async function load() {
   const r = await fetch('/api/fleet'); const data = await r.json()
   const list = document.getElementById('list'); list.textContent = ''
   const empty = document.getElementById('empty')
-  empty.textContent = data.instances.length ? '' : 'no zeropg instances discovered in any context'
+  if (data.instances.length) empty.textContent = ''
+  else if (data.contextCount === 0) empty.textContent = 'no contexts configured - tell the console where to look:  zeropg fleet context add <name> --project <gcp-project> --region <region>'
+  else if (data.errors.length === data.contextCount) empty.textContent = 'every context scan failed (errors below) - nothing could be discovered'
+  else empty.textContent = 'contexts scanned, no zeropg instances found (a service counts when it has ZEROPG_BUCKET/ZEROPG_PREFIX env vars or a zeropg label)'
   for (const e of data.errors) list.appendChild(el('div', { class: 'card err', text: 'context ' + e.context + ': ' + e.error }))
   for (const inst of data.instances) list.appendChild(card(inst))
 }

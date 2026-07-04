@@ -31,7 +31,20 @@ export function saveConfig(cfg: FleetConfig): void {
   writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + '\n')
 }
 
-export function addContext(ctx: FleetContext): void {
+/** Reject paste/typo artifacts (trailing dots, spaces, uppercase) at add time
+ *  instead of letting them surface later as a Cloud Run 400 on every scan. */
+export function validateContext(ctx: FleetContext): FleetContext {
+  const name = ctx.name.trim()
+  const project = ctx.project.trim()
+  const region = ctx.region.trim()
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(name)) throw new Error(`invalid context name "${ctx.name}" (use lowercase letters, digits, - or _)`)
+  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project)) throw new Error(`"${ctx.project}" does not look like a GCP project id (lowercase letters, digits, hyphens; 6-30 chars)`)
+  if (!/^[a-z]+-[a-z]+\d$/.test(region)) throw new Error(`"${ctx.region}" does not look like a Cloud Run region (e.g. europe-west1, us-central1)`)
+  return { ...ctx, name, project, region }
+}
+
+export function addContext(rawCtx: FleetContext): void {
+  const ctx = validateContext(rawCtx)
   const cfg = loadConfig()
   if (cfg.contexts.some((c) => c.name === ctx.name)) {
     throw new Error(`context "${ctx.name}" already exists (remove it first: zeropg fleet context rm ${ctx.name})`)
@@ -60,7 +73,8 @@ export function resolveContexts(flags: Record<string, string | boolean>): FleetC
   const region = s('region')
   if (project || region) {
     if (!project || !region) throw new Error('--project and --region must be given together')
-    return [{ name: `${project}/${region}`, provider: 'gcloud', project, region }]
+    const adhoc = validateContext({ name: 'adhoc', provider: 'gcloud', project, region })
+    return [{ ...adhoc, name: `${adhoc.project}/${adhoc.region}` }]
   }
   const cfg = loadConfig()
   const wanted = s('context')
