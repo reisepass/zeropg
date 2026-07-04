@@ -63,17 +63,25 @@ Killswitch TODO before promoting WhoDB or pgconsole into the recipes: the
 standard 42P05/concurrency/poisoning test against a local wire (reuse
 killswitch-pgmeta.mjs's harness pattern).
 
-## Live test results (2026-07-04, against a local zeropg wire on :5499)
+## Live test results (2026-07-04)
 
-All four tools driven headless (Playwright / API) against the same seeded table;
-edits verified by reading back over the wire.
+All four tools driven headless (Playwright / API) against BOTH:
 
-| tool | verdict | evidence |
+- **local zeropg**: a no-GCS `serveWire` on :5499 with a seeded fixture table;
+  edits verified by reading back over the wire.
+- **remote zeropg**: the deployed `supabase-zeropg` Cloud Run instance, reached
+  the supported way - a `ZeroPGReplica` snapshot of its GCS bucket
+  (`gs://zeropg-experiments-euw1/cloudrun-supabase-v5`) served on a local wire
+  (:5601), no lease/fencing, live service untouched. Ground truth read straight
+  off the replica (`auth.users` = 5, `public.todos` = 5) and every tool's
+  displayed/queried result compared against it.
+
+| tool | local (:5499) | remote snapshot (:5601) |
 |---|---|---|
-| **Adminer 5** (`adminer:latest`, port 8081) | **PASS incl. row edit** | login form -> table list -> data grid -> edited a row through the form; new value confirmed over the wire |
-| **pgweb** (port 8082) | **PASS (read/SQL)** | connected at boot via env URL; /api/objects lists the table; SELECT + UPDATE via its query API round-trip; no grid editing by design |
-| **WhoDB** (port 8083) | **PARTIAL** | login + schema introspection work (GORM/pgx did NOT hit 42P05); BUT its database dropdown says "No database found." against PGlite (its pg_database listing query returns empty) and the session defaults into whatever schema sorts first; usable, rough edges |
-| **drizzle-kit studio** (server :4983 + CDN frontend) | **PASS incl. rows in ~2s** | server listens in tens of ms; local.drizzle.studio renders the table + rows ~2.1s after page load, 13ms query time, Add record UI present |
+| **Adminer 5** (8081) | **PASS incl. row edit** (edit form -> value confirmed over the wire) | **PASS**: login, todos grid renders "5 rows", SQL command `SELECT count(*) FROM auth.users` returns 5 = wire truth |
+| **pgweb** (8082 local / 8084 remote) | **PASS (read/SQL)**: objects + SELECT + UPDATE round-trip | **PASS**: lists remote todos, query returns 5 users = wire truth |
+| **WhoDB** (8083) | **PARTIAL**: login + tables work (no 42P05); db dropdown says "No database found." (its pg_database query returns empty on PGlite); defaults into first-sorted schema | **PASS (browse)**: login, auth-schema tables listed (users, sessions, identities), table view opens and queries data; same db-dropdown gap |
+| **drizzle-kit studio** (:4983 local / :4984 remote + CDN frontend) | **PASS incl. rows in ~2s**, 13ms queries, Add record UI | **PASS**: remote todos listed, rows grid renders (frontend pinned to the second server via `?port=4984`) |
 
 ### Finding 1: the wire does not answer SSLRequest - clients with default sslmode HANG
 
