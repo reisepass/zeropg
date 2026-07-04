@@ -1,9 +1,9 @@
 {
-  "name": "zero-supabase-studio",
+  "name": "zeropg-console",
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "zeroSupabaseStudio - a lightweight Supabase-Studio-style admin frontend for zeropg (scale-to-zero PGlite behind pglite-socket).",
+  "description": "zeropg Console - a lightweight Supabase-Studio-style admin frontend for zeropg (scale-to-zero PGlite behind pglite-socket).",
   "engines": {
     "node": ">=22"
   },

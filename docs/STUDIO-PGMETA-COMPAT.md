@@ -1,6 +1,6 @@
 # postgres-meta on zeropg - compatibility matrix + SQL-editor design notes
 
-Gate spike for `docs/DIY-zeroSupabaseStudioFrontend.md`: does `supabase/postgres-meta`
+Gate spike for `docs/DIY-zeropg ConsoleFrontend.md`: does `supabase/postgres-meta`
 (the introspection + run-SQL engine behind Supabase Studio) work against zeropg's
 **one shared PGlite session**? This is the single new backend dependency the Studio
 plan rests on.

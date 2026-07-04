@@ -1,4 +1,4 @@
-// zeroSupabaseStudio BFF.
+// zeropg Console BFF.
 //
 // A lightweight Supabase-Studio-style admin console for zeropg (scale-to-zero
 // PGlite behind pglite-socket, ONE shared wire session). Plain node:http, no

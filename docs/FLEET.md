@@ -3,7 +3,7 @@
 `zeropg fleet` manages all your Postgres instances - deployed scale-to-zero
 services across any number of cloud accounts, plus the local datadirs on this
 machine - from your laptop. `zeropg console` puts the same inventory in a
-browser tab on localhost, and can launch zeroSupabaseStudio against any of
+browser tab on localhost, and can launch zeropg Console against any of
 them.
 
 Design stance (the constraints came first):
@@ -90,7 +90,7 @@ still exists. In the console every present local DB has two one-click actions:
 
 ## Studio bridge: inspect any database in one click
 
-zeroSupabaseStudio (`examples/cloudrun/supabase/studio` - table editor, SQL
+zeropg Console (`examples/cloudrun/supabase/studio` - table editor, SQL
 editor) attaches to a Postgres wire. The console can mint a wire for anything
 it lists, so every row has an "open in studio" button:
 

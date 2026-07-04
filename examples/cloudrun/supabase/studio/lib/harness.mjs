@@ -1,4 +1,4 @@
-// Local bring-up for zeroSupabaseStudio: ONE call boots
+// Local bring-up for zeropg Console: ONE call boots
 //   (1) a local single-session zeropg wire (serveWire, no GCS - the shared
 //       session, not persistence, is what the studio must be correct against),
 //   (2) supabase/postgres-meta:v0.96.6 in Docker pointed at that wire

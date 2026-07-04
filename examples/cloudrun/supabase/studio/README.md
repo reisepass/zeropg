@@ -1,4 +1,4 @@
-# zeroSupabaseStudio
+# zeropg Console
 
 A lightweight, Supabase-Studio-style admin console for **zeropg** (scale-to-zero
 Postgres = PGlite behind `pglite-socket`, with **one shared wire session**). It is

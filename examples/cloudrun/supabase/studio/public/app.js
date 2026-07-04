@@ -1,4 +1,4 @@
-// zeroSupabaseStudio SPA shell: instant paint, real-URL history routing, and
+// zeropg Console SPA shell: instant paint, real-URL history routing, and
 // lazy-loaded per-view chunks (dynamic import). Auth is checked once on load;
 // unauthenticated navigation is redirected to the login view.
 

@@ -1,4 +1,4 @@
-// One command to bring zeroSupabaseStudio up locally (wire + postgres-meta + BFF)
+// One command to bring zeropg Console up locally (wire + postgres-meta + BFF)
 // and keep it running until Ctrl-C. Seeds a small demo schema so the table editor
 // has something to show.
 //

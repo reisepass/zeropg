@@ -1,8 +1,8 @@
 // KILL-SWITCH: supabase/postgres-meta over the single-session zeropg wire.
 //
 // postgres-meta is the introspection + run-SQL engine behind Supabase Studio,
-// and the engine we plan to use for the zeroSupabaseStudio admin frontend
-// (docs/DIY-zeroSupabaseStudioFrontend.md). This proves it works against
+// and the engine we plan to use for the zeropg Console admin frontend
+// (docs/DIY-zeropg ConsoleFrontend.md). This proves it works against
 // zeropg's ONE shared PGlite session (pglite-socket multiplexes every wire
 // connection onto a single serialized PGlite), and pins the exact adversarial
 // behaviors the SQL editor has to design around.

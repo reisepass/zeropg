@@ -9,7 +9,7 @@ function fmtUptime(s) {
 
 export async function render(root, { api, el }) {
   root.append(
-    el('h1', {}, 'zeroSupabaseStudio'),
+    el('h1', {}, 'zeropg Console'),
     el('p', { class: 'sub' }, 'Admin console for a scale-to-zero Postgres (zeropg / PGlite over one shared wire session).'),
   )
   const grid = el('div', { class: 'card-grid', 'data-testid': 'status-grid' })

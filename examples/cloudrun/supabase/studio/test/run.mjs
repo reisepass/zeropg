@@ -1,4 +1,4 @@
-// One-command test runner for zeroSupabaseStudio.
+// One-command test runner for zeropg Console.
 //
 //   node examples/cloudrun/supabase/studio/test/run.mjs
 //
