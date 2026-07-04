@@ -3,8 +3,8 @@
 `zeropg fleet` manages all your Postgres instances - deployed scale-to-zero
 services across any number of cloud accounts, plus the local datadirs on this
 machine - from your laptop. `zeropg console` puts the same inventory in a
-browser tab on localhost, and can launch zeropg Console against any of
-them.
+browser tab on localhost, and can launch the zeroSupabaseStudio admin UI
+against any of them.
 
 Design stance (the constraints came first):
 
@@ -103,25 +103,30 @@ it lists, so every row has an "open in studio" button:
   detached throwaway copy, so poking at it - even writing - is
   consequence-free; relaunch to refresh the snapshot.
 
-**No Docker.** The whole studio stack is plain node child processes on
-loopback: the wire, postgres-meta (the npm `@supabase/postgres-meta` package
-ships the same fastify server the Docker image runs - `dist/server/server.js`,
-same env contract), and the studio BFF. Nothing binds beyond 127.0.0.1,
-nothing needs a container runtime. Cost while a studio is open: ~200 MB for
-postgres-meta + ~100 MB for the BFF (both Node), torn down on stop. (postgres-
-meta's own admin app wants `PG_META_PORT+1`, so the console reserves that
-port too; all three ports are OS-assigned per launch, so a concurrent
-up-local studio stack is never trampled.)
+**No Docker, at all.** The whole studio stack is plain node processes on
+loopback: the wire, postgres-meta, and the studio BFF. postgres-meta runs from
+the npm `@supabase/postgres-meta` package - but via `lib/meta-server.mjs`,
+which `build()`s and listens the package's **main introspection app only**.
+The package's own `server.js` also starts an "admin" app on `PG_META_PORT+1`
+and `process.exit(1)`s if that port is taken (harmless as root on `:1` inside
+the Docker image, a landmine as a node child); the studio never calls it, so
+skipping it removes both the second process-killer and the need to reserve a
+`+1` port. Ports are OS-assigned per launch, so a concurrently running
+up-local studio stack is never trampled. Launch is ~0.85-1.3s; cost while a
+studio is open is ~200 MB postgres-meta + ~100 MB BFF (both Node), torn down
+on stop.
 
 One studio at a time; the console banner shows the URL + admin password and a
 stop button. Requirement: a zeropg repo checkout (studio is not shipped in the
-npm CLI). The `metaMode: 'docker'` harness option still runs postgres-meta as a
-container for parity testing.
+npm CLI).
 
 Footprint note: the ~200 MB is postgres-meta (a Node/fastify service) - the one
 heavy dependency here. A future direction for a genuinely tiny inspector is to
 drop postgres-meta and run the handful of introspection queries directly (the
 BFF already only forwards SQL), which also opens the door to a Go/Rust rewrite.
+postgres-meta *can* serve any wire via a per-request `pg` connection header
+(which would let one instance be reused across launches), but its introspection
+endpoints error on that header today, so the reuse path is not wired up.
 
 `status` prominently reports exposure: zeropg has **no built-in auth** (the
 protection model is platform ingress/IAM), so a service with an `allUsers`
