@@ -21,7 +21,17 @@ export async function render(root, { api, el, copyToClipboard }) {
     for (const s of c.secrets) {
       const box = el('div', { class: 'value-box', 'data-testid': `set-secret-${s.key}` }, '••••••••  (hidden)')
       const btn = el('button', { class: 'btn', 'data-testid': `set-reveal-${s.key}`, onclick: async () => { const r = await api(`/connection/reveal?item=${encodeURIComponent(s.key)}`, { method: 'POST' }); box.textContent = r.value || '(not set)'; btn.disabled = true } }, 'Reveal')
-      kv.append(el('div', { class: 'row' }, [el('div', { class: 'k' }, `${s.label} (privileged)`), el('div', { class: 'copyrow' }, [box, btn])]))
+      // Copy without revealing: fetch the value and put it straight on the
+      // clipboard - it is never rendered into the DOM.
+      const copyBtn = el('button', { class: 'btn', 'data-testid': `set-copy-${s.key}`, onclick: async () => {
+        const r = await api(`/connection/reveal?item=${encodeURIComponent(s.key)}&mode=copy`, { method: 'POST' })
+        await copyToClipboard(r.value || '')
+        const orig = copyBtn.textContent
+        copyBtn.textContent = 'Copied'
+        copyBtn.disabled = true
+        setTimeout(() => { copyBtn.textContent = orig; copyBtn.disabled = false }, 1500)
+      } }, 'Copy')
+      kv.append(el('div', { class: 'row' }, [el('div', { class: 'k' }, `${s.label} (privileged)`), el('div', { class: 'copyrow' }, [box, copyBtn, btn])]))
     }
     connCard.append(kv)
   } catch (e) { connCard.innerHTML = `<div class="err">${e.message}</div>` }

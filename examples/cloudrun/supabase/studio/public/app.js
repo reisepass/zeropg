@@ -80,7 +80,7 @@ function showLogin() {
       await boot()
     } catch (ex) { err.textContent = String(ex && ex.message || ex); btn.disabled = false }
   } }, [
-    el('div', { class: 'brand' }, [document.createTextNode('zero'), el('span', {}, 'Studio')]),
+    el('div', { class: 'brand' }, [document.createTextNode('zeropg '), el('span', {}, 'Console')]),
     el('p', { class: 'sub' }, 'Admin console for zeropg'),
     el('div', { class: 'field' }, [el('label', {}, 'Password'), pw]),
     btn,
@@ -119,9 +119,17 @@ async function openConnModal() {
         box.dataset.revealed = '1'
         revealBtn.disabled = true
       } }, 'Reveal')
+      // Copy without revealing: value goes clipboard-only, never into the DOM.
+      const copyBtn = el('button', { class: 'btn', 'data-testid': `copy-${s.key}`, onclick: async () => {
+        const r = await api(`/connection/reveal?item=${encodeURIComponent(s.key)}&mode=copy`, { method: 'POST' })
+        await copyToClipboard(r.value || '')
+        copyBtn.textContent = 'Copied'
+        copyBtn.disabled = true
+        setTimeout(() => { copyBtn.textContent = 'Copy'; copyBtn.disabled = false }, 1500)
+      } }, 'Copy')
       wrap.append(el('div', { class: 'row' }, [
         el('div', { class: 'k' }, `${s.label} (privileged)`),
-        el('div', { class: 'copyrow' }, [box, revealBtn]),
+        el('div', { class: 'copyrow' }, [box, copyBtn, revealBtn]),
       ]))
     }
     connBody.append(wrap)

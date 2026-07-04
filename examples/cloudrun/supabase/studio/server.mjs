@@ -375,7 +375,10 @@ const server = createServer(async (req, res) => {
         const item = url.searchParams.get('item')
         const secret = CONN.secrets[item]
         if (!secret) return json(res, 404, { error: 'unknown secret' })
-        await logger.warn('auth', 'secret revealed', { item })
+        // mode=copy: the client puts the value on the clipboard without ever
+        // rendering it; the audit trail distinguishes the two exposures.
+        const copied = url.searchParams.get('mode') === 'copy'
+        await logger.warn('auth', copied ? 'secret copied to clipboard (not displayed)' : 'secret revealed', { item })
         return json(res, 200, { key: item, label: secret.label, value: secret.value })
       }
       if (sub === '/api/meta/tables' && method === 'GET') {
