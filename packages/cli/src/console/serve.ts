@@ -2,8 +2,9 @@
 //
 // serve:  turn a local datadir into a live postgres:// URL on demand
 //         (serveWire), so any tool - psql, TablePlus, DataGrid - can open it.
-// studio: launch zeroSupabaseStudio (BFF + postgres-meta in Docker) against
-//         any wire the console can produce:
+// studio: launch zeroSupabaseStudio (BFF + postgres-meta, both plain node
+//         child processes on loopback - no Docker) against any wire the
+//         console can produce:
 //           - a local datadir  -> its served wire (read-write, the real DB)
 //           - a remote instance -> a ZeroPGReplica materialized from its
 //             bucket: NO lease, NO fencing, the live service is untouched; a
@@ -15,8 +16,6 @@
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import { createServer as createNetServer } from 'node:net'
 import { serveWire, type WireServer } from '@zeropg/client'
 import type { Instance } from '../fleet/types.js'
@@ -34,7 +33,30 @@ function freePort(): Promise<number> {
   })
 }
 
-const execFileAsync = promisify(execFile)
+/** A free port whose successor (port+1) is also free. postgres-meta binds an
+ *  extra "admin" app on PG_META_PORT+1, so the meta port needs a free buddy or
+ *  the meta process exits(1). */
+function freePortWithSuccessor(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const s1 = createNetServer()
+    s1.once('error', reject)
+    s1.listen(0, '127.0.0.1', () => {
+      const p = (s1.address() as { port: number }).port
+      const s2 = createNetServer()
+      s2.once('error', () => s1.close(() => resolve(freePortWithSuccessor()))) // p+1 taken; retry
+      s2.listen(p + 1, '127.0.0.1', () => s1.close(() => s2.close(() => resolve(p))))
+    })
+  })
+}
+
+/** Studio needs 3 ports: meta (+ its admin buddy at meta+1) and the BFF, all
+ *  distinct. */
+async function studioPorts(): Promise<{ metaPort: number; bffPort: number }> {
+  const metaPort = await freePortWithSuccessor()
+  let bffPort = await freePort()
+  while (bffPort === metaPort || bffPort === metaPort + 1) bffPort = await freePort()
+  return { metaPort, bffPort }
+}
 
 // ---------------------------------------------------------------- serving ----
 
@@ -56,15 +78,11 @@ export function listServed(): Array<Omit<Served, 'stop'>> {
 }
 
 /** Serve a local datadir on a loopback wire. Idempotent per path. */
-export async function serveLocal(path: string, opts: { host?: string } = {}): Promise<Served> {
+export async function serveLocal(path: string): Promise<Served> {
   const abs = resolve(path)
-  const host = opts.host ?? '127.0.0.1'
+  const host = '127.0.0.1'
   const existing = served.get(abs)
-  if (existing) {
-    // Re-serve on a wider binding when studio needs Docker to reach it.
-    if (host === '0.0.0.0' && existing.host !== '0.0.0.0') await stopServed(abs)
-    else return existing
-  }
+  if (existing) return existing
   const wire: WireServer = await serveWire({ dataDir: abs, host, port: 0 })
   const entry: Served = {
     kind: 'local',
@@ -82,12 +100,12 @@ export async function serveLocal(path: string, opts: { host?: string } = {}): Pr
 }
 
 /** Serve a detached snapshot of a remote instance's bucket state. */
-export async function serveReplica(inst: Instance, opts: { host?: string } = {}): Promise<Served> {
+export async function serveReplica(inst: Instance): Promise<Served> {
   if (!inst.bucket || !inst.prefix) throw new Error(`${inst.name}: no bucket/prefix on the service`)
   const key = `${inst.context}/${inst.name}`
   const existing = served.get(key)
   if (existing) return existing
-  const host = opts.host ?? '127.0.0.1'
+  const host = '127.0.0.1'
   const [{ GcsBlobStore }, { ZeroPGReplica }, { PGLiteSocketServer }] = await Promise.all([
     import('@zeropg/blobstore'),
     import('@zeropg/objectstore-fs'),
@@ -162,25 +180,20 @@ export async function launchStudio(target: { kind: 'local'; path: string } | { k
   if (!existsSync(join(dir, 'lib', 'harness.mjs'))) {
     throw new Error('studio launch needs the zeropg repo checkout (examples/cloudrun/supabase/studio not found next to the CLI)')
   }
-  await execFileAsync('docker', ['info']).catch(() => {
-    throw new Error('studio needs Docker running (postgres-meta runs as a container)')
-  })
 
   if (studio) {
     await studio.stop().catch(() => {})
     studio = null
   }
 
-  // Docker's host.docker.internal cannot reach a 127.0.0.1-bound wire on
-  // macOS; studio wires bind 0.0.0.0. LAN exposure of an unauthenticated wire
-  // is the tradeoff - same as the studio's own local harness.
-  const wire =
-    target.kind === 'local' ? await serveLocal(target.path, { host: '0.0.0.0' }) : await serveReplica(target.inst, { host: '0.0.0.0' })
+  // The whole studio stack (wire, postgres-meta as a plain node child process,
+  // BFF) runs on loopback - no Docker, nothing leaves 127.0.0.1.
+  const wire = target.kind === 'local' ? await serveLocal(target.path) : await serveReplica(target.inst)
 
   const { bringUp } = (await import(join(dir, 'lib', 'harness.mjs'))) as {
     bringUp: (opts: Record<string, unknown>) => Promise<{ base: string; cfg: { adminPassword: string }; stop(): Promise<void> }>
   }
-  const [metaPort, bffPort] = await Promise.all([freePort(), freePort()])
+  const { metaPort, bffPort } = await studioPorts()
   const h = await bringUp({ existingWire: true, wirePort: wire.port, metaPort, bffPort, quiet: true, log: () => {} })
   const label = target.kind === 'local' ? target.path : `${target.inst.name} (detached snapshot)`
   studio = {

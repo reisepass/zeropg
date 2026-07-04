@@ -212,9 +212,23 @@ function localCard(db, servedList) {
   const renderConn = (s) => {
     connSlot.textContent = ''
     if (!s) return
-    connSlot.appendChild(el('dl', {}, [el('dt', { text: 'wire' }), el('dd', { text: s.url })]))
+    // Direct connections: the same live wire in every format a tool wants.
+    const hostPort = '127.0.0.1:' + s.port
+    const formats = [
+      ['uri', s.url],
+      ['psql', 'psql "' + s.url + '"'],
+      ['jdbc', 'jdbc:postgresql://' + hostPort + '/postgres?user=postgres&sslmode=disable'],
+      ['.env', 'DATABASE_URL=' + s.url],
+    ]
+    connSlot.appendChild(el('h3', { class: 'group', text: 'direct connections' }))
+    const dl = el('dl')
+    for (const [name, value] of formats) {
+      dl.appendChild(el('dt', { text: name }))
+      dl.appendChild(el('dd', { text: value }))
+    }
+    connSlot.appendChild(dl)
     connSlot.appendChild(el('div', { class: 'actions' }, [
-      copyBtn('copy connection string', s.url),
+      ...formats.map(([name, value]) => copyBtn('copy ' + name, value)),
       btn('stop serving', async (b) => { b.disabled = true; await api('/api/unserve', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: db.path }) }); renderConn(null) }),
     ]))
   }

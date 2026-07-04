@@ -14,6 +14,7 @@ import pg from 'pg'
 import { spawn, execFile as _execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 
 const execFile = promisify(_execFile)
@@ -64,28 +65,59 @@ export async function bringUp(opts = {}) {
   if (opts.existingWire) {
     log(`[harness] using existing wire on :${cfg.wirePort}`)
   } else {
-    wire = await serveWire({ host: '0.0.0.0', port: cfg.wirePort })
+    // 0.0.0.0 only for the docker meta (host.docker.internal cannot reach a
+    // 127.0.0.1-bound host port on macOS); the node meta keeps loopback.
+    wire = await serveWire({ host: opts.metaMode === 'docker' ? '0.0.0.0' : '127.0.0.1', port: cfg.wirePort })
     cleanups.push(() => wire.stop().catch(() => {}))
     if (opts.seed) await wire.pglite.exec(opts.seed)
     log(`[harness] wire up on :${cfg.wirePort}`)
   }
 
-  // 2. postgres-meta (Docker)
-  await execFile('docker', ['rm', '-f', container]).catch(() => {})
-  await execFile('docker', [
-    'run', '--rm', '-d', '--name', container,
-    '-p', `${cfg.metaPort}:8080`,
-    '-e', 'PG_META_PORT=8080',
-    '-e', `PG_META_DB_URL=postgresql://postgres:postgres@host.docker.internal:${cfg.wirePort}/postgres?sslmode=disable`,
-    '-e', `PG_QUERY_TIMEOUT_SECS=${cfg.queryTimeoutSecs}`,
-    cfg.metaImage,
-  ])
-  cleanups.unshift(() => execFile('docker', ['rm', '-f', container]).catch(() => {}))
+  // 2. postgres-meta. Default: a plain node child process - the npm package
+  //    @supabase/postgres-meta ships the exact same fastify server as the
+  //    Docker image (dist/server/server.js, same env contract), so no
+  //    container runtime is needed and everything stays on loopback.
+  //    metaMode: 'docker' keeps the old container path for parity testing.
   const metaBase = `http://127.0.0.1:${cfg.metaPort}`
-  if (!(await waitHttp(`${metaBase}/health`, (r) => r.ok, 45_000))) {
-    const logs = await execFile('docker', ['logs', container]).catch(() => ({ stdout: '', stderr: '' }))
-    await teardown(cleanups)
-    throw new Error(`postgres-meta never healthy\n${logs.stdout}\n${logs.stderr}`)
+  if (opts.metaMode === 'docker') {
+    await execFile('docker', ['rm', '-f', container]).catch(() => {})
+    await execFile('docker', [
+      'run', '--rm', '-d', '--name', container,
+      '-p', `${cfg.metaPort}:8080`,
+      '-e', 'PG_META_PORT=8080',
+      '-e', `PG_META_DB_URL=postgresql://postgres:postgres@host.docker.internal:${cfg.wirePort}/postgres?sslmode=disable`,
+      '-e', `PG_QUERY_TIMEOUT_SECS=${cfg.queryTimeoutSecs}`,
+      cfg.metaImage,
+    ])
+    cleanups.unshift(() => execFile('docker', ['rm', '-f', container]).catch(() => {}))
+    if (!(await waitHttp(`${metaBase}/health`, (r) => r.ok, 45_000))) {
+      const logs = await execFile('docker', ['logs', container]).catch(() => ({ stdout: '', stderr: '' }))
+      await teardown(cleanups)
+      throw new Error(`postgres-meta never healthy\n${logs.stdout}\n${logs.stderr}`)
+    }
+  } else {
+    const require = createRequire(import.meta.url)
+    let serverJs
+    try {
+      serverJs = join(dirname(require.resolve('@supabase/postgres-meta/package.json')), 'dist', 'server', 'server.js')
+    } catch {
+      throw new Error('postgres-meta not installed: npm i -D @supabase/postgres-meta (or pass metaMode: "docker")')
+    }
+    const meta = spawn('node', [serverJs], {
+      env: {
+        ...process.env,
+        PG_META_HOST: '127.0.0.1',
+        PG_META_PORT: String(cfg.metaPort),
+        PG_META_DB_URL: `postgresql://postgres:postgres@127.0.0.1:${cfg.wirePort}/postgres?sslmode=disable`,
+        PG_QUERY_TIMEOUT_SECS: String(cfg.queryTimeoutSecs),
+      },
+      stdio: opts.quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'],
+    })
+    cleanups.unshift(() => { try { meta.kill('SIGKILL') } catch {} })
+    if (!(await waitHttp(`${metaBase}/health`, (r) => r.ok, 30_000))) {
+      await teardown(cleanups)
+      throw new Error('postgres-meta (node) never became healthy')
+    }
   }
   log(`[harness] postgres-meta healthy on :${cfg.metaPort}`)
 

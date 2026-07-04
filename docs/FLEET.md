@@ -80,9 +80,11 @@ so it stays tiny forever.
 last-opened time, the project dir they were used from, and whether the datadir
 still exists. In the console every present local DB has two one-click actions:
 
-- **serve**: stands up a loopback wire (`serveWire`) on the datadir and hands
-  you a `postgresql://127.0.0.1:<port>/...` URL for psql / TablePlus /
-  DataGrip. Stop it from the same card.
+- **serve**: stands up a loopback wire (`serveWire`) on the datadir and shows a
+  **direct connections** block - the same live endpoint in every format a tool
+  wants: `uri`, a ready-to-paste `psql "..."` command, a `jdbc:postgresql://...`
+  URL, and a `DATABASE_URL=...` line for a `.env`. Each has its own copy
+  button. Stop it from the same card.
 - **open in studio**: see below.
 
 `~/.zeropg` is now the single zeropg home dir; `contexts.json` moved there
@@ -101,11 +103,25 @@ it lists, so every row has an "open in studio" button:
   detached throwaway copy, so poking at it - even writing - is
   consequence-free; relaunch to refresh the snapshot.
 
+**No Docker.** The whole studio stack is plain node child processes on
+loopback: the wire, postgres-meta (the npm `@supabase/postgres-meta` package
+ships the same fastify server the Docker image runs - `dist/server/server.js`,
+same env contract), and the studio BFF. Nothing binds beyond 127.0.0.1,
+nothing needs a container runtime. Cost while a studio is open: ~200 MB for
+postgres-meta + ~100 MB for the BFF (both Node), torn down on stop. (postgres-
+meta's own admin app wants `PG_META_PORT+1`, so the console reserves that
+port too; all three ports are OS-assigned per launch, so a concurrent
+up-local studio stack is never trampled.)
+
 One studio at a time; the console banner shows the URL + admin password and a
-stop button. Requirements: Docker running (postgres-meta runs as a container)
-and a zeropg repo checkout (studio is not shipped in the npm CLI). The studio
-wire binds 0.0.0.0 while studio is open (Docker on macOS cannot reach a
-127.0.0.1-bound host port) - the same tradeoff as studio's own local harness.
+stop button. Requirement: a zeropg repo checkout (studio is not shipped in the
+npm CLI). The `metaMode: 'docker'` harness option still runs postgres-meta as a
+container for parity testing.
+
+Footprint note: the ~200 MB is postgres-meta (a Node/fastify service) - the one
+heavy dependency here. A future direction for a genuinely tiny inspector is to
+drop postgres-meta and run the handful of introspection queries directly (the
+BFF already only forwards SQL), which also opens the door to a Go/Rust rewrite.
 
 `status` prominently reports exposure: zeropg has **no built-in auth** (the
 protection model is platform ingress/IAM), so a service with an `allUsers`
