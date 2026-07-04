@@ -119,3 +119,27 @@ today by running NocoDB against the wire.
    NocoDB/Outerbase/psql/TablePlus against this instance's wire.
 5. **Graduation panel**: the GRADUATION.md runbook as a guided UI (quiesce ->
    pg_dump command -> verify checksums -> point-your-app).
+
+## 5. Decision addendum (2026-07-04): adopt-vs-build + language question
+
+Settled after live-testing the survey candidates against both a local wire and a
+remote instance snapshot (docs/LIGHT-PG-EDITORS-SURVEY.md):
+
+- **Adopt for all generic SQL/grid work.** Adminer (fleet-wide editing, one
+  container, URL-addressable connections) + pgweb (browse/query) become the
+  "Open in..." data plane; NocoDB stays the Airtable tier. Our own grid stays
+  frozen. The only build-worthy editor remains the future RLS-client grid
+  (section 3), because no adoptable tool can execute as a GoTrue end-user
+  identity - they all connect as a DB superuser.
+- **Rust is disqualified for wire-facing tooling by our own compat evidence:**
+  the mainstream Rust drivers (sqlx, Diesel, named-statement tokio-postgres)
+  are exactly the clients blocked on the single-session wire. Go + pgx
+  cache_describe is the proven-good path if a rewrite ever happens.
+- **The footprint problem is postgres-meta (~200MB), not Node.** Next
+  lightness move: drop postgres-meta from the console stack (the BFF already
+  mostly forwards SQL; the introspection it uses is a handful of known catalog
+  queries, and /indexes is bypassed already). That cuts ~2/3 of the RSS with
+  no language change and is a prerequisite for any Go rewrite anyway.
+- **Go becomes right** only if the inspector ships as a standalone binary or a
+  per-instance sidecar where image size x fleet size bills. Neither is true
+  today for a research repo.
