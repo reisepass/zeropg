@@ -14,6 +14,8 @@ import { loadConfig } from '../fleet/contexts.js'
 import { listInstances } from '../fleet/gcloud.js'
 import { probeStatus, wakeAndWait } from '../fleet/probe.js'
 import { listLocalDbs } from '../fleet/localdbs.js'
+import { inspectManifest, peekTables } from '../fleet/bucket.js'
+import { mergeStats, readAllStats, remoteStatsKey } from '../fleet/stats.js'
 import type { Instance } from '../fleet/types.js'
 import {
   serveLocal,
@@ -64,6 +66,7 @@ const PAGE = `<!doctype html>
   .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; margin-bottom:16px; padding:16px 20px; }
   .card h2 { margin:0 0 4px; font-size:15px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .meta { color:var(--dim); font-size:12px; }
+  .mem { color:var(--dim); font-size:11px; opacity:.75; margin-top:2px; }
   dl { display:grid; grid-template-columns:110px 1fr; gap:4px 12px; margin:12px 0 0; }
   dt { color:var(--dim); }
   dd { margin:0; word-break:break-all; }
@@ -186,6 +189,35 @@ function remoteCard(inst) {
     setTimeout(() => { b.textContent = 'wake'; b.disabled = false }, 4000)
   })
   const studioBtn = btn('open in studio (snapshot)', (b) => studioLaunch({ kind: 'replica', service: inst.name, context: inst.context }, b))
+  // Remembered stats (grey memory), shown from cache without touching anything.
+  const memSlot = el('div')
+  const ago = (iso) => { if (!iso) return null; const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000); if (s < 90) return s + 's ago'; if (s < 5400) return Math.round(s/60) + 'm ago'; if (s < 129600) return Math.round(s/3600) + 'h ago'; return Math.round(s/86400) + 'd ago' }
+  const renderMem = (s) => {
+    memSlot.textContent = ''
+    if (!s) return
+    const bits = []
+    if (s.dbBytes != null) bits.push((s.dbBytes / 1e6).toFixed(1) + ' MB')
+    if (s.lastStartupMs != null) bits.push('last start ' + (s.lastStartupMs/1000).toFixed(1) + 's')
+    if (s.lastWakeAt) bits.push('woke ' + ago(s.lastWakeAt))
+    else if (s.lastProbeAt) bits.push('probed ' + ago(s.lastProbeAt))
+    if (bits.length) memSlot.appendChild(el('div', { class: 'mem', text: 'memory: ' + bits.join('  ·  ') }))
+    const tabs = [...new Set([...(s.recentTables||[]), ...(s.oldestTables||[])])].slice(0, 8)
+    if (tabs.length) memSlot.appendChild(el('div', { class: 'mem', text: 'tables: ' + tabs.join(', ') }))
+  }
+  renderMem(inst.stats)
+  const inspectBtn = btn('learn more (no wake)', async (b) => {
+    b.disabled = true; const old = b.textContent; b.textContent = 'reading bucket...'
+    try { const r = await api('/api/inspect', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ service: inst.name, context: inst.context }) }); renderMem(r.stats)
+      memSlot.appendChild(el('div', { class:'mem', text: 'bucket: last commit ' + (r.info.committedAt || '?') + '  ·  ' + r.info.commitSeq + ' commits  ·  ' + (r.info.bucketBytes/1e6).toFixed(1) + ' MB stored' + (r.info.movedTo ? '  ·  MOVED TO ' + r.info.movedTo : '') })) }
+    catch (e) { alert('inspect: ' + e.message) }
+    b.textContent = old; b.disabled = false
+  })
+  const peekBtn = btn('peek tables (no wake)', async (b) => {
+    b.disabled = true; const old = b.textContent; b.textContent = 'materializing snapshot...'
+    try { const r = await api('/api/peek', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ service: inst.name, context: inst.context }) }); renderMem(r.stats) }
+    catch (e) { alert('peek: ' + e.message) }
+    b.textContent = old; b.disabled = false
+  })
   return el('div', { class: 'card' }, [
     el('h2', {}, [
       el('span', { text: inst.name }),
@@ -194,6 +226,7 @@ function remoteCard(inst) {
       statusPill,
     ]),
     el('div', { class: 'meta', text: inst.project + '/' + inst.region + '  |  durability: ' + (inst.durability || 'sleep (default)') + (inst.extensions.length ? '  |  extensions: ' + inst.extensions.join(', ') : '') }),
+    memSlot,
     el('dl', {}, [
       el('dt', { text: 'url' }), el('dd', { text: inst.url || '(none)' }),
       el('dt', { text: 'bucket' }), el('dd', { text: bucket }),
@@ -201,7 +234,7 @@ function remoteCard(inst) {
       el('dt', { text: 'rest' }), el('dd', { text: inst.url ? inst.url + '/rest/<table>' : '(none)' }),
     ]),
     el('div', { class: 'actions' }, [
-      statusBtn, wakeBtn, studioBtn,
+      inspectBtn, peekBtn, statusBtn, wakeBtn, studioBtn,
       copyBtn('copy url', inst.url || ''),
       copyBtn('copy sql endpoint', inst.url ? inst.url + '/sql' : ''),
       copyBtn('copy bucket', bucket),
@@ -289,8 +322,26 @@ export async function runConsole(flags: Record<string, string | boolean>): Promi
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         return res.end(PAGE)
       }
-      if (url.pathname === '/api/fleet') return json(200, await discover())
+      if (url.pathname === '/api/fleet') {
+        const d = await discover()
+        // Attach remembered stats (grey memory) to each instance.
+        const stats = readAllStats()
+        return json(200, { ...d, instances: d.instances.map((i) => ({ ...i, stats: stats[remoteStatsKey(i)] ?? null })) })
+      }
       if (url.pathname === '/api/local') return json(200, { dbs: listLocalDbs(), served: listServed() })
+      if ((url.pathname === '/api/inspect' || url.pathname === '/api/peek') && req.method === 'POST') {
+        const { service, context } = await readBody()
+        const inst = await findByName(service ?? '', context ?? null)
+        if (!inst) return json(404, { error: `no instance ${service}` })
+        if (url.pathname === '/api/inspect') {
+          const info = await inspectManifest(inst)
+          mergeStats(remoteStatsKey(inst), { dbBytes: info.bucketBytes })
+          return json(200, { info, stats: { ...readAllStats()[remoteStatsKey(inst)] } })
+        }
+        const patch = await peekTables(inst)
+        mergeStats(remoteStatsKey(inst), patch)
+        return json(200, { stats: { ...readAllStats()[remoteStatsKey(inst)] } })
+      }
       if (url.pathname === '/api/serve' && req.method === 'POST') {
         const { path } = await readBody()
         if (!path) return json(400, { error: 'path required' })
@@ -329,8 +380,18 @@ export async function runConsole(flags: Record<string, string | boolean>): Promi
         if (!service) return json(400, { error: 'service query param required' })
         const inst = await findByName(service, context)
         if (!inst) return json(404, { error: `no instance ${service}` })
-        if (url.pathname === '/api/status') return json(200, await probeStatus(inst))
-        return json(200, await wakeAndWait(inst))
+        if (url.pathname === '/api/status') {
+          const st = await probeStatus(inst)
+          mergeStats(remoteStatsKey(inst), {
+            lastProbeAt: new Date().toISOString(),
+            lastProbeMs: st.probeMs,
+            ...(st.dbBytes !== null ? { dbBytes: st.dbBytes } : {}),
+          })
+          return json(200, st)
+        }
+        const r = await wakeAndWait(inst)
+        if (r.ready) mergeStats(remoteStatsKey(inst), { lastWakeAt: new Date().toISOString(), lastStartupMs: r.waitedMs })
+        return json(200, r)
       }
       return json(404, { error: 'not found' })
     } catch (e) {

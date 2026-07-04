@@ -9,6 +9,8 @@ import { listInstances, rollService } from './gcloud.js'
 import { probeStatus, wakeAndWait } from './probe.js'
 import { exportToFile, migrateTo } from './export.js'
 import { listLocalDbs } from './localdbs.js'
+import { inspectManifest, peekTables } from './bucket.js'
+import { mergeStats, readStats, remoteStatsKey } from './stats.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -23,6 +25,10 @@ Fleet (all commands take --json, and --context <name> | --project X --region Y):
   zeropg fleet ls                      discover instances (live; never wakes them)
   zeropg fleet local                   local datadirs this machine has opened
                                        (from the ~/.zeropg/opens.jsonl breadcrumbs)
+  zeropg fleet inspect <service>       read the bucket manifest: last commit,
+                                       commit count, stored bytes - NO wake
+  zeropg fleet peek <service>          table-name hints + exact size from a
+                                       bucket snapshot - NO wake (local restore)
   zeropg fleet status <service>        probe health + security posture (wakes it)
   zeropg fleet wake <service>          wake and wait until ready
   zeropg fleet url <service>           connection endpoints (HTTP faces)
@@ -229,8 +235,48 @@ export async function runFleet(positionals: string[], flags: Flags): Promise<voi
       if (!arg) throw new Error('usage: zeropg fleet status <service>')
       const inst = await findInstance(arg, flags)
       const st = await probeStatus(inst)
+      // Remember what we saw (grey stats in the console; survives between runs).
+      mergeStats(remoteStatsKey(inst), {
+        lastProbeAt: new Date().toISOString(),
+        lastProbeMs: st.probeMs,
+        ...(st.dbBytes !== null ? { dbBytes: st.dbBytes } : {}),
+      })
       if (json) console.log(JSON.stringify({ ...st, endpoints: endpointsOf(inst) }, null, 2))
       else printStatus(st)
+      return
+    }
+
+    case 'inspect': {
+      if (!arg) throw new Error('usage: zeropg fleet inspect <service>')
+      const inst = await findInstance(arg, flags)
+      const info = await inspectManifest(inst)
+      mergeStats(remoteStatsKey(inst), { dbBytes: info.bucketBytes })
+      if (json) {
+        console.log(JSON.stringify(info, null, 2))
+        return
+      }
+      console.log(`${inst.name}  (bucket: gs://${inst.bucket}/${inst.prefix})  — read WITHOUT waking the service`)
+      console.log(`  last commit  ${info.committedAt ?? '(no manifest yet)'}`)
+      console.log(`  commits      ${info.commitSeq ?? '?'}`)
+      console.log(`  generation   ${info.generation ?? '?'}`)
+      console.log(`  stored       ${fmtBytes(info.bucketBytes)} across ${info.objectCount} objects`)
+      if (info.movedTo) console.log(`  MOVED TO     ${info.movedTo} (booting this bucket would refuse)`)
+      return
+    }
+
+    case 'peek': {
+      if (!arg) throw new Error('usage: zeropg fleet peek <service>')
+      const inst = await findInstance(arg, flags)
+      if (!json) console.log(`peeking ${inst.name} from its bucket (local snapshot; the service is NOT woken)...`)
+      const patch = await peekTables(inst)
+      mergeStats(remoteStatsKey(inst), patch)
+      if (json) {
+        console.log(JSON.stringify(patch, null, 2))
+        return
+      }
+      if (patch.dbBytes !== undefined) console.log(`  db size      ${fmtBytes(patch.dbBytes)}`)
+      console.log(`  newest tables ${patch.recentTables?.length ? patch.recentTables.join(', ') : '(none in public)'}`)
+      console.log(`  oldest tables ${patch.oldestTables?.length ? patch.oldestTables.join(', ') : '(none in public)'}`)
       return
     }
 
@@ -239,6 +285,7 @@ export async function runFleet(positionals: string[], flags: Flags): Promise<voi
       const inst = await findInstance(arg, flags)
       if (!json) console.log(`waking ${inst.name} at ${inst.url}`)
       const r = await wakeAndWait(inst)
+      if (r.ready) mergeStats(remoteStatsKey(inst), { lastWakeAt: new Date().toISOString(), lastStartupMs: r.waitedMs })
       if (json) console.log(JSON.stringify({ service: inst.name, ...r, endpoints: endpointsOf(inst) }, null, 2))
       else if (r.ready) console.log(`✓ ready in ${r.waitedMs} ms`)
       else console.log(`still not ready after ${r.waitedMs} ms (phase: ${r.phase ?? 'unknown'})`)
