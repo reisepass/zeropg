@@ -50,6 +50,14 @@ export interface Instance {
 export interface InstanceStatus {
   instance: Instance
   reachable: boolean
+  /** True when the service answered on the zeropg HTTP control face (/up JSON).
+   *  False for an app service (PrivateBin, NocoDB, ...) that fronts zeropg and
+   *  serves its own app on the public port - it answers HTTP but has no zeropg
+   *  control face, so phase/metrics are unavailable (inspect it via the
+   *  bucket-backed studio snapshot instead). */
+  hasControlFace: boolean
+  /** HTTP status of the probe response (any value means the container is up). */
+  httpStatus: number | null
   /** Server boot phase from /up: init | restoring | wire | postgrest | ready | error. */
   phase: string | null
   ready: boolean

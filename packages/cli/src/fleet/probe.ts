@@ -20,10 +20,22 @@ interface MetricsBody {
   durability?: string | null
 }
 
-async function getJson<T>(url: string, timeoutMs: number): Promise<T> {
+/** Fetch a URL and JSON-parse only if it is actually JSON. Returns the parsed
+ *  body (or null for non-JSON, e.g. an app's HTML) plus the HTTP status, so a
+ *  caller can tell "answered but not the zeropg control face" from "down". */
+async function tryJson<T>(url: string, timeoutMs: number): Promise<{ status: number; body: T | null }> {
   const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
-  // /up answers 503 with a JSON body while booting; that is still signal.
-  return (await res.json()) as T
+  const text = await res.text()
+  const looksJson = /^[\s﻿]*[[{]/.test(text)
+  let body: T | null = null
+  if (looksJson) {
+    try {
+      body = JSON.parse(text) as T
+    } catch {
+      body = null
+    }
+  }
+  return { status: res.status, body }
 }
 
 export async function probeStatus(inst: Instance, opts: { timeoutMs?: number } = {}): Promise<InstanceStatus> {
@@ -32,6 +44,8 @@ export async function probeStatus(inst: Instance, opts: { timeoutMs?: number } =
   const status: InstanceStatus = {
     instance: inst,
     reachable: false,
+    hasControlFace: false,
+    httpStatus: null,
     phase: null,
     ready: false,
     dbBytes: null,
@@ -52,36 +66,54 @@ export async function probeStatus(inst: Instance, opts: { timeoutMs?: number } =
     return status
   }
   try {
-    const up = await getJson<UpBody>(`${inst.url}/up`, timeoutMs)
+    const { status: httpStatus, body: up } = await tryJson<UpBody>(`${inst.url}/up`, timeoutMs)
+    // Any HTTP answer means the container is up (the request just woke it).
     status.reachable = true
-    status.phase = up.phase ?? null
-    status.ready = up.ok === true
-    if (status.ready) {
-      try {
-        const m = await getJson<MetricsBody>(`${inst.url}/metrics`, timeoutMs)
-        status.dbBytes = m.dbBytes !== undefined ? Number(m.dbBytes) : null
-        status.totalRssMB = m.totalRssMB ?? null
-        status.requestsServed = m.requestsServed ?? null
-        status.fencingToken = m.fencingToken ?? null
-        status.postgrest = m.postgrest ?? null
-      } catch {
-        /* metrics are best-effort; /up already told us it is ready */
+    status.httpStatus = httpStatus
+    if (up && (typeof up.phase === 'string' || typeof up.ok === 'boolean')) {
+      // Bare zeropg standalone server: it has the JSON control face.
+      status.hasControlFace = true
+      status.phase = up.phase ?? null
+      status.ready = up.ok === true
+      if (status.ready) {
+        try {
+          const { body: m } = await tryJson<MetricsBody>(`${inst.url}/metrics`, timeoutMs)
+          if (m) {
+            status.dbBytes = m.dbBytes !== undefined ? Number(m.dbBytes) : null
+            status.totalRssMB = m.totalRssMB ?? null
+            status.requestsServed = m.requestsServed ?? null
+            status.fencingToken = m.fencingToken ?? null
+            status.postgrest = m.postgrest ?? null
+          }
+        } catch {
+          /* metrics are best-effort; /up already told us it is ready */
+        }
       }
+    } else {
+      // App service (PrivateBin, NocoDB, ...) fronting zeropg: no control face.
+      // It answered HTTP, so the container is up; treat <500 as serving.
+      status.hasControlFace = false
+      status.ready = httpStatus < 500
     }
   } catch (e) {
-    status.error = e instanceof Error ? e.message : String(e)
+    // Only a network/timeout failure reaches here now - genuinely unreachable.
+    const msg = e instanceof Error ? e.message : String(e)
+    status.error = /timeout|aborted|timed out/i.test(msg)
+      ? `no response within ${Math.round(timeoutMs / 1000)}s (cold start may take longer; try wake)`
+      : msg
   }
   status.probeMs = Math.round(performance.now() - t0)
   return status
 }
 
-/** GET /wake then poll until the instance reports ready. Older deployed images
- *  predate /wake and /ready and only serve /up (the nightly reset smokes /up
- *  for the same reason), so a 404 from /ready falls back to polling /up. */
+/** GET /wake then poll until the instance is serving. A bare zeropg server
+ *  reports readiness as JSON on /ready or /up; an app service (PrivateBin,
+ *  NocoDB, ...) has no control face, so any HTTP answer below 500 means its
+ *  container is up. Handles both, and non-JSON bodies, without crashing. */
 export async function wakeAndWait(
   inst: Instance,
   opts: { timeoutMs?: number; pollMs?: number } = {},
-): Promise<{ ready: boolean; waitedMs: number; phase: string | null }> {
+): Promise<{ ready: boolean; waitedMs: number; phase: string | null; appService: boolean }> {
   if (!inst.url) throw new Error(`${inst.name}: service has no URL`)
   const timeoutMs = opts.timeoutMs ?? 120_000
   const pollMs = opts.pollMs ?? 1_500
@@ -90,22 +122,29 @@ export async function wakeAndWait(
     /* the request itself is the wake; readiness comes from polling below */
   })
   let phase: string | null = null
-  let path = '/ready'
+  const done = (ready: boolean, appService: boolean) => ({
+    ready,
+    appService,
+    waitedMs: Math.round(performance.now() - t0),
+    phase,
+  })
   while (performance.now() - t0 < timeoutMs) {
     try {
-      const res = await fetch(`${inst.url}${path}`, { signal: AbortSignal.timeout(30_000) })
-      const body = (await res.json()) as { ready?: boolean; ok?: boolean; phase?: string; error?: string }
-      if (path === '/ready' && res.status === 404 && body.error === 'not found') {
-        path = '/up'
-        continue
+      const res = await fetch(`${inst.url}/up`, { signal: AbortSignal.timeout(30_000) })
+      const text = await res.text()
+      const body = /^[\s﻿]*[[{]/.test(text) ? (JSON.parse(text) as { ready?: boolean; ok?: boolean; phase?: string }) : null
+      if (body && (typeof body.ok === 'boolean' || typeof body.phase === 'string')) {
+        // zeropg control face
+        phase = body.phase ?? null
+        if (res.status === 200 && body.ok !== false) return done(true, false)
+      } else if (res.status < 500) {
+        // app service (or any non-control-face 2xx/3xx/4xx): container is up
+        return done(true, true)
       }
-      phase = body.phase ?? null
-      const ready = path === '/ready' ? res.status === 200 && body.ready !== false : res.status === 200 && body.ok === true
-      if (ready) return { ready: true, waitedMs: Math.round(performance.now() - t0), phase }
     } catch {
       /* instance still coming up */
     }
     await new Promise((r) => setTimeout(r, pollMs))
   }
-  return { ready: false, waitedMs: Math.round(performance.now() - t0), phase }
+  return done(false, false)
 }

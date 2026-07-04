@@ -116,16 +116,25 @@ function endpointsOf(inst: Instance) {
   }
 }
 
+function stateLine(st: InstanceStatus): string {
+  if (!st.reachable) return `unreachable${st.error ? `: ${st.error}` : ''}`
+  if (st.hasControlFace) return st.ready ? 'ready' : `booting (${st.phase ?? 'unknown'})`
+  // App service fronting zeropg: no control face, judge by HTTP.
+  return st.ready
+    ? `serving (app service, HTTP ${st.httpStatus}; no zeropg control face - inspect via studio snapshot)`
+    : `up but HTTP ${st.httpStatus} (app service; still booting?)`
+}
+
 function printStatus(st: InstanceStatus): void {
   const i = st.instance
   console.log(`${i.name}  (context ${i.context}, ${i.project}/${i.region})`)
   console.log(`  url          ${i.url ?? '(none)'}`)
-  console.log(`  state        ${st.reachable ? (st.ready ? 'ready' : `booting (${st.phase ?? 'unknown'})`) : `unreachable${st.error ? `: ${st.error}` : ''}`}`)
+  console.log(`  state        ${stateLine(st)}`)
   if (st.dbBytes !== null) console.log(`  db size      ${fmtBytes(st.dbBytes)}`)
   if (st.totalRssMB !== null) console.log(`  rss          ${st.totalRssMB} MB`)
   if (st.requestsServed !== null) console.log(`  requests     ${st.requestsServed}`)
   console.log(`  durability   ${i.durability ?? 'sleep (default)'}`)
-  console.log(`  postgrest    ${st.postgrest === null ? '?' : st.postgrest ? 'on (/rest)' : 'off'}`)
+  if (st.hasControlFace) console.log(`  postgrest    ${st.postgrest === null ? '?' : st.postgrest ? 'on (/rest)' : 'off'}`)
   console.log(`  bucket       ${i.bucket && i.prefix ? `gs://${i.bucket}/${i.prefix}` : '(unknown)'}`)
   console.log(`  image        ${i.image ?? '?'}`)
   console.log(`  deployed     ${i.updateTime ?? '?'}`)

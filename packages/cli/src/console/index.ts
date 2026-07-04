@@ -158,8 +158,14 @@ function remoteCard(inst) {
     b.disabled = true
     const q = '?service=' + encodeURIComponent(inst.name) + '&context=' + encodeURIComponent(inst.context)
     const st = await api('/api/status' + q)
-    statusPill.className = 'pill ' + (st.ready ? 'ready' : st.reachable ? 'booting' : 'bad')
-    statusPill.textContent = st.ready ? 'ready' : st.reachable ? 'booting: ' + (st.phase || '?') : 'unreachable'
+    // Three cases: bare zeropg control face (phase/metrics), an app service
+    // fronting zeropg (answers HTTP, no control face), or truly unreachable.
+    let cls, label
+    if (!st.reachable) { cls = 'bad'; label = 'unreachable' }
+    else if (st.hasControlFace) { cls = st.ready ? 'ready' : 'booting'; label = st.ready ? 'ready' : 'booting: ' + (st.phase || '?') }
+    else { cls = st.ready ? 'ready' : 'booting'; label = st.ready ? 'app up (HTTP ' + st.httpStatus + ')' : 'HTTP ' + st.httpStatus }
+    statusPill.className = 'pill ' + cls
+    statusPill.textContent = label
     extra.textContent = ''
     const facts = []
     if (st.dbBytes != null) facts.push('db ' + (st.dbBytes / 1e6).toFixed(1) + ' MB')
@@ -167,6 +173,7 @@ function remoteCard(inst) {
     if (st.requestsServed != null) facts.push(st.requestsServed + ' requests')
     facts.push('probe ' + st.probeMs + ' ms')
     extra.appendChild(el('div', { class: 'meta', text: facts.join('  |  ') }))
+    if (st.reachable && !st.hasControlFace) extra.appendChild(el('div', { class: 'meta', text: 'This is an app service fronting zeropg - it has no zeropg HTTP control face, so DB metrics are not available here. Inspect its data with "open in studio (snapshot)".' }))
     if (st.publicInvoker === true) extra.appendChild(el('div', { class: 'err', text: 'PUBLIC: allUsers can invoke and zeropg has no built-in auth; anyone with the URL can run SQL.' }))
     if (st.error) extra.appendChild(el('div', { class: 'err', text: st.error }))
     b.disabled = false
