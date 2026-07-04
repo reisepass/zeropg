@@ -13,7 +13,7 @@ import { createServer } from 'node:http'
 import { loadConfig } from '../fleet/contexts.js'
 import { listInstances } from '../fleet/gcloud.js'
 import { probeStatus, wakeAndWait } from '../fleet/probe.js'
-import { listLocalDbs } from '../fleet/localdbs.js'
+import { listLocalDbs, peekLocalDb } from '../fleet/localdbs.js'
 import { inspectManifest, peekTables } from '../fleet/bucket.js'
 import { mergeStats, readAllStats, remoteStatsKey } from '../fleet/stats.js'
 import type { Instance } from '../fleet/types.js'
@@ -281,14 +281,30 @@ function localCard(db, servedList) {
     b.textContent = 'serve (psql/TablePlus)'; b.disabled = false
   })
   const studioBtn = btn('open in studio', (b) => studioLaunch({ kind: 'local', path: db.path }, b))
+  const memSlot = el('div')
+  const renderMem = (s) => {
+    memSlot.textContent = ''
+    if (!s) return
+    if (s.dbBytes != null) memSlot.appendChild(el('div', { class: 'mem', text: 'memory: ' + (s.dbBytes / 1e6).toFixed(1) + ' MB' }))
+    const tabs = [...new Set([...(s.recentTables||[]), ...(s.oldestTables||[])])].slice(0, 8)
+    if (tabs.length) memSlot.appendChild(el('div', { class: 'mem', text: 'tables: ' + tabs.join(', ') }))
+  }
+  renderMem(db.stats)
+  const peekBtn = btn('peek (size+tables)', async (b) => {
+    b.disabled = true; const old = b.textContent; b.textContent = 'reading...'
+    try { const r = await api('/api/peek-local', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ path: db.path }) }); renderMem(r.stats) }
+    catch (e) { alert('peek: ' + e.message + (/held by live/.test(e.message) ? ' (in use - stop the app or serve first)' : '')) }
+    b.textContent = old; b.disabled = false
+  })
   const pills = [el('span', { class: 'pill ' + (db.status === 'gone' ? 'gone' : ''), text: db.status })]
   if (db.lockPresent) pills.push(el('span', { class: 'pill', text: 'lock present' }))
   const card = el('div', { class: 'card' }, [
     el('h2', {}, [el('span', { text: db.path.split('/').pop() || db.path }), ...pills]),
     el('div', { class: 'meta', text: 'last opened ' + db.lastOpened + '  |  project ' + db.cwd }),
+    memSlot,
     el('dl', {}, [el('dt', { text: 'datadir' }), el('dd', { text: db.path })]),
     el('div', { class: 'actions' },
-      db.status === 'gone' ? [copyBtn('copy path', db.path)] : [serveBtn, studioBtn, copyBtn('copy path', db.path)]),
+      db.status === 'gone' ? [copyBtn('copy path', db.path)] : [peekBtn, serveBtn, studioBtn, copyBtn('copy path', db.path)]),
     connSlot,
   ])
   if (servedEntry) renderConn(servedEntry)
@@ -351,6 +367,11 @@ export async function runConsole(flags: Record<string, string | boolean>): Promi
       if (url.pathname === '/api/unserve' && req.method === 'POST') {
         const { path } = await readBody()
         return json(200, { stopped: await stopServed(path ?? '') })
+      }
+      if (url.pathname === '/api/peek-local' && req.method === 'POST') {
+        const { path } = await readBody()
+        if (!path) return json(400, { error: 'path required' })
+        return json(200, { stats: await peekLocalDb(path) })
       }
       if (url.pathname === '/api/studio' && req.method !== 'POST') {
         const s = currentStudio()

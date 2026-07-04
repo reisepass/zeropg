@@ -8,7 +8,7 @@ import { addContext, loadConfig, removeContext, resolveContexts } from './contex
 import { listInstances, rollService } from './gcloud.js'
 import { probeStatus, wakeAndWait } from './probe.js'
 import { exportToFile, migrateTo } from './export.js'
-import { listLocalDbs } from './localdbs.js'
+import { listLocalDbs, peekLocalDb } from './localdbs.js'
 import { inspectManifest, peekTables } from './bucket.js'
 import { mergeStats, readStats, remoteStatsKey } from './stats.js'
 
@@ -23,8 +23,9 @@ Contexts (places to scan, stored in ~/.config/zeropg/contexts.json):
 
 Fleet (all commands take --json, and --context <name> | --project X --region Y):
   zeropg fleet ls                      discover instances (live; never wakes them)
-  zeropg fleet local                   local datadirs this machine has opened
-                                       (from the ~/.zeropg/opens.jsonl breadcrumbs)
+  zeropg fleet local [--peek]          local datadirs this machine has opened
+                                       (from ~/.zeropg/opens.jsonl); --peek opens
+                                       each read-only for size + table hints
   zeropg fleet inspect <service>       read the bucket manifest: last commit,
                                        commit count, stored bytes - NO wake
   zeropg fleet peek <service>          table-name hints + exact size from a
@@ -188,7 +189,19 @@ export async function runFleet(positionals: string[], flags: Flags): Promise<voi
     }
 
     case 'local': {
-      const dbs = listLocalDbs()
+      let dbs = listLocalDbs()
+      // --peek opens each present db read-only to fill in size + table hints.
+      if (flags.peek === true) {
+        for (const d of dbs) {
+          if (d.status !== 'present') continue
+          try {
+            await peekLocalDb(d.path)
+          } catch (e) {
+            if (!json) console.error(`! ${d.path}: ${e instanceof Error ? e.message : e}`)
+          }
+        }
+        dbs = listLocalDbs() // re-read with freshly cached stats
+      }
       if (json) {
         console.log(JSON.stringify({ dbs }, null, 2))
         return
@@ -199,10 +212,16 @@ export async function runFleet(positionals: string[], flags: Flags): Promise<voi
       }
       console.log(
         table(
-          dbs.map((d) => [d.status === 'gone' ? 'GONE' : d.lockPresent ? 'lock' : 'ok', d.lastOpened, d.path, d.cwd]),
-          ['STATE', 'LAST OPENED', 'DATADIR', 'PROJECT'],
+          dbs.map((d) => [
+            d.status === 'gone' ? 'GONE' : d.lockPresent ? 'lock' : 'ok',
+            d.stats?.dbBytes != null ? fmtBytes(d.stats.dbBytes) : '?',
+            d.stats?.recentTables?.length ? d.stats.recentTables.slice(0, 3).join(',') : '',
+            d.path,
+          ]),
+          ['STATE', 'SIZE', 'TABLES', 'DATADIR'],
         ),
       )
+      if (!flags.peek) console.log('\n(size/tables come from a prior open; run `zeropg fleet local --peek` to read them now)')
       return
     }
 

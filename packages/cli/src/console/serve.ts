@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url'
 import { createServer as createNetServer } from 'node:net'
 import { serveWire, type WireServer } from '@zeropg/client'
 import type { Instance } from '../fleet/types.js'
+import { captureDbStats, localStatsKey, mergeStats } from '../fleet/stats.js'
 
 /** OS-assigned free TCP port (so parallel studio/pg-meta stacks - e.g. the
  *  studio's own up-local harness on 4321/4322 - are never trampled). */
@@ -68,6 +69,11 @@ export async function serveLocal(path: string): Promise<Served> {
   const existing = served.get(abs)
   if (existing) return existing
   const wire: WireServer = await serveWire({ dataDir: abs, host, port: 0 })
+  // We are already holding this datadir open - capture its size + table hints
+  // for free (best-effort) so the console remembers them.
+  void captureDbStats({ query: (sql: string) => wire.pglite.query(sql) })
+    .then((s) => mergeStats(localStatsKey(abs), s))
+    .catch(() => {})
   const entry: Served = {
     kind: 'local',
     id: abs,
