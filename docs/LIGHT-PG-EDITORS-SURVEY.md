@@ -62,3 +62,58 @@ three concrete recipes instead of an abstract list:
 Killswitch TODO before promoting WhoDB or pgconsole into the recipes: the
 standard 42P05/concurrency/poisoning test against a local wire (reuse
 killswitch-pgmeta.mjs's harness pattern).
+
+## Live test results (2026-07-04, against a local zeropg wire on :5499)
+
+All four tools driven headless (Playwright / API) against the same seeded table;
+edits verified by reading back over the wire.
+
+| tool | verdict | evidence |
+|---|---|---|
+| **Adminer 5** (`adminer:latest`, port 8081) | **PASS incl. row edit** | login form -> table list -> data grid -> edited a row through the form; new value confirmed over the wire |
+| **pgweb** (port 8082) | **PASS (read/SQL)** | connected at boot via env URL; /api/objects lists the table; SELECT + UPDATE via its query API round-trip; no grid editing by design |
+| **WhoDB** (port 8083) | **PARTIAL** | login + schema introspection work (GORM/pgx did NOT hit 42P05); BUT its database dropdown says "No database found." against PGlite (its pg_database listing query returns empty) and the session defaults into whatever schema sorts first; usable, rough edges |
+| **drizzle-kit studio** (server :4983 + CDN frontend) | **PASS incl. rows in ~2s** | server listens in tens of ms; local.drizzle.studio renders the table + rows ~2.1s after page load, 13ms query time, Add record UI present |
+
+### Finding 1: the wire does not answer SSLRequest - clients with default sslmode HANG
+
+libpq and pgx default to `sslmode=prefer`, which opens with an SSLRequest
+packet. The current `serveWire` (@zeropg/client + pglite-socket 0.2.2) never
+answers it, so Adminer and WhoDB froze on login until the container got
+`PGSSLMODE=disable` (psql reproduces it: default DSN hangs, `?sslmode=disable`
+connects instantly). node-postgres and postgres-meta never noticed because
+their URLs carry `sslmode=disable` explicitly.
+
+- Container-level workaround (used in the recipes): `-e PGSSLMODE=disable`.
+- Proper fix candidate: serveWire should answer `N` to SSLRequest (and
+  GSSENCRequest) so default-mode clients fall back to plaintext. TODO: check
+  whether pglite-socket already supports this and our wrapper drops it.
+
+### Finding 2: Drizzle Studio, tested after all (why it was excluded, then wasn't)
+
+Excluded from the shipping shortlist because nothing is self-hostable open
+source: the embeddable component is paid B2B and `drizzle-kit studio` loads its
+frontend from their CDN (needs internet; HTTPS-to-localhost also trips
+Chrome's Local Network Access block, which shows up hard in headless). But as
+PERSONAL local DX it is excellent and free: against zeropg it listed schema +
+tables and rendered rows ~2s from page load with full editing UI. Verdict
+unchanged for the fleet/self-host story (Adminer + pgweb), but
+`drizzle-kit studio` earns a mention in the local-dev docs as the polished
+option for people who already live in the Drizzle ecosystem.
+
+### Recipes as tested
+
+```bash
+# Adminer (edit rows/DDL; one container serves the whole fleet)
+docker run -d -p 8081:8080 -e PGSSLMODE=disable adminer:latest
+#   login: driver=PostgreSQL, server=host.docker.internal:5499, postgres/postgres, db=postgres
+
+# pgweb (read/query/export; per-instance)
+docker run -d -p 8082:8081 -e PGWEB_DATABASE_URL="postgres://postgres:postgres@host.docker.internal:5499/postgres?sslmode=disable" sosedoff/pgweb
+
+# WhoDB (modern UI; partial against PGlite today)
+docker run -d -p 8083:8080 -e PGSSLMODE=disable clidey/whodb
+
+# drizzle-kit studio (local DX; CDN frontend)
+npx drizzle-kit studio --port 4983   # with a drizzle.config.ts whose dbCredentials.url has sslmode=disable
+```
