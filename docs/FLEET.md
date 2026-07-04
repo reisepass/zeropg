@@ -55,6 +55,8 @@ URLs, not just names) and `--context <name>` or `--project/--region`.
 ```
 zeropg fleet ls                       every instance, live-discovered; never wakes anything
 zeropg fleet local                    local datadirs this machine has opened
+zeropg fleet inspect <service>        bucket manifest: last commit, count, stored bytes - NO wake
+zeropg fleet peek <service>           table-name hints + exact size from a bucket snapshot - NO wake
 zeropg fleet status <service>         health probe + IAM exposure posture (wakes it)
 zeropg fleet wake <service>           wake and wait until ready
 zeropg fleet url <service>            all endpoints (base, /sql, /rest, /wake, bucket)
@@ -62,6 +64,33 @@ zeropg fleet export <service> --out dump.sql
 zeropg fleet migrate <service> --to <postgres-url> --yes
 zeropg console [--port 4900]          local web view over the same inventory
 ```
+
+## Learn about a db without starting it, and remember it
+
+Everything durable is in the bucket, so you can learn a lot without waking the
+Cloud Run service (no cost on the service, no cold start):
+
+- **`fleet inspect`** / console **"learn more (no wake)"**: one GET of
+  `manifest.json` plus a `list()` of the prefix - last commit time, commit
+  count, generation, and total bytes stored. Cheap.
+- **`fleet peek`** / console **"peek tables (no wake)"**: materialize a
+  read-only `ZeroPGReplica` from the bucket (local restore, seconds; the remote
+  service is never touched) and read exact db size + public table-name hints
+  (by `pg_class` oid order, a proxy for creation order). A badly named db still
+  shows what it holds - `privatebin-zeropg` -> `privatebin_paste`,
+  `privatebin_comment`, `privatebin_config`.
+
+The console **remembers** what it learns in `~/.zeropg/instance-stats.json`
+(keyed by the durable bucket/prefix): last known size, last probe/wake time,
+last startup duration, and the table hints. Each card shows it as a grey
+`memory:` / `tables:` line straight from cache - visible before you touch
+anything - and probe/wake/inspect/peek refresh it. All best-effort: a stats
+failure never breaks an action.
+
+App services fronting zeropg (PrivateBin, NocoDB, ...) serve their own app on
+the public port, not the zeropg control face, so `fleet status` reports them as
+"serving (app service)" rather than pretending to read DB metrics over HTTP -
+use `inspect`/`peek`/the studio snapshot to see inside their data.
 
 ## Local databases: open-breadcrumbs
 
