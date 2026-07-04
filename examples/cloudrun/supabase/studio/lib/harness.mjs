@@ -11,13 +11,10 @@
 
 import { serveWire } from '@zeropg/client'
 import pg from 'pg'
-import { spawn, execFile as _execFile } from 'node:child_process'
-import { promisify } from 'node:util'
+import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 
-const execFile = promisify(_execFile)
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const root = join(__dirname, '..')
 
@@ -25,7 +22,6 @@ export const DEFAULTS = {
   wirePort: Number(process.env.STUDIO_WIRE_PORT || 5499),
   metaPort: Number(process.env.STUDIO_META_PORT || 4322),
   bffPort: Number(process.env.STUDIO_PORT || 4321),
-  metaImage: process.env.PG_META_IMAGE || 'supabase/postgres-meta:v0.96.6',
   adminPassword: process.env.STUDIO_ADMIN_PASSWORD || 'studio-admin-pw-123',
   sessionSecret: process.env.STUDIO_SESSION_SECRET || 'test-session-secret-please-change-0123456789',
   queryTimeoutSecs: Number(process.env.STUDIO_QUERY_TIMEOUT_SECS || 20),
@@ -41,12 +37,12 @@ export const CONN = {
   dbUrl: 'postgres://postgres@127.0.0.1:5499/postgres?sslmode=disable',
 }
 
-function waitHttp(url, pred, ms = 60_000) {
+function waitHttp(url, pred, ms = 60_000, pollMs = 100) {
   const t0 = Date.now()
   return (async () => {
     while (Date.now() - t0 < ms) {
       try { const r = await fetch(url, { signal: AbortSignal.timeout(2500) }); if (await pred(r)) return true } catch {}
-      await new Promise((r) => setTimeout(r, 400))
+      await new Promise((r) => setTimeout(r, pollMs))
     }
     return false
   })()
@@ -54,70 +50,40 @@ function waitHttp(url, pred, ms = 60_000) {
 
 export async function bringUp(opts = {}) {
   const cfg = { ...DEFAULTS, ...opts }
-  const container = `studio-uplocal-${process.pid}`
   const cleanups = []
   const log = opts.log || ((m) => console.log(m))
 
   // 1. wire (or adopt one the caller already runs, e.g. zeropg console serving
-  //    a local datadir / a bucket replica - it must be reachable from Docker,
-  //    i.e. bound to 0.0.0.0, since pg-meta dials host.docker.internal)
+  //    a local datadir / a bucket replica)
   let wire = null
   if (opts.existingWire) {
     log(`[harness] using existing wire on :${cfg.wirePort}`)
   } else {
-    // 0.0.0.0 only for the docker meta (host.docker.internal cannot reach a
-    // 127.0.0.1-bound host port on macOS); the node meta keeps loopback.
-    wire = await serveWire({ host: opts.metaMode === 'docker' ? '0.0.0.0' : '127.0.0.1', port: cfg.wirePort })
+    wire = await serveWire({ host: '127.0.0.1', port: cfg.wirePort })
     cleanups.push(() => wire.stop().catch(() => {}))
     if (opts.seed) await wire.pglite.exec(opts.seed)
     log(`[harness] wire up on :${cfg.wirePort}`)
   }
 
-  // 2. postgres-meta. Default: a plain node child process - the npm package
-  //    @supabase/postgres-meta ships the exact same fastify server as the
-  //    Docker image (dist/server/server.js, same env contract), so no
-  //    container runtime is needed and everything stays on loopback.
-  //    metaMode: 'docker' keeps the old container path for parity testing.
+  // 2. postgres-meta as a plain node child on loopback - no Docker. lib/
+  //    meta-server.mjs build()s the package's MAIN introspection app only (see
+  //    that file for why the package's own server.js admin app is skipped), so
+  //    there is no PG_META_PORT+1 requirement and nothing leaves 127.0.0.1.
   const metaBase = `http://127.0.0.1:${cfg.metaPort}`
-  if (opts.metaMode === 'docker') {
-    await execFile('docker', ['rm', '-f', container]).catch(() => {})
-    await execFile('docker', [
-      'run', '--rm', '-d', '--name', container,
-      '-p', `${cfg.metaPort}:8080`,
-      '-e', 'PG_META_PORT=8080',
-      '-e', `PG_META_DB_URL=postgresql://postgres:postgres@host.docker.internal:${cfg.wirePort}/postgres?sslmode=disable`,
-      '-e', `PG_QUERY_TIMEOUT_SECS=${cfg.queryTimeoutSecs}`,
-      cfg.metaImage,
-    ])
-    cleanups.unshift(() => execFile('docker', ['rm', '-f', container]).catch(() => {}))
-    if (!(await waitHttp(`${metaBase}/health`, (r) => r.ok, 45_000))) {
-      const logs = await execFile('docker', ['logs', container]).catch(() => ({ stdout: '', stderr: '' }))
-      await teardown(cleanups)
-      throw new Error(`postgres-meta never healthy\n${logs.stdout}\n${logs.stderr}`)
-    }
-  } else {
-    const require = createRequire(import.meta.url)
-    let serverJs
-    try {
-      serverJs = join(dirname(require.resolve('@supabase/postgres-meta/package.json')), 'dist', 'server', 'server.js')
-    } catch {
-      throw new Error('postgres-meta not installed: npm i -D @supabase/postgres-meta (or pass metaMode: "docker")')
-    }
-    const meta = spawn('node', [serverJs], {
-      env: {
-        ...process.env,
-        PG_META_HOST: '127.0.0.1',
-        PG_META_PORT: String(cfg.metaPort),
-        PG_META_DB_URL: `postgresql://postgres:postgres@127.0.0.1:${cfg.wirePort}/postgres?sslmode=disable`,
-        PG_QUERY_TIMEOUT_SECS: String(cfg.queryTimeoutSecs),
-      },
-      stdio: opts.quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'],
-    })
-    cleanups.unshift(() => { try { meta.kill('SIGKILL') } catch {} })
-    if (!(await waitHttp(`${metaBase}/health`, (r) => r.ok, 30_000))) {
-      await teardown(cleanups)
-      throw new Error('postgres-meta (node) never became healthy')
-    }
+  const meta = spawn('node', [join(root, 'lib', 'meta-server.mjs')], {
+    env: {
+      ...process.env,
+      PG_META_HOST: '127.0.0.1',
+      PG_META_PORT: String(cfg.metaPort),
+      PG_META_DB_URL: `postgresql://postgres:postgres@127.0.0.1:${cfg.wirePort}/postgres?sslmode=disable`,
+      PG_QUERY_TIMEOUT_SECS: String(cfg.queryTimeoutSecs),
+    },
+    stdio: opts.quiet ? 'ignore' : ['ignore', 'inherit', 'inherit'],
+  })
+  cleanups.unshift(() => { try { meta.kill('SIGKILL') } catch {} })
+  if (!(await waitHttp(`${metaBase}/health`, (r) => r.ok, 30_000))) {
+    await teardown(cleanups)
+    throw new Error('postgres-meta (node) never became healthy')
   }
   log(`[harness] postgres-meta healthy on :${cfg.metaPort}`)
 

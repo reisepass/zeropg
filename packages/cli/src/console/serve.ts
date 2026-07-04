@@ -33,28 +33,12 @@ function freePort(): Promise<number> {
   })
 }
 
-/** A free port whose successor (port+1) is also free. postgres-meta binds an
- *  extra "admin" app on PG_META_PORT+1, so the meta port needs a free buddy or
- *  the meta process exits(1). */
-function freePortWithSuccessor(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const s1 = createNetServer()
-    s1.once('error', reject)
-    s1.listen(0, '127.0.0.1', () => {
-      const p = (s1.address() as { port: number }).port
-      const s2 = createNetServer()
-      s2.once('error', () => s1.close(() => resolve(freePortWithSuccessor()))) // p+1 taken; retry
-      s2.listen(p + 1, '127.0.0.1', () => s1.close(() => s2.close(() => resolve(p))))
-    })
-  })
-}
-
-/** Studio needs 3 ports: meta (+ its admin buddy at meta+1) and the BFF, all
- *  distinct. */
+/** Studio needs two distinct free ports: postgres-meta (main app only - the
+ *  admin app that wanted meta+1 is gone, see lib/meta-server.mjs) and the BFF. */
 async function studioPorts(): Promise<{ metaPort: number; bffPort: number }> {
-  const metaPort = await freePortWithSuccessor()
+  const metaPort = await freePort()
   let bffPort = await freePort()
-  while (bffPort === metaPort || bffPort === metaPort + 1) bffPort = await freePort()
+  while (bffPort === metaPort) bffPort = await freePort()
   return { metaPort, bffPort }
 }
 
