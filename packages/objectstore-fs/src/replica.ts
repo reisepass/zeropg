@@ -28,6 +28,11 @@ export interface ZeroPGReplicaOptions {
   pollIntervalMs?: number
   /** Local scratch directory. Default: os.tmpdir()/zeropg. */
   scratchDir?: string
+  /** PGlite contrib/extension modules to preload, e.g. `{ citext, pgcrypto }`
+   * from `@electric-sql/pglite/contrib/*`. A datadir whose objects use a
+   * contrib type/function needs its module present to open cleanly; pass the
+   * same set the writer used (the service's ZEROPG_EXTENSIONS). */
+  extensions?: Record<string, unknown>
 }
 
 export class ZeroPGReplica {
@@ -59,10 +64,13 @@ export class ZeroPGReplica {
     return this.pg
   }
 
+  private readonly extensions?: Record<string, unknown>
+
   private constructor(opts: ZeroPGReplicaOptions) {
     this.store = opts.store
     this.scratchBase = opts.scratchDir ?? join(tmpdir(), 'zeropg')
     this.pollMs = opts.pollIntervalMs ?? 5000
+    this.extensions = opts.extensions
   }
 
   static async open(opts: ZeroPGReplicaOptions): Promise<ZeroPGReplica> {
@@ -92,7 +100,7 @@ export class ZeroPGReplica {
     try {
       await restoreSnapshotInto(this.store, dir, m.snapshot)
       await applyWalSegments(this.store, dir, m)
-      const pg = await PGlite.create({ dataDir: dir })
+      const pg: PGlite = await PGlite.create({ dataDir: dir, extensions: this.extensions as never })
       await pg.waitReady
       // Belt-and-suspenders read-only: sessions reject writes. (The real
       // guarantee is that a replica never holds the lease and never CASes

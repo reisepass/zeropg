@@ -73,9 +73,21 @@ export async function peekTables(inst: Instance): Promise<InstanceStats> {
     import('@zeropg/blobstore'),
     import('@zeropg/objectstore-fs'),
   ])
+  // Preload the same contrib modules the service uses (ZEROPG_EXTENSIONS), so a
+  // datadir with citext/pgcrypto/etc. objects opens cleanly.
+  const extensions: Record<string, unknown> = {}
+  for (const n of inst.extensions) {
+    try {
+      const mod = (await import(`@electric-sql/pglite/contrib/${n}`)) as Record<string, unknown>
+      extensions[n] = mod[n] ?? Object.values(mod)[0]
+    } catch {
+      /* unknown contrib name; skip - catalog reads still work without it */
+    }
+  }
   const replica = await ZeroPGReplica.open({
     store: new GcsBlobStore({ bucket: inst.bucket, prefix: inst.prefix }),
     pollIntervalMs: 0,
+    extensions,
   })
   try {
     return await captureDbStats({ query: (sql: string) => replica.query(sql) })
