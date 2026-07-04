@@ -109,6 +109,19 @@ unchanged for the fleet/self-host story (Adminer + pgweb), but
 `drizzle-kit studio` earns a mention in the local-dev docs as the polished
 option for people who already live in the Drizzle ecosystem.
 
+### Multi-server: can ONE UI instance front many zeropg servers? (live-tested)
+
+| tool | one instance, many servers? | how |
+|---|---|---|
+| **Adminer** | **YES, best-in-class** | connection params live in the login session AND the URL (`?pgsql=host:port&username=..&db=..`), so different tabs can be on different servers simultaneously and deep links/bookmarks encode the server. Verified: same container queried :5499 and :5601. |
+| **pgweb** | **YES in `--sessions` mode** | pinned to one DB when launched with `PGWEB_DATABASE_URL`; launched with `--sessions` instead, each browser session connects to any server via the connect form. Verified: two concurrent sessions (x-session-id) on one instance, one per wire, isolated object lists. |
+| **WhoDB** | **YES via profiles** | each login creates a profile; multiple profiles stay live at once with a sidebar switcher + "Add Another Profile". Verified: :5499 and :5601 profiles held simultaneously. |
+| **drizzle-kit studio** | **NO** | one process = one database (one drizzle.config). Multi-server = one gateway process per server; the CDN UI targets one at a time via `?port=NNNN`. Fine for a launcher, no in-UI multi-connection management. |
+
+Fleet-console implication: the "Open in..." panel can run ONE shared Adminer (or
+pgweb `--sessions`) container and simply deep-link per instance - no per-instance
+editor processes needed except for drizzle-kit studio.
+
 ### Recipes as tested
 
 ```bash
