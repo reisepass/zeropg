@@ -1,4 +1,4 @@
-# Stripped Supabase on zeropg (scale-to-zero)
+# Simple Supabase demo on zeropg (scale-to-zero)
 
 Self-hosted Supabase minus the heavy bits — **PostgREST** (REST API) + **GoTrue**
 (auth) — on a Postgres that **scales to zero**. One Cloud Run

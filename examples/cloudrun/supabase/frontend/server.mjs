@@ -1,4 +1,4 @@
-// Ingress container for the stripped Supabase stack on zeropg.
+// Ingress container for the simple Supabase demo stack on zeropg.
 //
 // THREE jobs:
 //

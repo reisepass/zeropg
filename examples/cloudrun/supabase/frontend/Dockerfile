@@ -1,4 +1,4 @@
-# Ingress container for the stripped Supabase stack on zeropg.
+# Ingress container for the simple Supabase demo stack on zeropg.
 # A tiny Node HTTP server: serves the static shell instantly, mints the anon key,
 # and reverse-proxies /rest/v1 -> db sidecar PostgREST and /auth/v1 -> GoTrue
 # (Kong-style path layout so stock supabase-js works unmodified). No framework,
