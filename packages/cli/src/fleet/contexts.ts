@@ -1,6 +1,9 @@
-// Context config: ~/.config/zeropg/contexts.json (override dir with
-// $ZEROPG_CONFIG_DIR, used by tests). This file is deliberately NOT a registry
-// of databases - it only names provider+project+region tuples to scan.
+// Context config: ~/.zeropg/contexts.json (override dir with
+// $ZEROPG_CONFIG_DIR, used by tests). ~/.zeropg is the single zeropg home dir
+// (contexts + open-breadcrumbs); the pre-2026-07-04 location
+// ~/.config/zeropg/contexts.json is still read as a fallback so existing
+// setups keep working. This file is deliberately NOT a registry of databases -
+// it only names provider+project+region tuples to scan.
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -8,22 +11,35 @@ import { join } from 'node:path'
 import type { FleetConfig, FleetContext } from './types.js'
 
 export function configDir(): string {
-  return process.env.ZEROPG_CONFIG_DIR || join(homedir(), '.config', 'zeropg')
+  return process.env.ZEROPG_CONFIG_DIR || join(homedir(), '.zeropg')
 }
 
 function configPath(): string {
   return join(configDir(), 'contexts.json')
 }
 
-export function loadConfig(): FleetConfig {
+/** Old location, read-only fallback. */
+function legacyConfigPath(): string {
+  return join(homedir(), '.config', 'zeropg', 'contexts.json')
+}
+
+function readConfigFile(path: string): FleetConfig | null {
   try {
-    const raw = readFileSync(configPath(), 'utf8')
-    const parsed = JSON.parse(raw) as FleetConfig
-    if (!Array.isArray(parsed.contexts)) return { contexts: [] }
-    return parsed
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as FleetConfig
+    return Array.isArray(parsed.contexts) ? parsed : null
   } catch {
-    return { contexts: [] }
+    return null
   }
+}
+
+export function loadConfig(): FleetConfig {
+  const cfg = readConfigFile(configPath())
+  if (cfg) return cfg
+  if (!process.env.ZEROPG_CONFIG_DIR) {
+    const legacy = readConfigFile(legacyConfigPath())
+    if (legacy) return legacy
+  }
+  return { contexts: [] }
 }
 
 export function saveConfig(cfg: FleetConfig): void {

@@ -17,6 +17,7 @@ import { createServer } from 'node:net'
 import { resolve } from 'node:path'
 import { acquireDatadirLock, type DatadirLock } from './lockfile.js'
 import { nativeDatadirLockEnabled } from './pglite.js'
+import { recordOpen } from './breadcrumb.js'
 
 // @electric-sql/pglite-socket is an OPTIONAL peer: only `serveWire` needs it, and
 // it is loaded on demand so merely importing @zeropg/client (for memory:// /
@@ -105,6 +106,7 @@ export async function serveWire(opts: ServeWireOptions = {}): Promise<WireServer
       if (lock) await lock.release()
       throw e
     }
+    recordOpen(abs)
   } else {
     pglite = await PGlite.create({ extensions: opts.extensions as never })
   }

@@ -57,11 +57,18 @@ export async function bringUp(opts = {}) {
   const cleanups = []
   const log = opts.log || ((m) => console.log(m))
 
-  // 1. wire
-  const wire = await serveWire({ host: '0.0.0.0', port: cfg.wirePort })
-  cleanups.push(() => wire.stop().catch(() => {}))
-  if (opts.seed) await wire.pglite.exec(opts.seed)
-  log(`[harness] wire up on :${cfg.wirePort}`)
+  // 1. wire (or adopt one the caller already runs, e.g. zeropg console serving
+  //    a local datadir / a bucket replica - it must be reachable from Docker,
+  //    i.e. bound to 0.0.0.0, since pg-meta dials host.docker.internal)
+  let wire = null
+  if (opts.existingWire) {
+    log(`[harness] using existing wire on :${cfg.wirePort}`)
+  } else {
+    wire = await serveWire({ host: '0.0.0.0', port: cfg.wirePort })
+    cleanups.push(() => wire.stop().catch(() => {}))
+    if (opts.seed) await wire.pglite.exec(opts.seed)
+    log(`[harness] wire up on :${cfg.wirePort}`)
+  }
 
   // 2. postgres-meta (Docker)
   await execFile('docker', ['rm', '-f', container]).catch(() => {})

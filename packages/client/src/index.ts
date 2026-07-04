@@ -40,6 +40,7 @@ export {
 } from './lockfile.js'
 export { nativeDatadirLockEnabled } from './pglite.js'
 export { serveWire, type WireServer, type ServeWireOptions } from './wire.js'
+export { readOpenBreadcrumbs, recordOpen, zeropgHome, type OpenBreadcrumb } from './breadcrumb.js'
 export {
   resolveDatabaseUrl,
   resolve,

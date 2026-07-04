@@ -1,8 +1,10 @@
 # Fleet admin: every zeropg you have, from one CLI (and a local console)
 
-`zeropg fleet` manages all your deployed scale-to-zero Postgres instances -
-across any number of cloud accounts - from your laptop. `zeropg console` puts
-the same view in a browser tab on localhost.
+`zeropg fleet` manages all your Postgres instances - deployed scale-to-zero
+services across any number of cloud accounts, plus the local datadirs on this
+machine - from your laptop. `zeropg console` puts the same inventory in a
+browser tab on localhost, and can launch zeroSupabaseStudio against any of
+them.
 
 Design stance (the constraints came first):
 
@@ -52,13 +54,58 @@ URLs, not just names) and `--context <name>` or `--project/--region`.
 
 ```
 zeropg fleet ls                       every instance, live-discovered; never wakes anything
+zeropg fleet local                    local datadirs this machine has opened
 zeropg fleet status <service>         health probe + IAM exposure posture (wakes it)
 zeropg fleet wake <service>           wake and wait until ready
 zeropg fleet url <service>            all endpoints (base, /sql, /rest, /wake, bucket)
 zeropg fleet export <service> --out dump.sql
 zeropg fleet migrate <service> --to <postgres-url> --yes
-zeropg console [--port 4900]          local web view over the same discovery
+zeropg console [--port 4900]          local web view over the same inventory
 ```
+
+## Local databases: open-breadcrumbs
+
+Local zeropg databases are PGlite datadirs scattered across project folders
+(`.zeropg/dev`, `pgdata`, ...) - historically unfindable once you forget where.
+Now every successful local open (`connect('file:...')`, `serveWire`, `zeropg
+run`) drops ONE line into `~/.zeropg/opens.jsonl`:
+`{"path": "...", "cwd": "...", "at": "..."}` - the same moment the datadir lock
+is taken, so it adds no new I/O class. Contract (see
+`packages/client/src/breadcrumb.ts`): it can never fail or slow an open (every
+error swallowed), `ZEROPG_NO_BREADCRUMB=1` opts out, the writer only appends
+(crash-safe), and the reader dedupes by path and compacts the file past ~64KB
+so it stays tiny forever.
+
+`zeropg fleet local` and the console's "local" group list these with
+last-opened time, the project dir they were used from, and whether the datadir
+still exists. In the console every present local DB has two one-click actions:
+
+- **serve**: stands up a loopback wire (`serveWire`) on the datadir and hands
+  you a `postgresql://127.0.0.1:<port>/...` URL for psql / TablePlus /
+  DataGrip. Stop it from the same card.
+- **open in studio**: see below.
+
+`~/.zeropg` is now the single zeropg home dir; `contexts.json` moved there
+(the old `~/.config/zeropg/contexts.json` is still read as a fallback).
+
+## Studio bridge: inspect any database in one click
+
+zeroSupabaseStudio (`examples/cloudrun/supabase/studio` - table editor, SQL
+editor) attaches to a Postgres wire. The console can mint a wire for anything
+it lists, so every row has an "open in studio" button:
+
+- **local datadir** - served via `serveWire`; studio edits the real database.
+- **remote instance** - a `ZeroPGReplica` materialized from the instance's
+  bucket: **no lease, no fencing, the live service is untouched** (verified:
+  the live demo kept answering writes while its snapshot was open). It is a
+  detached throwaway copy, so poking at it - even writing - is
+  consequence-free; relaunch to refresh the snapshot.
+
+One studio at a time; the console banner shows the URL + admin password and a
+stop button. Requirements: Docker running (postgres-meta runs as a container)
+and a zeropg repo checkout (studio is not shipped in the npm CLI). The studio
+wire binds 0.0.0.0 while studio is open (Docker on macOS cannot reach a
+127.0.0.1-bound host port) - the same tradeoff as studio's own local harness.
 
 `status` prominently reports exposure: zeropg has **no built-in auth** (the
 protection model is platform ingress/IAM), so a service with an `allUsers`

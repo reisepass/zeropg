@@ -8,6 +8,7 @@ import { addContext, loadConfig, removeContext, resolveContexts } from './contex
 import { listInstances, rollService } from './gcloud.js'
 import { probeStatus, wakeAndWait } from './probe.js'
 import { exportToFile, migrateTo } from './export.js'
+import { listLocalDbs } from './localdbs.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -20,6 +21,8 @@ Contexts (places to scan, stored in ~/.config/zeropg/contexts.json):
 
 Fleet (all commands take --json, and --context <name> | --project X --region Y):
   zeropg fleet ls                      discover instances (live; never wakes them)
+  zeropg fleet local                   local datadirs this machine has opened
+                                       (from the ~/.zeropg/opens.jsonl breadcrumbs)
   zeropg fleet status <service>        probe health + security posture (wakes it)
   zeropg fleet wake <service>          wake and wait until ready
   zeropg fleet url <service>           connection endpoints (HTTP faces)
@@ -167,6 +170,25 @@ export async function runFleet(positionals: string[], flags: Flags): Promise<voi
         return
       }
       throw new Error(`unknown context subcommand: ${sub}`)
+    }
+
+    case 'local': {
+      const dbs = listLocalDbs()
+      if (json) {
+        console.log(JSON.stringify({ dbs }, null, 2))
+        return
+      }
+      if (dbs.length === 0) {
+        console.log('no local databases seen yet - any zeropg open (connect file://, zeropg run, serveWire) drops a breadcrumb in ~/.zeropg/opens.jsonl')
+        return
+      }
+      console.log(
+        table(
+          dbs.map((d) => [d.status === 'gone' ? 'GONE' : d.lockPresent ? 'lock' : 'ok', d.lastOpened, d.path, d.cwd]),
+          ['STATE', 'LAST OPENED', 'DATADIR', 'PROJECT'],
+        ),
+      )
+      return
     }
 
     case 'ls': {

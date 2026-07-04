@@ -7,6 +7,7 @@
 import { PGlite } from '@electric-sql/pglite'
 import { resolve } from 'node:path'
 import { acquireDatadirLock, type DatadirLock } from './lockfile.js'
+import { recordOpen } from './breadcrumb.js'
 import type { Client, ConnectOptions, Engine, FieldInfo, QueryResult, Queryable } from './types.js'
 
 // Whether the installed PGlite build takes its OWN cross-process datadir lock
@@ -137,6 +138,7 @@ export async function connectFile(dataDir: string, opts: ConnectOptions): Promis
     if (lock) await lock.release()
     throw e
   }
+  recordOpen(abs)
 
   const pinKey = opts.noHmrPin ? null : abs
   if (pinKey) pins().set(pinKey, { pg, lock })
