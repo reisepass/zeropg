@@ -19,6 +19,7 @@ import { mergeStats, readAllStats, remoteStatsKey } from '../fleet/stats.js'
 import type { Instance } from '../fleet/types.js'
 import {
   serveLocal,
+  serveReplica,
   stopServed,
   listServed,
   stopAllServed,
@@ -26,6 +27,7 @@ import {
   stopStudio,
   currentStudio,
 } from './serve.js'
+import { launchPgweb, listEditors, stopEditor, stopAllEditors } from './editors.js'
 
 async function discover(): Promise<{
   instances: Instance[]
@@ -67,6 +69,8 @@ const PAGE = `<!doctype html>
   .card h2 { margin:0 0 4px; font-size:15px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .meta { color:var(--dim); font-size:12px; }
   .mem { color:var(--dim); font-size:11px; opacity:.75; margin-top:2px; }
+  .studio-link { font-size:12px; color:var(--ok); border:1px solid var(--ok); border-radius:10px; padding:1px 8px; text-decoration:none; }
+  .studio-link:hover { background:rgba(63,185,80,.12); }
   dl { display:grid; grid-template-columns:110px 1fr; gap:4px 12px; margin:12px 0 0; }
   dt { color:var(--dim); }
   dd { margin:0; word-break:break-all; }
@@ -104,12 +108,23 @@ const el = (t, attrs = {}, kids = []) => {
   return n
 }
 const btn = (label, fn, cls) => { const b = el('button', { text: label, class: cls || '' }); b.onclick = () => fn(b); return b }
+// One-click pgweb: mints the wire (local serveWire / remote snapshot), spawns a
+// pinned pgweb, opens the tab already logged in - no connection form.
+const pgwebBtn = (body) => btn('open in pgweb', async (b) => {
+  b.disabled = true; const old = b.textContent; b.textContent = 'starting pgweb...'
+  try { const r = await api('/api/editor/pgweb', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); window.open(r.url, '_blank') }
+  catch (e) { alert('pgweb: ' + e.message) }
+  b.textContent = old; b.disabled = false
+})
 const copyBtn = (label, value) => btn(label, async (b) => { await navigator.clipboard.writeText(value); b.textContent = 'copied'; setTimeout(() => (b.textContent = label), 1200) }, 'copy')
 async function api(path, opts) { const r = await fetch(path, opts); const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); return j }
 
+let studioState = null
+
 async function load() {
+  const [fleet, local, s] = await Promise.all([api('/api/fleet'), api('/api/local'), api('/api/studio')])
+  studioState = s.studio
   renderStudio()
-  const [fleet, local] = await Promise.all([api('/api/fleet'), api('/api/local')])
   const empty = document.getElementById('empty')
   const remoteSlot = document.getElementById('remote-slot'); remoteSlot.textContent = ''
   const localSlot = document.getElementById('local-slot'); localSlot.textContent = ''
@@ -126,29 +141,42 @@ async function load() {
   localSlot.appendChild(el('h3', { class: 'group', text: 'local (' + local.dbs.length + ')' }))
   if (!local.dbs.length) localSlot.appendChild(el('div', { class: 'meta', text: 'no local databases seen yet - they appear here after any zeropg open (connect file://, zeropg run, serveWire) drops a breadcrumb in ~/.zeropg/opens.jsonl' }))
   for (const db of local.dbs) localSlot.appendChild(localCard(db, local.served))
+  updateStudioLinks()
 }
 
-async function renderStudio() {
+// Put the running studio's link inline on whichever card it is inspecting, so
+// you do not have to scroll to the top banner to open it.
+function updateStudioLinks() {
+  for (const slot of document.querySelectorAll('.studio-inline')) {
+    slot.textContent = ''
+    if (studioState && studioState.targetId === slot.getAttribute('data-tid')) {
+      slot.appendChild(el('a', { class: 'studio-link', href: studioState.url, target: '_blank', text: '▸ open studio' }))
+    }
+  }
+}
+
+function renderStudio() {
   const slot = document.getElementById('studio-slot'); slot.textContent = ''
-  const s = await api('/api/studio')
-  if (!s.studio) return
+  const st = studioState
+  if (!st) return
   slot.appendChild(el('div', { class: 'card', id: 'studio' }, [
-    el('h2', {}, [el('span', { text: 'studio running' }), el('span', { class: 'pill serving', text: s.studio.kind })]),
-    el('div', { class: 'meta', text: 'inspecting: ' + s.studio.target }),
+    el('h2', {}, [el('span', { text: 'studio running' }), el('span', { class: 'pill serving', text: st.kind })]),
+    el('div', { class: 'meta', text: 'inspecting: ' + st.target }),
     el('dl', {}, [
-      el('dt', { text: 'open' }), el('dd', {}, [el('a', { href: s.studio.url, target: '_blank', text: s.studio.url })]),
-      el('dt', { text: 'password' }), el('dd', { text: s.studio.adminPassword }),
+      el('dt', { text: 'open' }), el('dd', {}, [el('a', { href: st.url, target: '_blank', text: st.url })]),
+      el('dt', { text: 'password' }), el('dd', { text: st.adminPassword }),
     ]),
-    el('div', { class: 'actions' }, [btn('stop studio', async (b) => { b.disabled = true; await api('/api/studio/stop', { method: 'POST' }); load() })]),
+    el('div', { class: 'actions' }, [btn('stop studio', async (b) => { b.disabled = true; await api('/api/studio/stop', { method: 'POST' }); studioState = null; renderStudio(); updateStudioLinks() })]),
   ]))
 }
 
 async function studioLaunch(body, b) {
-  b.disabled = true; const old = b.textContent; b.textContent = 'starting studio (docker)...'
+  b.disabled = true; const old = b.textContent; b.textContent = 'starting studio...'
   try {
     await api('/api/studio/launch', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-    await renderStudio()
-    document.getElementById('studio-slot').scrollIntoView({ behavior: 'smooth' })
+    studioState = (await api('/api/studio')).studio
+    renderStudio()
+    updateStudioLinks() // inline link appears on this card immediately
   } catch (e) { alert('studio: ' + e.message) }
   b.textContent = old; b.disabled = false
 }
@@ -189,6 +217,7 @@ function remoteCard(inst) {
     setTimeout(() => { b.textContent = 'wake'; b.disabled = false }, 4000)
   })
   const studioBtn = btn('open in studio (snapshot)', (b) => studioLaunch({ kind: 'replica', service: inst.name, context: inst.context }, b))
+  const pgweb = pgwebBtn({ kind: 'replica', service: inst.name, context: inst.context })
   // Remembered stats (grey memory), shown from cache without touching anything.
   const memSlot = el('div')
   const ago = (iso) => { if (!iso) return null; const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000); if (s < 90) return s + 's ago'; if (s < 5400) return Math.round(s/60) + 'm ago'; if (s < 129600) return Math.round(s/3600) + 'h ago'; return Math.round(s/86400) + 'd ago' }
@@ -224,6 +253,7 @@ function remoteCard(inst) {
       el('span', { class: 'pill', text: inst.context }),
       inst.appLabel ? el('span', { class: 'pill', text: inst.appLabel }) : el('span'),
       statusPill,
+      el('span', { class: 'studio-inline', 'data-tid': inst.context + '/' + inst.name }),
     ]),
     el('div', { class: 'meta', text: inst.project + '/' + inst.region + '  |  durability: ' + (inst.durability || 'sleep (default)') + (inst.extensions.length ? '  |  extensions: ' + inst.extensions.join(', ') : '') }),
     memSlot,
@@ -234,7 +264,7 @@ function remoteCard(inst) {
       el('dt', { text: 'rest' }), el('dd', { text: inst.url ? inst.url + '/rest/<table>' : '(none)' }),
     ]),
     el('div', { class: 'actions' }, [
-      inspectBtn, peekBtn, statusBtn, wakeBtn, studioBtn,
+      inspectBtn, peekBtn, statusBtn, wakeBtn, studioBtn, pgweb,
       copyBtn('copy url', inst.url || ''),
       copyBtn('copy sql endpoint', inst.url ? inst.url + '/sql' : ''),
       copyBtn('copy bucket', bucket),
@@ -281,6 +311,7 @@ function localCard(db, servedList) {
     b.textContent = 'serve (psql/TablePlus)'; b.disabled = false
   })
   const studioBtn = btn('open in studio', (b) => studioLaunch({ kind: 'local', path: db.path }, b))
+  const pgweb = pgwebBtn({ kind: 'local', path: db.path })
   const memSlot = el('div')
   const renderMem = (s) => {
     memSlot.textContent = ''
@@ -299,12 +330,12 @@ function localCard(db, servedList) {
   const pills = [el('span', { class: 'pill ' + (db.status === 'gone' ? 'gone' : ''), text: db.status })]
   if (db.lockPresent) pills.push(el('span', { class: 'pill', text: 'lock present' }))
   const card = el('div', { class: 'card' }, [
-    el('h2', {}, [el('span', { text: db.path.split('/').pop() || db.path }), ...pills]),
+    el('h2', {}, [el('span', { text: db.path.split('/').pop() || db.path }), ...pills, el('span', { class: 'studio-inline', 'data-tid': db.path })]),
     el('div', { class: 'meta', text: 'last opened ' + db.lastOpened + '  |  project ' + db.cwd }),
     memSlot,
     el('dl', {}, [el('dt', { text: 'datadir' }), el('dd', { text: db.path })]),
     el('div', { class: 'actions' },
-      db.status === 'gone' ? [copyBtn('copy path', db.path)] : [peekBtn, serveBtn, studioBtn, copyBtn('copy path', db.path)]),
+      db.status === 'gone' ? [copyBtn('copy path', db.path)] : [peekBtn, serveBtn, studioBtn, pgweb, copyBtn('copy path', db.path)]),
     connSlot,
   ])
   if (servedEntry) renderConn(servedEntry)
@@ -375,7 +406,7 @@ export async function runConsole(flags: Record<string, string | boolean>): Promi
       }
       if (url.pathname === '/api/studio' && req.method !== 'POST') {
         const s = currentStudio()
-        return json(200, { studio: s ? { url: s.url, adminPassword: s.adminPassword, target: s.target, kind: s.kind } : null })
+        return json(200, { studio: s ? { url: s.url, adminPassword: s.adminPassword, target: s.target, targetId: s.targetId, kind: s.kind } : null })
       }
       if (url.pathname === '/api/studio/launch' && req.method === 'POST') {
         const body = await readBody()
@@ -394,6 +425,25 @@ export async function runConsole(flags: Record<string, string | boolean>): Promi
       }
       if (url.pathname === '/api/studio/stop' && req.method === 'POST') {
         return json(200, { stopped: await stopStudio() })
+      }
+      if (url.pathname === '/api/editors') return json(200, { editors: listEditors() })
+      if (url.pathname === '/api/editor/pgweb' && req.method === 'POST') {
+        const body = await readBody()
+        let servedEntry
+        if (body.kind === 'local') {
+          if (!body.path) return json(400, { error: 'path required' })
+          servedEntry = await serveLocal(body.path)
+        } else if (body.kind === 'replica') {
+          const inst = await findByName(body.service ?? '', body.context ?? null)
+          if (!inst) return json(404, { error: `no instance ${body.service}` })
+          servedEntry = await serveReplica(inst)
+        } else return json(400, { error: 'kind must be local or replica' })
+        const e = await launchPgweb(servedEntry.id, servedEntry.url)
+        return json(200, { url: e.url, port: e.port, targetId: e.targetId })
+      }
+      if (url.pathname === '/api/editor/stop' && req.method === 'POST') {
+        const { targetId } = await readBody()
+        return json(200, { stopped: await stopEditor(targetId ?? '') })
       }
       if (url.pathname === '/api/status' || url.pathname === '/api/wake') {
         const service = url.searchParams.get('service')
@@ -428,7 +478,7 @@ export async function runConsole(flags: Record<string, string | boolean>): Promi
   console.log(`zeropg console: http://127.0.0.1:${port} (Ctrl-C to stop)`)
 
   const cleanup = async () => {
-    await Promise.allSettled([stopStudio(), stopAllServed()])
+    await Promise.allSettled([stopStudio(), stopAllServed(), stopAllEditors()])
     process.exit(0)
   }
   process.on('SIGINT', () => void cleanup())

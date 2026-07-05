@@ -143,8 +143,11 @@ export async function stopAllServed(): Promise<void> {
 export interface StudioHandle {
   url: string
   adminPassword: string
-  /** What the studio is looking at. */
+  /** Human label of what the studio is looking at. */
   target: string
+  /** Stable id of the target so a card can tell it is the one being inspected:
+   *  the datadir path (local) or `${context}/${name}` (remote). */
+  targetId: string
   kind: 'local' | 'replica'
   stop(): Promise<void>
 }
@@ -186,10 +189,12 @@ export async function launchStudio(target: { kind: 'local'; path: string } | { k
   const { metaPort, bffPort } = await studioPorts()
   const h = await bringUp({ existingWire: true, wirePort: wire.port, metaPort, bffPort, quiet: true, log: () => {} })
   const label = target.kind === 'local' ? target.path : `${target.inst.name} (detached snapshot)`
+  const targetId = target.kind === 'local' ? resolve(target.path) : `${target.inst.context}/${target.inst.name}`
   studio = {
     url: `${h.base}/studio`,
     adminPassword: h.cfg.adminPassword,
     target: label,
+    targetId,
     kind: target.kind,
     stop: async () => {
       studio = null
