@@ -93,12 +93,35 @@ ${note ? `<p class="warn">${esc(note)}</p>` : ''}
 </body></html>`
 }
 
+/**
+ * Resolve the upstream URL for a proxied request, SAFELY.
+ *
+ * /db/<rest> -> adminer /<rest> (Adminer's links are query-relative, so the
+ * /db/ prefix survives navigation). pgweb runs with --prefix pgweb and wants
+ * the path verbatim, so stripPrefix is null there.
+ *
+ * SECURITY: stripping the prefix can leave a protocol-relative "//host/..."
+ * (e.g. /db//169.254.169.254/...), which new URL() resolves to a DIFFERENT
+ * authority - a host-controlling SSRF (GCP metadata server, arbitrary hosts,
+ * SA-credential theft). Two guards: collapse leading slashes so rest is always
+ * host-relative, then reject anything whose resolved origin is not the intended
+ * upstream. Returns null when the request must be refused. Exported for tests.
+ */
+export function resolveUpstream(pathname: string, search: string, upstreamBase: string, stripPrefix: string | null): URL | null {
+  let rest = stripPrefix ? pathname.replace(new RegExp(`^${stripPrefix}`), '') || '/' : pathname
+  rest = rest.replace(/^\/+/, '/')
+  const upstream = new URL(rest + search, upstreamBase)
+  if (upstream.origin !== new URL(upstreamBase).origin) return null
+  return upstream
+}
+
 function proxy(req: IncomingMessage, res: ServerResponse, url: URL, upstreamBase: string, stripPrefix: string | null): void {
-  // /db/<rest> -> adminer /<rest> (Adminer's links are query-relative, so the
-  // /db/ prefix survives navigation). pgweb runs with --prefix pgweb and wants
-  // the path verbatim, so stripPrefix is null there.
-  const rest = stripPrefix ? url.pathname.replace(new RegExp(`^${stripPrefix}`), '') || '/' : url.pathname
-  const upstream = new URL(rest + url.search, upstreamBase)
+  const upstream = resolveUpstream(url.pathname, url.search, upstreamBase, stripPrefix)
+  if (!upstream) {
+    res.writeHead(400, { 'content-type': 'text/plain' })
+    res.end('bad request path')
+    return
+  }
   const headers = { ...req.headers, host: upstream.host }
   const p = httpRequest(upstream, { method: req.method, headers }, (up) => {
     res.writeHead(up.statusCode || 502, up.headers)
