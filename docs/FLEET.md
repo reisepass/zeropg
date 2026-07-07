@@ -191,13 +191,17 @@ instances are safe by construction.
 
 ## The console is localhost-only, on purpose
 
-`zeropg console` binds `127.0.0.1` and there is no flag to widen it. It can
-wake and inspect every database your credentials reach, and zeropg instances
-have no auth layer of their own - a network-exposed console would need a real
-auth/RBAC story, which is product territory this research project deliberately
-stays out of. If you want it on another machine, that is what `ssh -L` is for.
+`zeropg console` binds `127.0.0.1` and there is no flag to widen *that mode*.
+It can wake and inspect every database your credentials reach, and zeropg
+instances have no auth layer of their own - a network-exposed full console
+would need a real auth/RBAC story, which is product territory this research
+project deliberately stays out of. If you want it on another machine, that is
+what `ssh -L` is for.
 
-Data browsing / SQL editing is out of scope for the console (separate work).
+The one sanctioned wide-bound mode is `zeropg console --inspector` (see the
+unification section below): it binds 0.0.0.0 but holds only a structurally
+reduced surface - bearer-token gate, detached snapshots, no write/wake/export
+routes in existence. The full-powers console never widens.
 
 ## Not built, on purpose
 
@@ -210,24 +214,50 @@ Data browsing / SQL editing is out of scope for the console (separate work).
   auth lands on the HTTP face later, `fleet rotate-token` becomes a small env
   var update + roll via the already-present provider surface
 
-## Console/inspector unification (decided 2026-07-07, step 1 done)
+## Console/inspector unification (decided 2026-07-07, DONE 2026-07-07)
 
 The cloud inspector (`examples/cloudrun/inspector`) and the local console grew
-the same organs independently. Direction: the inspector should become
-`zeropg console --inspector` - one codebase, two trust modes - rather than a
-separate app.
+the same organs independently, so the inspector became
+`zeropg console --inspector` - one codebase, two trust modes. The separate
+`server.mjs` app is deleted; the inspector directory now holds only deploy
+artifacts (Dockerfile/service.yaml/deploy.sh/adminer sidecar), all pointed at
+the CLI console image.
 
-- **Done (step 1):** the replica-wire manager is ONE implementation,
-  `packages/cli/src/console/replica-wire.mjs` (openReplicaWire +
-  createReplicaManager with the LRU memory cap). The console's serveReplica
-  and the inspector both use it; the inspector's deploy.sh vendors the file
-  into its build context (the copy is gitignored - edit the source only).
-- **Pending (the mode merge):** auth as pluggable middleware (none/loopback ->
-  bearer token -> IAP), live fleet discovery in the cloud instead of the
-  baked targets secret, pgweb + Adminer adapters available on both surfaces,
-  and a STRUCTURAL capability matrix - inspector mode never registers
-  write/wake/export routes (not if-guards inside handlers). Read-write local
-  serving must never ship in any wide-bound mode.
+The two modes:
+
+- **`zeropg console`** (default, unchanged): binds 127.0.0.1 and refuses to
+  widen, no auth (the machine boundary is the auth), full powers - read-write
+  wires for local datadirs, studio, pgweb, wake, export.
+- **`zeropg console --inspector`**: binds 0.0.0.0 (Cloud Run), REQUIRES
+  `INSPECTOR_TOKEN` (refuses to start without), and registers only the safe
+  routes: landing, `/open/<target>` (detached replica snapshots),
+  `/db/*` Adminer proxy, `/pgweb/*` (pgweb pinned to a replica wire),
+  `/livez`. The pruning is STRUCTURAL: `console/inspector.ts` never imports
+  the serve/localdbs/probe machinery, so write/wake/export/serve-local/studio
+  handlers do not exist in this mode (grep-provable, asserted by
+  `examples/cloudrun/inspector/test/modes.test.mjs`).
+
+How the pieces landed:
+
+- Auth is pluggable middleware (`console/auth.ts`): `none` (loopback) and
+  `bearer` (the ?t= -> 302 + zpt cookie flow, exact behavior ported from the
+  old server.mjs, including Adminer's independent login() re-check). A third
+  mode - per-link HMAC of {target, exp} - is anticipated in the interface but
+  deliberately not built.
+- The cloud inspector uses LIVE fleet discovery (`console/discovery.ts`, the
+  same listInstances path; ADC from the runtime SA;
+  ZEROPG_FLEET_PROJECT/REGION name the home context). The stale
+  `inspector-targets` secret is gone; `INSPECTOR_TARGETS` env JSON remains as
+  a loudly-labeled fallback when discovery fails.
+- Both editor adapters work on both surfaces: pgweb's linux binary is
+  pre-baked into the CLI image (no runtime download; auto-download stays for
+  local), Adminer stays the sidecar and the console proxies to it via
+  `ADMINER_URL`.
+- The replica-wire manager was already ONE implementation
+  (`console/replica-wire.mjs`, LRU cap); the vendoring step in deploy.sh is
+  gone since the image now builds from the repo tree.
+- Read-write local serving must never ship in any wide-bound mode - the
+  closing rule of docs/EDITOR-AUTH-SECURITY.md is load-bearing here.
 - Deploy gotcha captured in deploy.sh: `gcloud run services replace` with an
   unchanged `:latest` spec does NOT roll a revision - images are pinned by
   digest at deploy time (same lesson as the zeropocket demo).

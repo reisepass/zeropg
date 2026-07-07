@@ -14,7 +14,7 @@ echo "== stage the build context (monorepo subset the console needs)"
 # from the repo tree. Stage into a temp dir so the context is small and clean
 # (no examples/, no experiments/, no .git).
 CTX=$(mktemp -d)
-cp "$DIR/Dockerfile" package.json package-lock.json tsconfig.json "$CTX/"
+cp "$DIR/Dockerfile" package.json package-lock.json tsconfig.json tsconfig.build.base.json "$CTX/"
 cp -r packages "$CTX/packages"
 
 echo "== build images"

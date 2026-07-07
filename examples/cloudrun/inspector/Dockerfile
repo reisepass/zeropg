@@ -10,7 +10,7 @@
 # at dist/ - so the dists must exist.
 FROM node:22-slim AS build
 WORKDIR /app
-COPY package.json package-lock.json tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json tsconfig.build.base.json ./
 COPY packages ./packages
 RUN npm ci --no-audit --no-fund
 RUN npm run build

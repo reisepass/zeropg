@@ -6,7 +6,14 @@ trust models and it matters not to confuse them:
 | surface | where | auth mechanism | what a compromise exposes |
 |---|---|---|---|
 | `zeropg console` + pgweb | your laptop, loopback only | **none - the machine boundary IS the auth** | read-WRITE access to local datadirs, read to remote snapshots |
-| `zeropg-inspector` + Adminer | public Cloud Run URL | **one shared bearer token** (Secret Manager) | read access to snapshots of every fleet DB (incl. auth.users emails); writes are throwaway |
+| `zeropg console --inspector` + Adminer/pgweb | public Cloud Run URL (service `zeropg-inspector`) | **one shared bearer token** (Secret Manager) | read access to snapshots of every fleet DB (incl. auth.users emails); writes are throwaway |
+
+Since the 2026-07-07 unification both surfaces are ONE codebase
+(`packages/cli/src/console/`) with the auth as pluggable middleware
+(`auth.ts`: `none` for loopback, `bearer` for the cloud). The trust asymmetry
+is enforced structurally: the inspector mode module never imports the
+write/wake/export/serve-local machinery, so those routes do not exist on the
+wide-bound surface.
 
 zeropg itself has **no built-in auth anywhere** - the wire accepts any
 username/password. Every security property therefore comes from *network
@@ -59,7 +66,7 @@ Properties and their limits:
                       │
 ┌── Cloud Run service zeropg-inspector (one instance, scale-to-zero) ────────────┐
 │                     ▼                                                          │
-│   node ingress :8080                                                           │
+│   zeropg console --inspector :8080                                             │
 │   ┌──────────────────────────────────────────────────────────────┐             │
 │   │ GATE: every request must present the token                   │             │
 │   │   1st hop:  ?t=<token>  → verified → 302 that                │             │
@@ -76,8 +83,9 @@ Properties and their limits:
 │    no fencing, writes discarded         login() requires the SAME token from   │
 │    when the replica closes)             the zpt cookie before any connection   │
 │                                                                                │
-│   service account: blob-pglite-dev (bucket read via GCS IAM,                   │
-│   secretAccessor on inspector-token + inspector-targets only)                  │
+│   service account: blob-pglite-dev (bucket read via GCS IAM, run.viewer for    │
+│   live fleet discovery, secretAccessor on inspector-token only - the old       │
+│   inspector-targets secret is gone; targets are discovered live)               │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -155,7 +163,8 @@ and the bucket was never writable through this path.
    non-Google users.
 2. **Per-link expiring tokens**: sign `{target, exp}` with HMAC instead of one
    static token - links become target-scoped and time-boxed (the fleet CLI
-   would mint them). ~30 lines in the ingress; the natural next step.
+   would mint them). The auth middleware (`console/auth.ts`) is shaped for
+   this as a third mode; the natural next step.
 3. **Redaction at the replica**: strip `auth.users` PII columns into a view on
    open, if inspectors are ever shared beyond the operator.
 
