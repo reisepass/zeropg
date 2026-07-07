@@ -125,6 +125,17 @@ Holds:
   "password" never exists as a secret: the wire doesn't verify one, and what
   Adminer submits is supplied server-side. There is nothing DB-shaped to leak.
 
+> Caught in review (fixed, commit c3120ff): the `/db/*` reverse proxy stripped
+> its `/db` prefix, and a path like `/db//169.254.169.254/...` left a
+> protocol-relative `//host` that `new URL()` re-homed to a DIFFERENT authority
+> - a host-controlling SSRF a token holder could aim at the GCP metadata server
+> to steal the runtime SA's OAuth token (escalating past "read a snapshot" to
+> the service's cloud identity). This falsified the "write blast radius is zero"
+> claim above until fixed. The proxy now collapses leading slashes AND pins the
+> resolved origin to the intended upstream; `examples/cloudrun/inspector/test/
+> ssrf.test.mjs` is the regression. Lesson: a reverse proxy that rewrites paths
+> must pin the upstream ORIGIN, never trust that a rewritten path stays on-host.
+
 Does not hold (the "mega insecure" part, stated plainly):
 
 1. **One shared bearer token, no identity.** Everyone with the link is the
