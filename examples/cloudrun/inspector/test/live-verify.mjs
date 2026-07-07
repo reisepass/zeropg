@@ -65,13 +65,23 @@ try {
   assert(await page.$('table tr'), 'data grid must have rows')
   ok('todos grid renders')
 
-  // 6. SQL query returns
-  await page.goto(`${origin}/db/?pgsql=${encodeURIComponent(await wireHost())}&username=postgres&db=postgres&sql=`, {
+  // 6. SQL query returns (ns=public: without a namespace Adminer shows the
+  // "Select database" page instead of the SQL command form)
+  await page.goto(`${origin}/db/?pgsql=${encodeURIComponent(await wireHost())}&username=postgres&db=postgres&ns=public&sql=`, {
     waitUntil: 'domcontentloaded',
     timeout: 60_000,
   })
-  await page.fill('textarea', 'SELECT count(*) AS todo_count FROM todos')
-  await page.click('input[type="submit"][value="Execute"]')
+  // Adminer's jush editor overlays the real textarea (not "visible" to
+  // Playwright's fill), so set the value in the DOM and submit the form.
+  await page.waitForSelector('textarea', { state: 'attached', timeout: 60_000 })
+  await page.evaluate(() => {
+    const ta = document.querySelector('textarea')
+    ta.value = 'SELECT count(*) AS todo_count FROM todos'
+  })
+  await Promise.all([
+    page.waitForLoadState('domcontentloaded'),
+    page.evaluate(() => document.querySelector('textarea').form.submit()),
+  ])
   await page.waitForSelector('table', { timeout: 60_000 })
   const sqlOut = await page.textContent('body')
   assert(/todo_count/.test(sqlOut), 'SQL result must show the aliased column')
