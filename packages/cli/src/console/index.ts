@@ -10,13 +10,11 @@
 // see. It is a viewer/launcher for the human; agents use the CLI.
 
 import { createServer } from 'node:http'
-import { loadConfig } from '../fleet/contexts.js'
-import { listInstances } from '../fleet/gcloud.js'
 import { probeStatus, wakeAndWait } from '../fleet/probe.js'
 import { listLocalDbs, peekLocalDb } from '../fleet/localdbs.js'
 import { inspectManifest, peekTables } from '../fleet/bucket.js'
 import { mergeStats, readAllStats, remoteStatsKey } from '../fleet/stats.js'
-import type { Instance } from '../fleet/types.js'
+import { discover, findByName } from './discovery.js'
 import {
   serveLocal,
   serveReplica,
@@ -28,27 +26,6 @@ import {
   currentStudio,
 } from './serve.js'
 import { launchPgweb, listEditors, stopEditor, stopAllEditors } from './editors.js'
-
-async function discover(): Promise<{
-  instances: Instance[]
-  errors: Array<{ context: string; error: string }>
-  contextCount: number
-}> {
-  const cfg = loadConfig()
-  const instances: Instance[] = []
-  const errors: Array<{ context: string; error: string }> = []
-  const results = await Promise.allSettled(cfg.contexts.map((c) => listInstances(c)))
-  results.forEach((r, i) => {
-    if (r.status === 'fulfilled') instances.push(...r.value)
-    else errors.push({ context: cfg.contexts[i].name, error: r.reason instanceof Error ? r.reason.message : String(r.reason) })
-  })
-  return { instances, errors, contextCount: cfg.contexts.length }
-}
-
-async function findByName(service: string, context: string | null): Promise<Instance | null> {
-  const { instances } = await discover()
-  return instances.find((i) => i.name === service && (!context || i.context === context)) ?? null
-}
 
 const PAGE = `<!doctype html>
 <html lang="en">

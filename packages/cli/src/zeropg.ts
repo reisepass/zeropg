@@ -79,6 +79,11 @@ Usage:
   zeropg console [--port <n>]
       Local web console over the same fleet discovery (localhost only).
 
+  zeropg console --inspector
+      Cloud trust mode: binds 0.0.0.0 behind a bearer-token gate
+      (INSPECTOR_TOKEN required) and serves ONLY detached bucket snapshots -
+      no write, wake, export, or local-datadir routes exist in this mode.
+
 Defaults: --schema prisma/schema.prisma  --migrations prisma/migrations  --data .zeropg/dev`
 
 /**
@@ -129,6 +134,14 @@ async function main(): Promise<void> {
     return
   }
   if (group === 'console') {
+    if (flags.inspector) {
+      // The cloud trust mode is a separate module on purpose: it never imports
+      // the console's write/wake/export/serve-local/studio machinery, so those
+      // capabilities are structurally absent from the wide-bound surface.
+      const { runInspector } = await import('./console/inspector.js')
+      await runInspector(flags)
+      return
+    }
     await runConsole(flags)
     return
   }

@@ -84,25 +84,30 @@ export function listEditors(): Array<Omit<EditorProc, 'stop'>> {
   return [...editors.values()].map(({ stop: _stop, ...rest }) => rest)
 }
 
-/** Launch pgweb pinned to a served wire. Idempotent per target. */
-export async function launchPgweb(targetId: string, wireUrl: string): Promise<EditorProc> {
+/** Launch pgweb pinned to a served wire. Idempotent per target.
+ *  `prefix` serves pgweb under /<prefix>/ (pgweb --prefix) so a reverse proxy
+ *  can mount it on a subpath - the inspector mode does this. */
+export async function launchPgweb(targetId: string, wireUrl: string, opts: { prefix?: string } = {}): Promise<EditorProc> {
   const key = `pgweb:${targetId}`
   const existing = editors.get(key)
   if (existing) return existing
   const bin = await ensurePgweb()
   const port = await freePort()
-  const child: ChildProcess = spawn(bin, ['--url', wireUrl, '--bind', '127.0.0.1', '--listen', String(port), '--skip-open'], {
+  const args = ['--url', wireUrl, '--bind', '127.0.0.1', '--listen', String(port), '--skip-open']
+  if (opts.prefix) args.push('--prefix', opts.prefix)
+  const child: ChildProcess = spawn(bin, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let stderr = ''
   child.stderr?.on('data', (d) => (stderr += d))
+  const basePath = opts.prefix ? `/${opts.prefix}/` : '/'
   // wait until it answers (pgweb starts in tens of ms; connect errors exit fast)
   const deadline = Date.now() + 10_000
   let up = false
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`pgweb exited: ${stderr.trim().split('\n').pop() ?? child.exitCode}`)
     try {
-      const r = await fetch(`http://127.0.0.1:${port}/api/info`)
+      const r = await fetch(`http://127.0.0.1:${port}${basePath}api/info`)
       if (r.ok) {
         up = true
         break
@@ -120,7 +125,7 @@ export async function launchPgweb(targetId: string, wireUrl: string): Promise<Ed
     tool: 'pgweb',
     targetId,
     port,
-    url: `http://127.0.0.1:${port}/`,
+    url: `http://127.0.0.1:${port}${basePath}`,
     stop: async () => {
       editors.delete(key)
       child.kill('SIGTERM')
