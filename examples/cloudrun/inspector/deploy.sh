@@ -8,6 +8,9 @@ REGION=europe-west1
 REPO=europe-west1-docker.pkg.dev/$PROJECT/zeropg
 DIR="$(dirname "$0")"
 
+echo "== vendor the shared replica-wire module (single source of truth)"
+cp packages/cli/src/console/replica-wire.mjs "$DIR/replica-wire.mjs"
+
 echo "== build images"
 gcloud builds submit "$DIR" --project $PROJECT --tag $REPO/zeropg-inspector:latest --quiet
 gcloud builds submit "$DIR/adminer" --project $PROJECT --tag $REPO/zeropg-inspector-adminer:latest --quiet
@@ -27,8 +30,14 @@ npx tsx packages/cli/src/zeropg.ts fleet ls --json \
        | tr -d '\n' \
        | gcloud secrets create inspector-targets --project $PROJECT --data-file=-; }
 
-echo "== roll the service"
-gcloud run services replace "$DIR/service.yaml" --project $PROJECT --region $REGION --quiet
+echo "== roll the service (pin images by digest - :latest alone does not roll a revision)"
+DIGEST_APP=$(gcloud artifacts docker images describe $REPO/zeropg-inspector:latest --project $PROJECT --format='value(image_summary.digest)')
+DIGEST_ADM=$(gcloud artifacts docker images describe $REPO/zeropg-inspector-adminer:latest --project $PROJECT --format='value(image_summary.digest)')
+SPEC=$(mktemp)
+sed -e "s|zeropg-inspector:latest|zeropg-inspector@$DIGEST_APP|" \
+    -e "s|zeropg-inspector-adminer:latest|zeropg-inspector-adminer@$DIGEST_ADM|" \
+    "$DIR/service.yaml" > "$SPEC"
+gcloud run services replace "$SPEC" --project $PROJECT --region $REGION --quiet
 gcloud run services add-iam-policy-binding zeropg-inspector --project $PROJECT --region $REGION \
   --member=allUsers --role=roles/run.invoker --quiet >/dev/null
 

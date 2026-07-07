@@ -89,38 +89,25 @@ export async function serveLocal(path: string): Promise<Served> {
   return entry
 }
 
-/** Serve a detached snapshot of a remote instance's bucket state. */
+/** Serve a detached snapshot of a remote instance's bucket state.
+ *  The materialize-and-wire mechanics live in replica-wire.mjs - the ONE
+ *  implementation shared with the cloud inspector. */
 export async function serveReplica(inst: Instance): Promise<Served> {
   if (!inst.bucket || !inst.prefix) throw new Error(`${inst.name}: no bucket/prefix on the service`)
   const key = `${inst.context}/${inst.name}`
   const existing = served.get(key)
   if (existing) return existing
-  const host = '127.0.0.1'
-  const [{ GcsBlobStore }, { ZeroPGReplica }, { PGLiteSocketServer }] = await Promise.all([
-    import('@zeropg/blobstore'),
-    import('@zeropg/objectstore-fs'),
-    import('@electric-sql/pglite-socket'),
-  ])
-  const replica = await ZeroPGReplica.open({
-    store: new GcsBlobStore({ bucket: inst.bucket, prefix: inst.prefix }),
-    pollIntervalMs: 0, // a fixed snapshot; relaunch to refresh
-  })
-  // The replica pins its session read-only; the scratch copy is throwaway, so
-  // let studio write (its own bootstrap schema, scratch experiments) freely.
-  await replica.raw.exec('SET default_transaction_read_only = off')
-  const port = await freePort()
-  const wire = new PGLiteSocketServer({ db: replica.raw, host, port, maxConnections: 10 })
-  await wire.start()
+  const { openReplicaWire } = await import('./replica-wire.mjs')
+  const wire = await openReplicaWire({ bucket: inst.bucket, prefix: inst.prefix })
   const entry: Served = {
     kind: 'replica',
     id: key,
-    port,
-    host,
-    url: `postgresql://postgres@127.0.0.1:${port}/postgres?sslmode=disable`,
+    port: wire.port,
+    host: wire.host,
+    url: wire.url,
     stop: async () => {
       served.delete(key)
       await wire.stop()
-      await replica.close()
     },
   }
   served.set(key, entry)

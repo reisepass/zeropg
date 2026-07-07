@@ -14,9 +14,10 @@
 // (set once via ?t=<token>), and Adminer's login() checks the same token.
 
 import { createServer, request as httpRequest } from 'node:http'
-import { GcsBlobStore } from '@zeropg/blobstore'
-import { ZeroPGReplica } from '@zeropg/objectstore-fs'
-import { PGLiteSocketServer } from '@electric-sql/pglite-socket'
+// replica-wire.mjs is the shared implementation from
+// packages/cli/src/console/replica-wire.mjs, copied into this build context by
+// deploy.sh. Edit the source there, never the copy here.
+import { createReplicaManager } from './replica-wire.mjs'
 
 const PORT = Number(process.env.PORT || 8080)
 const TOKEN = process.env.INSPECTOR_TOKEN || ''
@@ -28,51 +29,19 @@ const TARGETS = JSON.parse(process.env.INSPECTOR_TARGETS || '[]')
 if (!TOKEN) throw new Error('INSPECTOR_TOKEN is required - this service fronts every fleet database')
 if (!BUCKET) throw new Error('ZEROPG_BUCKET is required')
 
-/** name -> { port, openedAt, stop } */
-const open = new Map()
-let nextPort = 6001
+const manager = createReplicaManager({ maxOpen: MAX_OPEN, log: (m) => console.log(`[inspector] ${m}`) })
 
 async function ensureReplica(name) {
   const t = TARGETS.find((x) => x.name === name)
   if (!t) throw new Error(`unknown target ${name}`)
-  const existing = open.get(name)
-  if (existing) {
-    existing.openedAt = Date.now()
-    return existing
-  }
-  // LRU-close beyond the cap: each replica is a full PGlite in memory.
-  while (open.size >= MAX_OPEN) {
-    const oldest = [...open.entries()].sort((a, b) => a[1].openedAt - b[1].openedAt)[0]
-    console.log(`[inspector] closing LRU replica ${oldest[0]}`)
-    await oldest[1].stop().catch(() => {})
-    open.delete(oldest[0])
-  }
-  console.log(`[inspector] materializing ${name} from gs://${BUCKET}/${t.prefix}`)
-  const replica = await ZeroPGReplica.open({
-    store: new GcsBlobStore({ bucket: BUCKET, prefix: t.prefix }),
-    pollIntervalMs: 0,
-  })
-  await replica.raw.exec('SET default_transaction_read_only = off')
-  const port = nextPort++
-  const wire = new PGLiteSocketServer({ db: replica.raw, host: '127.0.0.1', port, maxConnections: 5 })
-  await wire.start()
-  const entry = {
-    port,
-    openedAt: Date.now(),
-    stop: async () => {
-      await wire.stop()
-      await replica.close()
-    },
-  }
-  open.set(name, entry)
-  return entry
+  return manager.ensure(name, { bucket: BUCKET, prefix: t.prefix, maxConnections: 5 })
 }
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
 
 function landing() {
   const rows = TARGETS.map((t) => {
-    const o = open.get(t.name)
+    const o = manager.get(t.name)
     const state = o ? `open (wire :${o.port})` : 'closed'
     return `<tr><td>${esc(t.name)}</td><td class="dim">${esc(t.prefix)}</td><td class="dim">${state}</td>
       <td><a href="/open/${encodeURIComponent(t.name)}">open in Adminer</a></td></tr>`
@@ -152,6 +121,6 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, () => console.log(`[inspector] listening on :${PORT}, ${TARGETS.length} targets, bucket ${BUCKET}`))
 
 process.on('SIGTERM', async () => {
-  await Promise.allSettled([...open.values()].map((o) => o.stop()))
+  await manager.closeAll()
   process.exit(0)
 })

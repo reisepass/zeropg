@@ -8,6 +8,8 @@ RUN npm install --omit=dev --no-audit --no-fund \
       @electric-sql/pglite@^0.5 \
       @electric-sql/pglite-socket@^0.2 \
  && npm cache clean --force
-COPY server.mjs ./
+# replica-wire.mjs is copied into this context by deploy.sh from
+# packages/cli/src/console/replica-wire.mjs (the single source of truth).
+COPY server.mjs replica-wire.mjs ./
 ENV NODE_ENV=production
 CMD ["node", "server.mjs"]

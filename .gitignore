@@ -39,3 +39,4 @@ experiments/prisma-spike/dbpush.ts
 
 # local marketing prep - never commit (personal/company channel drafts)
 local-writing/
+examples/cloudrun/inspector/replica-wire.mjs

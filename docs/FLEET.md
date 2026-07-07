@@ -209,3 +209,25 @@ Data browsing / SQL editing is out of scope for the console (separate work).
 - Password/token rotation - zeropg has no auth to rotate yet; if bearer-token
   auth lands on the HTTP face later, `fleet rotate-token` becomes a small env
   var update + roll via the already-present provider surface
+
+## Console/inspector unification (decided 2026-07-07, step 1 done)
+
+The cloud inspector (`examples/cloudrun/inspector`) and the local console grew
+the same organs independently. Direction: the inspector should become
+`zeropg console --inspector` - one codebase, two trust modes - rather than a
+separate app.
+
+- **Done (step 1):** the replica-wire manager is ONE implementation,
+  `packages/cli/src/console/replica-wire.mjs` (openReplicaWire +
+  createReplicaManager with the LRU memory cap). The console's serveReplica
+  and the inspector both use it; the inspector's deploy.sh vendors the file
+  into its build context (the copy is gitignored - edit the source only).
+- **Pending (the mode merge):** auth as pluggable middleware (none/loopback ->
+  bearer token -> IAP), live fleet discovery in the cloud instead of the
+  baked targets secret, pgweb + Adminer adapters available on both surfaces,
+  and a STRUCTURAL capability matrix - inspector mode never registers
+  write/wake/export routes (not if-guards inside handlers). Read-write local
+  serving must never ship in any wide-bound mode.
+- Deploy gotcha captured in deploy.sh: `gcloud run services replace` with an
+  unchanged `:latest` spec does NOT roll a revision - images are pinned by
+  digest at deploy time (same lesson as the zeropocket demo).
