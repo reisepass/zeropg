@@ -118,7 +118,7 @@ export function resolveUpstream(pathname: string, search: string, upstreamBase: 
 function proxy(req: IncomingMessage, res: ServerResponse, url: URL, upstreamBase: string, stripPrefix: string | null): void {
   const upstream = resolveUpstream(url.pathname, url.search, upstreamBase, stripPrefix)
   if (!upstream) {
-    res.writeHead(400, { 'content-type': 'text/plain' })
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' })
     res.end('bad request path')
     return
   }
@@ -128,7 +128,7 @@ function proxy(req: IncomingMessage, res: ServerResponse, url: URL, upstreamBase
     up.pipe(res)
   })
   p.on('error', (e) => {
-    res.writeHead(502, { 'content-type': 'text/plain' })
+    res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
     res.end(`upstream error: ${e.message}`)
   })
   req.pipe(p)
@@ -192,16 +192,16 @@ export async function runInspector(flags: Record<string, string | boolean>): Pro
       }
       if (url.pathname === '/pgweb' || url.pathname.startsWith('/pgweb/')) {
         if (!currentPgweb) {
-          res.writeHead(404, { 'content-type': 'text/plain' })
+          res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
           return res.end('no pgweb running - open a target first (/pgweb/open/<name>)')
         }
         return proxy(req, res, url, `http://127.0.0.1:${currentPgweb}`, null)
       }
-      res.writeHead(404, { 'content-type': 'text/plain' })
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
       return res.end('not found')
     } catch (e) {
       console.error('[inspector]', e)
-      res.writeHead(500, { 'content-type': 'text/plain' })
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
       res.end(`inspector error: ${e instanceof Error ? e.message : e}`)
     }
   })

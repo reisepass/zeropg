@@ -51,8 +51,8 @@ export function authBearer(token: string): ConsoleAuth {
       const cookies = parseCookies(req.headers.cookie)
       const presented = url.searchParams.get('t') || cookies.zpt || ''
       if (presented !== token) {
-        res.writeHead(403, { 'content-type': 'text/plain' })
-        res.end('missing or wrong token - open the link your fleet console gave you (…?t=<token>)')
+        res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('missing or wrong token - open the link your fleet console gave you (the one ending in ?t=<token>)')
         return false
       }
       if (url.searchParams.get('t')) {
