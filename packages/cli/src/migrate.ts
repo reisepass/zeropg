@@ -1,6 +1,6 @@
 // The Prisma-migration workflow for zeropg/PGlite, with NO external Postgres and
 // without the native `prisma migrate dev` engine (which can't drive single-session
-// PGlite — see ORM-ADAPTER-NOTES.md). `migrate dev` is really two steps bundled
+// PGlite — see docs/ORM-ADAPTER-NOTES.md). `migrate dev` is really two steps bundled
 // with a shadow/advisory-lock orchestration PGlite can't satisfy; each step works
 // on PGlite on its own, so we run them ourselves:
 //

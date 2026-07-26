@@ -1,4 +1,4 @@
-// Local real-wire mode (ORM-ADAPTER-NOTES.md §1 — "the single biggest
+// Local real-wire mode (docs/ORM-ADAPTER-NOTES.md §1 — "the single biggest
 // compatibility win"). PGlite is in-process only, but plenty of the Postgres
 // ecosystem (Prisma's migration engine, `drizzle-kit push`, `psql`, TablePlus,
 // any `pg`-based tool) insists on a real `postgres://` wire connection. This

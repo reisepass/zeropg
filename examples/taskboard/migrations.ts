@@ -1,5 +1,5 @@
 // Schema migrations, applied by the instance to ITSELF at boot (the single-applier
-// pattern from ORM-ADAPTER-NOTES.md: migrations are writes, and zeropg has exactly
+// pattern from docs/ORM-ADAPTER-NOTES.md: migrations are writes, and zeropg has exactly
 // one writer holding the lease — so the right place to apply DDL is the instance,
 // under that lease, never an external engine pushing DDL over the wire). Forward-only,
 // idempotent, tracked in a _migrations table so each runs exactly once.

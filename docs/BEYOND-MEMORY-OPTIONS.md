@@ -4,7 +4,7 @@ Status: **options inventory, no decision.** The question: how could zeropg suppo
 a **20GB+ database with out-of-memory (lazy) WRITES** while keeping some form of
 **scale-to-zero**? Today's flagship mode can't: the datadir lives on tmpfs (RAM)
 and the bucket is the only durable home, with no in-place page writes, so the DB
-must fit in memory (see [LAZY-PAGEFAULT-RESTORE-from-blob.md](../LAZY-PAGEFAULT-RESTORE-from-blob.md)
+must fit in memory (see [LAZY-PAGEFAULT-RESTORE-from-blob.md](LAZY-PAGEFAULT-RESTORE-from-blob.md)
 and the "why writes are the wall" reasoning: object storage has no `pwrite` to an
 offset, and the whole-datadir tarball base does not scale).
 

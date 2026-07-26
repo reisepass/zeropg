@@ -6,7 +6,7 @@ Prisma should work against zeropg across the connection ladder
 graduated `postgres://`), and specifically how schema migrations work when the
 remote instance is **HTTP-only** (no raw 5432 on Cloud Run / Code Engine).
 
-Related: Track E in [TODO.md](TODO.md) (unified `connect()` client), DESIGN §5
+Related: Track E in [TODO.md](../TODO.md) (unified `connect()` client), DESIGN §5
 (env-var graduation), `packages/server` (HTTP `/sql`, `/wake`, loopback 5432).
 
 ---

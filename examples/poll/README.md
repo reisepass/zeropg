@@ -18,7 +18,7 @@ npx tsx examples/poll/index.ts          # http://localhost:8083  (file:// datadi
 
 Prisma's native **migrate engine cannot drive** PGlite over the wire (it needs
 multiple privileged sessions + advisory locks + a shadow DB; verified to fail
-with `P1017` — see `experiments/prisma-spike` and `ORM-ADAPTER-NOTES.md`). So we
+with `P1017` — see `experiments/prisma-spike` and `docs/ORM-ADAPTER-NOTES.md`). So we
 use the pattern that **does** work end to end:
 
 1. **Author** migrations with the zeropg CLI — no external Postgres, it uses a
