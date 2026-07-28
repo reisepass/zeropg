@@ -1,0 +1,187 @@
+# Spec: the zeropg wire router
+
+Status: **SPEC, not built.** Written 2026-07-28.
+
+One always-on process that terminates the Postgres wire protocol on a real TCP port, routes
+each connection to the right database by name, and starts or wakes that database on demand.
+
+It is **one program with a RAM budget**, not two products. The knob is how many databases it
+keeps warm:
+
+| warm set | box | what it behaves like | cold start on first hit |
+|---|---|---|---|
+| `0` | GCP `e2-micro`, ~1 GB | pure protocol terminator and waker | always paid |
+| `1-2` | 2-4 GB | shim that also hosts the hottest database | zero for the warm set |
+| `3-4 medium`, `15-20 small` | 8 GB | actual database host | zero for the warm set |
+
+Build it once. Pick the box later. Do not fork the codebase for the two shapes.
+
+## 1. Why this exists
+
+zeropg's flagship platform cannot hand out a `postgres://` URL. Cloud Run accepts HTTP/1.1,
+HTTP/2, gRPC and WebSockets, and **no inbound raw TCP**. Every other constraint the design
+carries downstream of that - loopback-only wire, co-located app and db, `sslmode=disable`
+everywhere - exists because of it.
+
+A tiny always-on box removes it, for a few dollars a month, without giving up scale-to-zero
+for the databases themselves.
+
+It also fixes a second problem that has nothing to do with TCP. **The bucket holds a
+database's identity, not any host.** So "warm on this box" versus "cold in the bucket" is only
+a question of who holds the lease. Promotion and demotion move no data. That makes a warm tier
+nearly free to add once something is routing connections.
+
+## 2. The reachability problem, which decides the whole design
+
+The router terminates a client's TCP connection. It then has to reach the actual database.
+Three options, and on GCP only one works:
+
+1. **WebSocket tunnel to the backend.** Cloud Run accepts inbound WebSockets. The router
+   dials `wss://<service>/wire`, and a bridge inside `@zeropg/server` unwraps the stream onto
+   the local loopback wire. **This is the only option that works with Cloud Run backends, so
+   it is required, and it is new code on BOTH ends.**
+2. **Start the database locally** in the router's own process. Works, bounded by RAM. This is
+   the warm set.
+3. **Proxy raw TCP** to a platform that accepts it - Fly.io, Azure Container Apps. Simplest,
+   but not available on the flagship platform.
+
+A router without (1) can accept your connection and then do nothing useful with it on GCP.
+Do not ship the router without the bridge.
+
+## 3. Routing requires parsing the startup packet
+
+To route by database name, something must read the `database` field out of the StartupMessage.
+
+- **PGlite discards it.** Verified: two startup packets with different `user` and different
+  `database` produce byte-identical 429-byte responses. It is a single-user backend that is
+  already logged in.
+- **pglite-socket never parses it.** The only protocol field it reads is
+  `readInt32BE(4) === 196608`; everything else is forwarded as opaque bytes.
+
+So the router must own a real startup-packet parser. **This is the strongest justification for
+the wire-frontend work in the whole project**, and it is independent of TLS and SCRAM, both of
+which are theater on loopback. Routing is not theater anywhere.
+
+See [WIRE-AUTH-DECISION-2026-07-28.md](WIRE-AUTH-DECISION-2026-07-28.md) section 4 for the
+build-versus-vendor call on the frontend itself.
+
+## 4. Connection lifecycle
+
+```
+client connects, TCP :5432
+  ↓
+SSLRequest / GSSENCRequest handled (reply 'N', or terminate TLS if configured)
+  ↓
+parse StartupMessage -> { user, database, options }
+  ↓
+authenticate (SCRAM, or trust when bound to loopback)   [see the credential model]
+  ↓
+resolve `database` -> a placement
+     warm here          -> attach to the local PGlite instance
+     cold, RAM free     -> start locally, take the lease, attach
+     cold, RAM tight    -> evict LRU (flush, release lease), then start locally
+     remote             -> wake over HTTP, open the WS tunnel, attach
+     unknown name       -> ErrorResponse 3D000 invalid_catalog_name
+  ↓
+replay PGlite's real handshake block, then proxy
+```
+
+**Handshake replay, not synthesis.** Harvest PGlite's real 429-byte block once at boot, strip
+`R` (AuthenticationOk) and `K` (BackendKeyData), force the trailing `Z` to `'I'`, and emit all
+16 real `ParameterStatus` messages. Do not fake `server_version` the way the existing
+pg-gateway spike does. Caveat from probing: `ParameterStatus` values go stale across
+connections, so track them live rather than replaying a boot snapshot forever - a `SET
+TimeZone` emits six updates to the setter only, and pinning boot-time values is silent
+timestamp corruption.
+
+**Hold the connection during a cold start.** Complete the handshake immediately, then hold the
+first query until the database is ready. Measured with a prototype: node-postgres at library
+defaults against an 11s restore connected in 4ms and returned correct rows at 10880ms. Cap the
+hold at 30s, and cap the leasing and restoring phases separately so the error names the phase
+it died in. Full analysis in [COLDSTART-ABSORPTION.md](COLDSTART-ABSORPTION.md).
+
+## 5. Eviction, and the data-loss hazard in it
+
+**Every demotion must `POST /flush` before releasing the lease.** This is not a nicety.
+Live-verified: taking the lease from an awake `sleep`-durability instance **drops its
+unflushed writes**. Eviction is a lease handoff. An LRU evictor that forgets to flush is a
+silent data-loss bug, not a performance bug.
+
+Eviction protocol, in order, no steps skipped:
+
+1. Stop accepting new connections for that database.
+2. Drain or forcibly fail in-flight connections with a protocol-legal `ErrorResponse`
+   (`57P01 admin_shutdown`).
+3. `flush` and confirm it committed.
+4. Release the lease.
+5. Close the PGlite instance and free the memory.
+
+If step 3 fails, **do not proceed**. Keep the database warm and evict a different one. Refusing
+to evict is always better than losing writes.
+
+**Split brain.** The router must be the only thing that decides where a database lives. If the
+router holds a lease and something else wakes the same database elsewhere, the fence protects
+correctness but you get takeover churn plus that write-loss path.
+
+## 6. What already exists versus what is new
+
+Existing, reuse rather than reinvent:
+
+- `serveWire()` in `packages/client/src/wire.ts` - serves one datadir over TCP.
+- `WireFrontend` in `packages/server/src/wire-frontend.ts` - already owns a public port, peeks
+  the first 8 bytes, answers SSLRequest and GSSENCRequest, enforces a connection cap with a
+  real `53300` ErrorResponse.
+- The lease and fencing in `@zeropg/lease` - handoff and split-brain protection.
+- `POST /flush` on `@zeropg/server` - the quiesce path.
+- `POST /wake` and `/ready` - remote wake and readiness.
+- The fleet CLI - already discovers live services and local datadirs.
+
+New:
+
+- **Startup-packet parser** and the name-to-placement router.
+- **Warm-set manager**: capacity accounting, LRU, the eviction protocol in section 5.
+- **WebSocket-to-wire bridge** in `@zeropg/server`, plus the client half in the router.
+- **Placement policy**: a single function `where(databaseName) -> local | remote | cold`, so
+  that the local-only build and the local-plus-remote build differ by one branch body.
+
+## 7. Non-goals
+
+- **Not a connection pooler.** PGlite is one session per database; multiplexing more
+  connections onto it does not add throughput.
+- **Not multi-writer.** One lease per database, unchanged.
+- **Not a query router.** No cross-database joins, no `postgres_fdw`-style federation. That
+  was considered and parked: `postgres_fdw` holds a connection per remote per session, and a
+  held connection to a scale-to-zero backend keeps it awake, which converts the fleet to
+  always-on prices.
+- **Not HA.** The router is a single point of failure for the warm tier. The bucket is the
+  source of truth, so recovery is "start elsewhere" with an RTO of one cold start. Say this
+  plainly rather than implying redundancy.
+
+## 8. Build order
+
+1. **Startup parsing plus routing, local placement only, warm set fixed at 1.** Proves the
+   parser and gives a working single-database TCP endpoint.
+2. **Warm set greater than 1, with the full eviction protocol** and a test that asserts writes
+   survive an eviction under load. This is the step that can lose data if rushed.
+3. **Cold-start holding**, per section 4.
+4. **WebSocket bridge and remote placement.** Only now does the tiny-box configuration become
+   useful on GCP.
+5. **TLS and SCRAM**, only if a genuinely public port is the goal. On a private network or
+   loopback these are theater. See the fork in
+   [HANDOFF-2026-07-28-wire-auth.md](HANDOFF-2026-07-28-wire-auth.md).
+
+Steps 1-3 are worth doing for the fat-box configuration alone, with no shim and no Cloud Run
+involvement.
+
+## 9. Open questions
+
+- **Resident memory per idle PGlite instance.** The warm-set arithmetic in the table at the
+  top is extrapolated from "a 500 MB database wants about 2 GiB comfortable", not measured per
+  instance. Measure it before promising capacity. Tracked as E8 in
+  [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md).
+- **Does the WebSocket tunnel keep a Cloud Run instance billable for its whole duration?** If
+  an open tunnel counts as an active request, a long-lived client connection pins the instance
+  awake and the economics collapse back to always-on. This decides whether option (1) in
+  section 2 is viable at all. **Settle this before building the bridge.**
+- **Whether a real Postgres could be the router**, giving a TCP endpoint plus federation in
+  one box. Blocked on the same FDW connection-holding problem in section 7.
