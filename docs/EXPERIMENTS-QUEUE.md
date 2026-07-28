@@ -182,3 +182,41 @@ tunnel while `ReadyForQuery` reports `T`, and does close it on `I`.
 **Decides.** Whether the tiny-VM shim in front of Cloud Run backends is viable at all, and
 therefore whether step 4 of the build order in [SPEC-wire-router.md](SPEC-wire-router.md) gets
 built. Steps 1-3 do not depend on it.
+
+---
+
+## E11. Fly.io baseline: does a public `postgres://` with scale-to-zero actually work? **OPEN, unblocked**
+
+**Why.** Fly.io forwards real public TCP (`[[services.ports]] port = 5432, handlers = []`) and
+stops idle Machines (`auto_stop_machines` / `auto_start_machines`, `min_machines_running = 0`).
+If both hold together, Fly gives what Cloud Run cannot: a genuine `postgres://` URL that costs
+nothing idle, **and no shim is needed at all** because clients dial the backend directly. That
+would make the Cloud Run shim a niche path rather than the main one.
+
+Access is in place: `flyctl` is authenticated on `blob-pglite-dev` as `ruben@forest-ai.org`,
+org `personal`, with `FLY_API_TOKEN` and `PATH` wired into `~/.bashrc`. There is prior art at
+`experiments/standalone-service/fly.toml` and `scripts/deploy-standalone-fly.sh`. Tigris
+(`https://fly.storage.tigris.dev`) is the natural object store there, but **the credentials in
+`.tigrisfly.env` were exposed in a session transcript on 2026-07-28 and must be rotated before
+use.**
+
+**Setup.** Deploy `@zeropg/server` to one Fly Machine with a raw TCP service on 5432,
+`auto_stop_machines = "stop"`, `min_machines_running = 0`, backed by a Tigris bucket. Then:
+
+1. Let it stop. Confirm the Machine is genuinely stopped and not billing.
+2. `psql` at libpq's **default** `sslmode` straight at the public hostname. Does the connection
+   get held while the Machine starts, or refused? This is the Fly counterpart of E1 and it is
+   the whole question.
+3. Measure connect-to-first-row on a cold Machine, and separately on a warm one.
+4. Confirm the single-writer constraint: `min_machines_running` is a floor, not a ceiling, so
+   verify that only one Machine ever holds the lease and that a second would be fenced rather
+   than corrupting.
+
+**Then, and only after the baseline passes**, layer step 5 of
+[SPEC-wire-router.md](SPEC-wire-router.md): real TLS and SCRAM from the forked pg-gateway.
+On Fly the port is genuinely public, so unlike loopback these are load-bearing rather than
+theater. Test `sslmode=require`, `verify-full` against a real cert, and a wrong password.
+
+**Decides.** Whether the product's public-`postgres://` story is "deploy to Fly" rather than
+"run a shim in front of Cloud Run". If Fly passes, the shim drops to one row of the scope table
+in SPEC-wire-router.md section 0 and stays there.
