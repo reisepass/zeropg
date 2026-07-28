@@ -419,3 +419,62 @@ with    rewriteIncoming:  prepared statement "ghost" does not exist
 sqlx" on it in any roadmap or marketing copy - that claim is now measured false. The
 advisory-lock semantics are the real blocker for Rust migration tooling, they sit
 below the wire, and they need their own entry.
+
+---
+
+## E11. Does `sslnegotiation=direct` hang or error? **DONE - it hangs, indefinitely**
+
+**Why.** [WIRE-AUTH-DECISION-2026-07-28.md](WIRE-AUTH-DECISION-2026-07-28.md) section 4
+predicts this and adds ALPN to the patch list, calling it "a hang, not an error - the
+exact class we exist to eliminate". A prediction from reading the framer is worth
+confirming, because an error is a support ticket and a hang is a burned connection slot
+plus a user with no idea what happened.
+
+### Result, 2026-07-28. Confirmed, and the hang is unbounded.
+
+```
+--- 1. direct TLS ClientHello with ALPN, the PG17 opening move ---
+    HUNG (no response, no close, still open after 10022ms)
+--- 2. bare 0x16 TLS record header, nothing else ---
+    HUNG (no response, no close, still open after 10003ms)
+--- 3. control: the SSLRequest path a PG16 client uses ---
+    errored after 34ms: server replied "S"
+```
+
+The server sends nothing and closes nothing. The client waits until it gives up on its
+own, and until then the connection slot is held.
+
+**Client caveat, stated because it limits the claim.** The psql available here is
+16.14, which predates the `sslnegotiation` parameter and rejects it outright
+(`invalid URI query parameter: "sslnegotiation"`). So this is driven with `node:tls`
+emitting a real ClientHello with `ALPNProtocols: ['postgresql']`, which is byte-for-byte
+the opening move libpq makes. The property under test is what the server does with `0x16`
+as the first byte, and that does not depend on which client produced it. A PG17 psql
+should still be run against this before the ALPN patch is called done.
+
+### Mechanism, exactly
+
+Pre-startup, `message-buffer.ts:61` sets `codeLength = 0` (the startup packet has a
+4-byte header with no type byte), so `processMessages()` reads a `uint32` at offset 0 and
+treats it as the message length. For a TLS record header the first four bytes are
+`0x16 0x03 0x01 0x02`:
+
+```
+0x16030102 = 369,295,618 bytes = 352 MiB
+```
+
+So the framer concludes the client has announced a 352 MiB startup packet, and the
+`while (offset + headerLength <= bufferFullLength)` loop simply never yields. It is not
+a crash or a rejection - it is a buffer patiently waiting for a third of a gigabyte that
+will never arrive. Worse, a client that kept writing would be *fed into that buffer*,
+which is a memory-growth path on unauthenticated input.
+
+**This is a better argument for the framer being ours than the crash was.** It is not a
+bug upstream would call a bug - pg-gateway simply predates PG17 direct SSL. But every
+libpq from 17 onward can be pointed at us this way, and the correct behaviour (sniff
+`0x16` as the first byte, branch to a TLS terminator with ALPN `postgresql`) is ~10 LOC
+only because the TLS path already exists.
+
+**Decides.** ALPN stays on the patch list and is now measured rather than predicted. The
+first-byte sniff belongs in our framer, not in a pg-gateway option, because the framer
+has to make the decision before pg-gateway's state machine starts.
