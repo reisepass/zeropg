@@ -147,3 +147,103 @@ already; this adds the VM column.
 
 **Decides.** What we tell people the product is for, and at what fleet size we should stop
 recommending it.
+
+---
+
+## E9. Does an open WebSocket pin a Cloud Run instance awake and billable? **DONE - YES, 1:1**
+
+**Why.** [SPEC-wire-router.md](SPEC-wire-router.md) section 9 named this as the question that
+decides whether the tiny-VM shim is viable at all. Section 2 of that spec says a WebSocket
+tunnel is *the only* way a router can reach a Cloud Run backend, so it is required and must be
+built on both ends. But if an open tunnel counts as an active request, then a long-lived
+Postgres client connection tunnelled over it pins the backend instance awake for as long as the
+client stays connected, and scale-to-zero collapses back to always-on. That would not make the
+bridge harder to build; it would make it pointless.
+
+**Setup.** `experiments/e9-ws-pin/` - a dependency-free Node service that accepts a WebSocket,
+sends one frame at open, then goes completely silent. It carries a `setInterval` tick counter so
+CPU scheduling during the hold is observable independently of anything the client sees. Deployed
+twice to Cloud Run (`min-instances=0`, `max-instances=1`, 1 vCPU / 512 MiB, europe-west1), once
+with `--timeout=300` and once with `--timeout=3600`. `hold.mjs` opens one connection from
+outside GCP and holds it idle, sending nothing.
+
+### Result: the connection pins the instance, at exactly 1:1
+
+`--timeout=300` service, one idle WebSocket held from 17:02:12Z:
+
+```
+request log:   status 101   latency 301.002044s   /wire
+client:        {"event":"close","heldMs":300991,"code":1006,"wasClean":false}
+
+billable_instance_time, 60s buckets:
+  17:02  0.8      <- connection opens mid-bucket
+  17:03  34.3
+  17:04  60.2     <- fully billed, doing nothing
+  17:05  60.1
+  17:06  60.1
+  17:07  60.2
+  17:08  26.2     <- torn down mid-bucket
+  17:09  0.0      <- counterfactual: billing stops when the socket closes
+  TOTAL  301.9 billable seconds for a 301s idle hold
+```
+
+**301.9 billed seconds for 301 seconds of connection carrying zero bytes.** `instance_count`
+held at 1 for the whole hold and dropped to 0 after. The 0.0 bucket after close is the control:
+the instance is billed for exactly the connection's lifetime and not a second longer.
+
+**The instance is not merely alive, it has full CPU.** The server-side tick counter advanced
+70 -> 130 -> 190 -> 250 -> 310 -> 370 across the five one-minute heartbeats: exactly 60 ticks
+per 60 seconds of wall clock, with no traffic on the socket. There is no throttled-but-open
+state to exploit. This matches the documented behaviour ("A Cloud Run instance that has any open
+WebSocket connection is considered active, so CPU is allocated"), and the measurement makes it a
+fact rather than a doc claim.
+
+### The request timeout is a hard cap on connection lifetime
+
+The `--timeout=300` connection died at **300991ms** with WebSocket close code **1006** (abnormal,
+`wasClean: false`) - torn down by the platform, not by either endpoint. The `--timeout=3600`
+service, given an identical idle connection at the same moment, sailed straight past 300s and
+was still open and ticking at 360s+. So the cap is precisely the configured request timeout.
+
+**The 60-minute maximum is real and enforced at the API**, not just documented:
+
+```
+$ gcloud run services update e9-ws-pin-t300 --timeout=3601
+ERROR: service.spec.template.spec.timeout_seconds: Must be a number between 0 and 3600.
+```
+
+So the best case is a **hard 60-minute ceiling on any tunnelled connection**, after which the
+client is disconnected uncleanly (1006) and must reconnect. Cloud Run's own docs note a
+reconnecting client "isn't guaranteed to connect to the same instance", which for a lease-holding
+database is a takeover, not a reconnect.
+
+### What it means for the design
+
+**Answer: yes, it pins the instance awake. The WebSocket bridge does not deliver scale-to-zero.**
+
+- Cost: a pinned 1 vCPU / 1 GiB instance is roughly **$52/month per connected database**
+  (30d x 86400s x ($0.000018/vCPU-s + $0.000002/GiB-s)). That is worse than the always-on VM the
+  shim exists to avoid, and it is per database, not per fleet.
+- The economics do not merely degrade, they invert: the shim's premise is one cheap always-on box
+  fronting many scale-to-zero databases. With a tunnel per connection, every database with a
+  connected client is also always-on, so you pay for the box *and* the fleet.
+- A pooled client (any ORM default) holds several connections idle. Each is its own tunnel and
+  its own billed request, so the pin is not even amortized.
+- The 60-minute ceiling means even accepting the cost buys a connection that dies hourly with a
+  1006 and may reconnect to a different instance.
+
+**Consequence, recorded in the spec:** step 4 of the build order (the WebSocket bridge) does not
+achieve what it was for. Steps 1-3 stand on their own for the fat-box configuration, which does
+not involve Cloud Run at all. The tiny-shim-plus-Cloud-Run-backends shape needs a different
+reachability answer than option (1), or it needs the databases to live somewhere with real TCP
+ingress - which is what **E1** (Azure Container Apps) and Fly.io are about.
+
+**What this does NOT rule out.** A tunnel opened *per query* and closed immediately bills only
+for the query, and the router could keep the client's TCP connection alive across those. That is
+a materially different design from the one in spec section 2 - it gives up session state,
+transactions, and the single-session model PGlite requires - and nothing here says it works. It
+is recorded only so the reader knows the pin applies to *held* connections specifically.
+
+**Reproduce.** `experiments/e9-ws-pin/{server.mjs,hold.mjs,Dockerfile}`; deploy with
+`--min-instances=0 --max-instances=1`, run `node hold.mjs wss://<url>/wire 12`, then read
+`run.googleapis.com/container/billable_instance_time` over the window.

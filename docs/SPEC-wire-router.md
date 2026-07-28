@@ -198,8 +198,13 @@ describes.
 2. **Warm set greater than 1, with the full eviction protocol** and a test that asserts writes
    survive an eviction under load. This is the step that can lose data if rushed.
 3. **Cold-start holding**, per section 4.
-4. **WebSocket bridge and remote placement.** Only now does the tiny-box configuration become
-   useful on GCP.
+4. ~~**WebSocket bridge and remote placement.**~~ **BLOCKED, and not by difficulty.** E9 in
+   [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md) measured an open WebSocket pinning a Cloud Run
+   instance awake and billable 1:1 for the connection's whole life. The bridge would work and
+   would deliver nothing: every database with a connected client becomes always-on, so you pay
+   for the shim box *and* the fleet it was supposed to keep asleep. Do not build this until
+   there is a reachability answer that does not hold a request open, or the databases move to a
+   platform with real TCP ingress (see E1).
 5. **TLS and SCRAM**, only if a genuinely public port is the goal. On a private network or
    loopback these are theater. See the fork in
    [HANDOFF-2026-07-28-wire-auth.md](HANDOFF-2026-07-28-wire-auth.md).
@@ -213,9 +218,14 @@ involvement.
   top is extrapolated from "a 500 MB database wants about 2 GiB comfortable", not measured per
   instance. Measure it before promising capacity. Tracked as E8 in
   [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md).
-- **Does the WebSocket tunnel keep a Cloud Run instance billable for its whole duration?** If
-  an open tunnel counts as an active request, a long-lived client connection pins the instance
-  awake and the economics collapse back to always-on. This decides whether option (1) in
-  section 2 is viable at all. **Settle this before building the bridge.**
+- ~~**Does the WebSocket tunnel keep a Cloud Run instance billable for its whole duration?**~~
+  **SETTLED 2026-07-28: yes, exactly 1:1. Measured 301.9 billable seconds for a 301-second idle
+  WebSocket carrying zero bytes, with full CPU throughout, and billing dropping to 0.0 the
+  moment the socket closed.** The request timeout is also a hard cap on connection lifetime: a
+  300s-timeout service tore the connection down at 300991ms with close code 1006, and 3600s is
+  an API-enforced maximum. So option (1) in section 2 pins every backend awake for as long as a
+  client is connected, at roughly $52/month per connected database, and the scale-to-zero
+  premise collapses. **Step 4 of the build order does not achieve what it was for.** Full
+  numbers and the reproduction recipe in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md) E9.
 - **Whether a real Postgres could be the router**, giving a TCP endpoint plus federation in
   one box. Blocked on the same FDW connection-holding problem in section 7.
