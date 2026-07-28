@@ -215,19 +215,29 @@ async function main(): Promise<void> {
       eq(r.rows, [{ tag: 'from-app' }], 'psql -U app with no -d routed to database "app"')
     })
 
-    // ---- 5. Warm set fixed at 1 ----
-    console.log('warm set of 1: a second database is refused in protocol, not evicted unsafely')
-    let full: PgError | null = null
-    const second = new Client({ connectionString: url('other') })
-    try {
-      await second.connect()
-    } catch (e) {
-      full = e as PgError
-    }
-    ok(full !== null, 'the second database was refused')
-    eq(full?.code, '53400', 'SQLSTATE is 53400 configuration_limit_exceeded')
-    eq(other.opened, 0, 'the refused database was never started')
-    eq(router.warmDatabases, ['app'], 'the resident database was not evicted')
+    // ---- 5. Warm set of 1 ----
+    //
+    // UPDATED for step 2. This assertion used to be "a second database is
+    // refused with 53400", because step 1 shipped before the eviction protocol
+    // existed and refusing was the only safe answer: eviction is a lease
+    // handoff, and one that skips the flush loses the victim's unflushed
+    // writes. Now that the protocol is built, a full warm set makes room by
+    // EVICTING safely, so a second database is admitted rather than refused.
+    // The refusal path is still exercised, in wire-eviction.test.ts, where it
+    // is what happens when no victim can be flushed.
+    console.log('warm set of 1: a second database evicts the first, safely')
+    await withPg(url('other'), async (c) => {
+      const r = await c.query('select tag from t')
+      eq(r.rows, [{ tag: 'from-other' }], 'the second database was admitted and is its own instance')
+    })
+    eq(other.opened, 1, 'the second database was started')
+    eq(router.warmDatabases, ['other'], 'the warm set still holds exactly one database')
+    // And the evicted one comes back on demand, as a fresh instance.
+    await withPg(url('app'), async (c) => {
+      const r = await c.query('select tag from t')
+      eq(r.rows, [{ tag: 'from-app' }], 'the evicted database is re-admitted on the next connection')
+    })
+    eq(app.opened, 2, 'the re-admitted database was opened a second time')
 
     // ---- 6. Transaction isolation on the shared session ----
     console.log('two connections, one PGlite session: transactions stay isolated')
