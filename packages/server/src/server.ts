@@ -27,6 +27,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { BlobStore } from '@zeropg/blobstore'
 import { ZeroPG, FencedError, LockedError, type Durability } from '@zeropg/objectstore-fs'
 import { PostgrestProcess, postgrestBootstrapSql } from './postgrest.js'
+import { WireFrontend } from './wire-frontend.js'
 
 let PGLiteSocketServer: typeof import('@electric-sql/pglite-socket').PGLiteSocketServer
 
@@ -76,7 +77,7 @@ interface BootTimings {
 
 export class ZeroPGServer {
   private db: ZeroPG | null = null
-  private wire: import('@electric-sql/pglite-socket').PGLiteSocketServer | null = null
+  private wire: WireFrontend | null = null
   private pgrest: PostgrestProcess | null = null
   private http: Server | null = null
 
@@ -158,12 +159,22 @@ export class ZeroPGServer {
       if (!PGLiteSocketServer) {
         ;({ PGLiteSocketServer } = await import('@electric-sql/pglite-socket'))
       }
-      this.wire = new PGLiteSocketServer({
-        db: this.db.raw,
+      // The front-end owns o.wirePort and answers SSLRequest/GSSENCRequest with
+      // 'N' before proxying plaintext to the inner PGLiteSocketServer on a private
+      // loopback port. Without it, any libpq/pgx client at its default
+      // sslmode=prefer hangs silently: pglite-socket has no SSL negotiation.
+      const db = this.db.raw
+      this.wire = new WireFrontend({
         port: o.wirePort,
         host: o.wireHost,
-        // PostgREST opens a small pool; allow several concurrent loopback conns.
-        maxConnections: 10,
+        createInner: (cfg) =>
+          new PGLiteSocketServer({
+            db,
+            host: cfg.host,
+            port: cfg.port,
+            // PostgREST opens a small pool; allow several concurrent loopback conns.
+            maxConnections: 10,
+          }),
       })
       await this.wire.start()
       this.bootTimings.wireMs = performance.now() - tw

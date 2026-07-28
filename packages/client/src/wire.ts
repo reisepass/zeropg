@@ -12,11 +12,16 @@
 // both open it. The socket multiplexes many TCP connections (an ORM pool) onto
 // the single serialized PGlite — which is exactly the single-writer model.
 
-import { PGlite } from '@electric-sql/pglite'
-import { createServer } from 'node:net'
+import type { PGlite } from '@electric-sql/pglite'
 import { resolve } from 'node:path'
+// Deep import, NOT the '@zeropg/server' barrel: the barrel re-exports
+// ZeroPGServer, which pulls @zeropg/objectstore-fs and with it a hard
+// @electric-sql/pglite import. Importing it here would make merely loading
+// @zeropg/client fail for a postgres://-only project that has no PGlite
+// installed. wire-frontend.js depends on nothing but node:net.
+import { WireFrontend } from '@zeropg/server/wire-frontend'
 import { acquireDatadirLock, type DatadirLock } from './lockfile.js'
-import { nativeDatadirLockEnabled } from './pglite.js'
+import { loadPGlite, nativeDatadirLockEnabled } from './pglite.js'
 import { recordOpen } from './breadcrumb.js'
 
 // @electric-sql/pglite-socket is an OPTIONAL peer: only `serveWire` needs it, and
@@ -74,23 +79,11 @@ export interface WireServer {
   stop(): Promise<void>
 }
 
-/** Pick a free TCP port by binding an ephemeral server and reading it back. */
-function freePort(host: string): Promise<number> {
-  return new Promise((res, rej) => {
-    const s = createServer()
-    s.once('error', rej)
-    s.listen(0, host, () => {
-      const addr = s.address()
-      const port = typeof addr === 'object' && addr ? addr.port : 0
-      s.close(() => res(port))
-    })
-  })
-}
-
 /** Start a localhost Postgres-wire server backed by PGlite. */
 export async function serveWire(opts: ServeWireOptions = {}): Promise<WireServer> {
   const host = opts.host ?? '127.0.0.1'
-  const port = opts.port && opts.port > 0 ? opts.port : await freePort(host)
+  // Load before nativeDatadirLockEnabled(), which reads a marker off the build.
+  const PGliteClass = await loadPGlite()
 
   let lock: DatadirLock | null = null
   let pglite: PGlite
@@ -101,22 +94,31 @@ export async function serveWire(opts: ServeWireOptions = {}): Promise<WireServer
       ? null
       : await acquireDatadirLock(abs, { acquireTimeoutMs: opts.acquireTimeoutMs })
     try {
-      pglite = await PGlite.create({ dataDir: abs, extensions: opts.extensions as never })
+      pglite = await PGliteClass.create({ dataDir: abs, extensions: opts.extensions as never })
     } catch (e) {
       if (lock) await lock.release()
       throw e
     }
     recordOpen(abs)
   } else {
-    pglite = await PGlite.create({ extensions: opts.extensions as never })
+    pglite = await PGliteClass.create({ extensions: opts.extensions as never })
   }
 
   const PGLiteSocketServer = await loadSocketServer()
-  const server = new PGLiteSocketServer({
-    db: pglite,
+  // The front-end owns the public port and answers SSLRequest/GSSENCRequest (see
+  // WireFrontend). Without it, libpq/pgx at their default sslmode=prefer hang:
+  // pglite-socket does not implement SSL negotiation. The inner PGLiteSocketServer
+  // is bound by the front-end on a private loopback port.
+  const server = new WireFrontend({
     host,
-    port,
-    maxConnections: opts.maxConnections ?? 100,
+    port: opts.port && opts.port > 0 ? opts.port : 0,
+    createInner: (cfg) =>
+      new PGLiteSocketServer({
+        db: pglite,
+        host: cfg.host,
+        port: cfg.port,
+        maxConnections: opts.maxConnections ?? 100,
+      }),
   })
   try {
     await server.start()
@@ -125,6 +127,7 @@ export async function serveWire(opts: ServeWireOptions = {}): Promise<WireServer
     if (lock) await lock.release()
     throw e
   }
+  const port = server.port
 
   let stopped = false
   return {
