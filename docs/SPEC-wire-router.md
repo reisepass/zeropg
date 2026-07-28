@@ -1,6 +1,30 @@
 # Spec: the zeropg wire router
 
-Status: **SPEC, not built.** Written 2026-07-28.
+Status: **steps 1-3 of section 8 are BUILT.** Written 2026-07-28, build landed 2026-07-28.
+
+| step | status | code | test |
+|---|---|---|---|
+| 1. startup parsing plus routing, warm set 1 | **done** | `packages/server/src/wire-router.ts`, `startup-packet.ts`, `handshake.ts`, `wire-queue.ts`, `wire-messages.ts`, `warm-set.ts`, `router-sources.ts` | `packages/server/test/wire-router.test.ts` (34 assertions, real psql 16.4 + real node-postgres) |
+| 2. warm set > 1, full eviction protocol | **done** | `wire-router.ts` `evict()` / `makeRoom()` | `packages/server/test/wire-eviction.test.ts` (26 assertions, writes over the wire, races the flush timer) |
+| 3. cold-start holding | **done** | `wire-router.ts` `coldStart()` / `raceHold()` | `packages/server/test/wire-coldstart.test.ts` (30 assertions; connect at 162ms against a 3s cold start, correct rows at 7261ms) |
+| 4. WebSocket bridge | blocked, see below | - | - |
+| 5. TLS and SCRAM | not started | - | - |
+
+Measured on this box during the build, worth recording because they are the numbers the
+design turns on:
+
+- PGlite 0.5.2 answers a `StartupMessage` with a **byte-identical 428-byte block** regardless
+  of the `user`, `database` or `application_name` in it, and a fresh instance answers a bare
+  `Query` correctly with **no startup packet ever sent**. Confirms section 3: the startup
+  packet is not an authentication step for PGlite, so the router harvests the handshake and
+  never forwards the client's packet.
+- The handshake harvest is **side-effect free on an open transaction**: taken while the shared
+  session was inside `BEGIN`, the transaction stayed open and a later `ROLLBACK` still unwound
+  correctly. The trailing `Z` is forced to `'I'` because the real byte would be `'T'` there,
+  and a new client told `'T'` believes it is inside a transaction it never opened.
+- Cold-start holding, real node-postgres at library defaults against a 3s cold start:
+  **connect returned at 162ms, correct rows at 7261ms.** Real `psql` waited it out with no
+  warning on stderr.
 
 One always-on process that terminates the Postgres wire protocol on a real TCP port, routes
 each connection to the right database by name, and starts or wakes that database on demand.
@@ -208,6 +232,32 @@ defaults against an 11s restore connected in 4ms and returned correct rows at 10
 hold at 30s, and cap the leasing and restoring phases separately so the error names the phase
 it died in. Full analysis in [COLDSTART-ABSORPTION.md](COLDSTART-ABSORPTION.md).
 
+> **BUILT 2026-07-28**, `WireRouter.coldStart()` / `raceHold()`, tested by
+> `packages/server/test/wire-coldstart.test.ts`. Reproduced against real node-postgres:
+> connect at **162ms** against a 3s cold start, correct rows at **7261ms**. Four things the
+> implementation settled that the design left open:
+>
+> - **There are THREE phases, not two.** Freeing a warm-set slot means draining and flushing
+>   another database to the object store, which is real network work and is neither leasing nor
+>   restoring. Charging it to leasing made a slow eviction report `phase=leasing, 10s elapsed`
+>   about a lease that was never contended, pointing an operator at the wrong problem entirely.
+>   `admitting` is now its own phase with its own clock. Each phase gets its own budget rather
+>   than sharing one running total, so a slow phase cannot consume another's.
+> - **Anything knowable before the handshake must be answered before it.** An unknown database
+>   name, a full warm set, a fenced lease: all resolve instantly, and answering them after the
+>   handshake is materially different for a client, which has by then resolved `connect()`
+>   successfully and gets the error asynchronously instead. `psql -d typo` must fail its connect
+>   the way it does against real Postgres. Only the RESTORE, which cannot be known quickly, is
+>   worth converting into a hold.
+> - **The block sent early is copied from a real harvested one, never synthesized.** Every PGlite
+>   instance in one process answers identically (same WASM build, same process `TZ`), so copying
+>   is sound where guessing is exactly the silent-corruption risk section 4 warns about. On a
+>   completely cold process with nothing to copy, the first connection is deliberately NOT held.
+>   It pays the cold start on its connect budget once, and every connection after it is held.
+> - **A hold that expires does not cancel the cold start.** The database keeps coming up and the
+>   next client finds it warm. Cancelling would discard a nearly-finished restore and make the
+>   next client pay for it again.
+
 ## 5. Eviction, and the data-loss hazard in it
 
 **Every demotion must `POST /flush` before releasing the lease.** This is not a nicety.
@@ -226,6 +276,33 @@ Eviction protocol, in order, no steps skipped:
 
 If step 3 fails, **do not proceed**. Keep the database warm and evict a different one. Refusing
 to evict is always better than losing writes.
+
+> **BUILT 2026-07-28**, `WireRouter.evict()` in `packages/server/src/wire-router.ts`, tested by
+> `packages/server/test/wire-eviction.test.ts`. Two additions the implementation found necessary:
+>
+> - **Step 2 has a sub-step.** A protocol message already inside PGlite's
+>   `execProtocolRawStream` cannot be cancelled. The evictor therefore waits for the queue to go
+>   idle (`QueryQueue.whenIdle`, default 5s) and treats a timeout as a refusal, because flushing
+>   underneath a write that is still landing is the same race the protocol exists to prevent.
+> - **A refused eviction must not be a refused admission.** A victim whose flush fails stays warm
+>   and the evictor tries the next-least-recently-used one. Only when every candidate refuses does
+>   admission fail, with `53400`.
+>
+> **Two real data-loss bugs this turned up**, both found by deleting the evictor's flush and
+> checking that the test still failed. It did not, at first:
+>
+> 1. `zeropgSource` left the engine **dirty** after running `schemaSql`. Under `sleep` durability
+>    `exec()` sets the flag and does not commit, so `ZeroPG.close()` committed on its way out -
+>    and that commit swept up every raw-wire write made since, which have no flag of their own.
+>    The database then looked durable for a reason unrelated to the eviction protocol having
+>    flushed it. `open()` now flushes before handing over to the wire.
+> 2. `flush()` trusted the dirty flag, so it could **return success having written nothing**. The
+>    eviction protocol reads a resolved flush as permission to release the lease, which turns that
+>    into silent loss. It now calls `markDirty()` unconditionally.
+>
+> Generalizable lesson: on the wire path the dirty flag means nothing, so any code that reads it
+> to decide whether to commit is wrong by construction. And a data-loss test is not finished until
+> you have broken the thing it guards and watched it fail.
 
 **Split brain.** The router must be the only thing that decides where a database lives. If the
 router holds a lease and something else wakes the same database elsewhere, the fence protects
@@ -289,11 +366,12 @@ describes.
 
 ## 8. Build order
 
-1. **Startup parsing plus routing, local placement only, warm set fixed at 1.** Proves the
-   parser and gives a working single-database TCP endpoint.
-2. **Warm set greater than 1, with the full eviction protocol** and a test that asserts writes
-   survive an eviction under load. This is the step that can lose data if rushed.
-3. **Cold-start holding**, per section 4.
+1. ~~**Startup parsing plus routing, local placement only, warm set fixed at 1.**~~ **DONE.**
+   Proves the parser and gives a working single-database TCP endpoint.
+2. ~~**Warm set greater than 1, with the full eviction protocol**~~ **DONE**, with a test that
+   asserts writes survive an eviction under load. This is the step that can lose data if rushed,
+   and it did: see the callout in section 5 for the two bugs it caught.
+3. ~~**Cold-start holding**, per section 4.~~ **DONE.**
 4. ~~**WebSocket bridge and remote placement.**~~ **BLOCKED, and not by difficulty.** E9 in
    [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md) measured an open WebSocket pinning a Cloud Run
    instance awake and billable 1:1 for the connection's whole life. The bridge would work and
@@ -307,6 +385,29 @@ describes.
 
 Steps 1-3 are worth doing for the fat-box configuration alone, with no shim and no Cloud Run
 involvement.
+
+## 8.5 Known gaps in the built steps 1-3
+
+Small and deliberate, recorded so nobody rediscovers them as surprises.
+
+- **`CancelRequest` closes the connection without cancelling.**
+  `packages/server/src/wire-router.ts`, the `cancel-request` branch of `route()`. Protocol-legal
+  (a CancelRequest gets no response of any kind), and honest: there is no cancel path into the
+  PGlite WASM backend and `statement_timeout` is inert there, so anything else would be a lie.
+  The router now generates per-connection key material, so implementing cancellation AT THE
+  FRONTEND - look the connection up by pid/secret and drop its QUEUED message before it reaches
+  PGlite - is possible where it was not before. Most valuable during a cold-start hold, where
+  the query has not started executing.
+- **The router does not renew leases on a schedule.** `ZeroPG.validateLease()` renews on the
+  request path, which covers a database under traffic. A database that is warm but completely
+  idle past its TTL depends on the takeover path. Fine on an always-on box, worth revisiting
+  before anything long-idle.
+- **One shared PGlite session per database, so session state is shared.** Session GUCs and
+  `SET ROLE` leak between connections routed to the same database. Pre-existing and documented;
+  the router's queue preserves TRANSACTION isolation, not session isolation, and section 7
+  already says this is not a connection pooler.
+- **`maxConnections` is global, not per database.** One noisy database can consume the whole
+  budget. A per-database cap wants its own SQLSTATE and message and was not worth guessing at.
 
 ## 9. Open questions
 

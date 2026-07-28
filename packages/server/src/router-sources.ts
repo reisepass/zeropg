@@ -9,6 +9,10 @@
 // deep import rather than part of the wire-frontend barrel that @zeropg/client
 // relies on staying PGlite-free.
 
+// FencedError comes via objectstore-fs's barrel rather than @zeropg/lease
+// directly: lease is not a dependency of this package, objectstore-fs already
+// re-exports it, and adding a dependency to reach one error class is not worth
+// the extra edge in the graph.
 import { ZeroPG, type Durability } from '@zeropg/objectstore-fs'
 import type { BlobStore } from '@zeropg/blobstore'
 import type { DatabaseSource, RoutedInstance } from './warm-set.js'
@@ -40,8 +44,13 @@ export interface ZeroPGSourceOptions {
  */
 export function zeropgSource(opts: ZeroPGSourceOptions): DatabaseSource {
   return {
-    async open(): Promise<RoutedInstance> {
+    async open(onPhase): Promise<RoutedInstance> {
       const db = await ZeroPG.open({
+        // The router caps leasing and restoring separately so a hold that
+        // expires can name the phase it died in.
+        onPhase: (p) => {
+          if (p !== 'ready') onPhase?.(p)
+        },
         store: opts.store,
         durability: opts.durability ?? 'sleep',
         holder: opts.holder,

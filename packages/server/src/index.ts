@@ -2,13 +2,19 @@ export { ZeroPGServer, type ZeroPGServerOptions, type BootPhase } from './server
 export { PostgrestProcess, postgrestBootstrapSql, type PostgrestOptions } from './postgrest.js'
 export { ZeroPGRemoteClient, type ZeroPGRemoteClientOptions } from './remote-client.js'
 export { WireFrontend, type WireFrontendOptions, type InnerSocketServer } from './wire-frontend.js'
-export { WireRouter, UnknownDatabaseError, type WireRouterOptions } from './wire-router.js'
+export {
+  WireRouter,
+  UnknownDatabaseError,
+  HoldExpiredError,
+  type WireRouterOptions,
+} from './wire-router.js'
 export {
   WarmEntry,
   WarmSetFullError,
   catalogFrom,
   type Catalog,
   type DatabaseSource,
+  type OpenPhase,
   type RoutedInstance,
 } from './warm-set.js'
 export { QueryQueue, HandlerGoneError, type ProtocolEngine } from './wire-queue.js'

@@ -35,9 +35,26 @@ export interface RoutedInstance {
   pendingWrites?(): Promise<boolean>
 }
 
+/**
+ * Which part of a cold start is running. The two phases have different budgets
+ * and different fixes when they overrun - a contended lease is not a slow
+ * bucket - so they are capped separately and named in the error.
+ */
+export type OpenPhase =
+  /** Freeing a warm-set slot: draining and flushing the database being evicted.
+   *  Reported by the router itself, not by a source - a source knows nothing
+   *  about the warm set. Charged separately because a slow eviction is a slow
+   *  OTHER database, which is a third distinct thing to go wrong. */
+  | 'admitting'
+  | 'leasing'
+  | 'restoring'
+
 /** How a named database is brought into memory. */
 export interface DatabaseSource {
-  open(): Promise<RoutedInstance>
+  /** `onPhase` is optional to implement: a source that cannot distinguish the
+   *  phases simply never calls it, and the router charges the whole open to
+   *  `restoring`, which is where the seconds normally go anyway. */
+  open(onPhase?: (phase: OpenPhase) => void): Promise<RoutedInstance>
 }
 
 /** Resolve a database name to its source, or null when no such database exists

@@ -145,6 +145,20 @@ export interface ZeroPGOptions {
   seedSnapshot?: Uint8Array
   /** Local scratch directory for the datadir. Default: os.tmpdir()/zeropg. */
   scratchDir?: string
+  /**
+   * Called as boot crosses each phase boundary. The wire router needs this to
+   * hold a cold-starting connection correctly: leasing and restoring have
+   * different time budgets and different fixes when they overrun (a contended
+   * lease versus a slow bucket), so an error has to be able to name the phase
+   * it died in. Without the callback the router can only time the whole of
+   * `open()` and report "something took too long".
+   *
+   * 'leasing'   acquiring the writer lease. Fast and uncontended normally.
+   * 'restoring' lease is HELD; downloading and materializing the datadir.
+   *             This is the expensive phase, 3.5s to 11s.
+   * 'ready'     open() is about to return.
+   */
+  onPhase?: (phase: 'leasing' | 'restoring' | 'ready') => void
   /** Injectable clock (tests). */
   now?: () => number
   /** If true, skip taking the lease (single-tenant platform guarantees it).
@@ -393,6 +407,7 @@ export class ZeroPG {
     // 2) Acquire the lease, with the fencing-token floor sourced from the
     //    manifest so tokens are monotonic across the whole bucket history.
     const tokenFloor = existing ? decodeManifest(existing.bytes).fencingToken : 0
+    opts.onPhase?.('leasing')
     if (!this.noLease) {
       this.lease = new Lease(this.store, {
         holder,
@@ -414,6 +429,10 @@ export class ZeroPG {
       }
       this.bootTimings.leaseMs = performance.now() - tLease
     }
+
+    // Lease is ours (or was never taken). Everything past here is materializing
+    // the datadir, which is where the seconds go.
+    opts.onPhase?.('restoring')
 
     if (existing) {
       // Re-read AFTER the lease is ours: acquisition can wait out a previous
@@ -466,6 +485,7 @@ export class ZeroPG {
     }
 
     this.bootTimings.totalMs = performance.now() - bootStart
+    opts.onPhase?.('ready')
 
     if (this.durability === 'interval') {
       this.flushTimer = setInterval(() => {
