@@ -1,5 +1,5 @@
 // Boot the reading-list board on zeropg — the Drizzle path, which (per
-// ORM-ADAPTER-NOTES.md §"Drizzle (the natural fit)") needs NO special handling:
+// docs/ORM-ADAPTER-NOTES.md §"Drizzle (the natural fit)") needs NO special handling:
 //
 //   1. serveWire() stands up a localhost postgres:// wire over one PGlite
 //      (file:// datadir, held under the E1 lock — one writer).

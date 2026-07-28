@@ -12,7 +12,7 @@ the query path — with **no zeropg-specific code in the ORM layer**.
 
 ## Why Drizzle is the natural fit (contrast with Prisma)
 
-See [ORM-ADAPTER-NOTES.md](../../ORM-ADAPTER-NOTES.md) for the full story. The
+See [ORM-ADAPTER-NOTES.md](../../docs/ORM-ADAPTER-NOTES.md) for the full story. The
 short version:
 
 | | Drizzle | Prisma |

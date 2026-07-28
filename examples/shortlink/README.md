@@ -43,7 +43,7 @@ Open <http://localhost:8083>.
   string; everything else sees a `Client`.
 - **Boot-time, single-applier migrations** (`migrations.ts`): the instance applies
   DDL to _itself_ under the lease — the pattern from
-  [`ORM-ADAPTER-NOTES.md`](../../ORM-ADAPTER-NOTES.md), not an ORM pushing DDL over
+  [`ORM-ADAPTER-NOTES.md`](../../docs/ORM-ADAPTER-NOTES.md), not an ORM pushing DDL over
   the wire.
 - **A transactional side effect.** The redirect resolves the code and bumps
   `clicks` in one `db.transaction(...)`, so the counter can't drift from the

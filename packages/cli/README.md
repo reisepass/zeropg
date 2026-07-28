@@ -81,7 +81,7 @@ itself and gives you the same DX (edit schema → timestamped migration → appl
 entirely on PGlite, with no external Postgres.
 
 Full empirical write-up, including everything tested and ruled out, is in
-[ORM-ADAPTER-NOTES.md](../../ORM-ADAPTER-NOTES.md).
+[ORM-ADAPTER-NOTES.md](../../docs/ORM-ADAPTER-NOTES.md).
 
 ## Requirement: `prisma.config.ts` must read URLs from `process.env`
 

@@ -78,12 +78,12 @@ frameworks pay their own 20-35s on top. The fast tier:
 | app | what it is | cold start | live | source |
 |---|---|---|---|---|
 | **webhookx** | webhook gateway (Go), first needs-Redis app: valkey sidecar scales to zero with it | ~4-5s | (not public) | [examples/cloudrun/webhookx](examples/cloudrun/webhookx) |
-| **httpbin + requestbin** | our own request-echo + capture bins (Go), TTL retention built in | Go-tier | [httpbin-ui-scale-to-zero.0rs.org](https://httpbin-ui-scale-to-zero.0rs.org) | [examples/cloudrun/httpbin](examples/cloudrun/httpbin) |
-| **cocoon** | a Bluesky-compatible AT Protocol PDS (Go, GORM+pgx). Your own PDS, DB in a bucket | ~5s (rarely cold: real AT-Proto traffic keeps it warm) | [pds-scale-to-zero.0rs.org](https://pds-scale-to-zero.0rs.org) | [examples/cloudrun/pds](examples/cloudrun/pds) |
+| **httpbin + requestbin** | our own request-echo + capture bins (Go), TTL retention built in | ~4-5s | [httpbin-ui-scale-to-zero.0rs.org](https://httpbin-ui-scale-to-zero.0rs.org) | [examples/cloudrun/httpbin](examples/cloudrun/httpbin) |
+| **cocoon** | a Bluesky-compatible AT Protocol PDS (Go, GORM+pgx). Your own PDS, DB in a bucket; rarely cold in practice (live AT-Proto traffic keeps it warm) | ~5s | [pds-scale-to-zero.0rs.org](https://pds-scale-to-zero.0rs.org) | [examples/cloudrun/pds](examples/cloudrun/pds) |
 | **PrivateBin** | encrypted pastebin (PHP) | ~5s | [privatebin-scale-to-zero.0rs.org](https://privatebin-scale-to-zero.0rs.org) | [examples/cloudrun/privatebin](examples/cloudrun/privatebin) |
 | **supabase (simple demo)** | self-hosted PostgREST + GoTrue + RLS on the zeropg wire, driven by supabase-js | ~5-8s | [supabase-scale-to-zero.0rs.org](https://supabase-scale-to-zero.0rs.org) | [examples/cloudrun/supabase](examples/cloudrun/supabase) |
 | **airtable-style** | rows-as-JSONB grid app (Go + tiny SPA) | ~8s | [airtable-scale-to-zero.0rs.org](https://airtable-scale-to-zero.0rs.org) | [examples/cloudrun/airtable](examples/cloudrun/airtable) |
-| **znostr-relay** | our ~330-line NIP-01 nostr relay, no Redis, DB is the only state | fast (Go-tier) | wss://znostr-zeropg-71428757273.europe-west1.run.app | [examples/cloudrun/nostr](examples/cloudrun/nostr) |
+| **znostr-relay** | our ~330-line NIP-01 nostr relay, no Redis, DB is the only state | ~4-5s | wss://znostr-zeropg-71428757273.europe-west1.run.app | [examples/cloudrun/nostr](examples/cloudrun/nostr) |
 
 And the "it also runs" tier: heavyweight Node/Next.js apps that work unmodified but pay
 their own boot on every wake. They are compatibility proof, not showcases:

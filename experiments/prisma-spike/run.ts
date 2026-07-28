@@ -6,7 +6,7 @@
 // pglite-socket wire. It gets through SSL (with sslmode=disable) and auth (user
 // postgres), then the engine's migration workflow — multiple sessions, advisory
 // locks, a shadow-DB reset, introspection — trips pglite-socket's single-backend
-// multiplexing and the connection drops (P1017). This matches ORM-ADAPTER-NOTES:
+// multiplexing and the connection drops (P1017). This matches docs/ORM-ADAPTER-NOTES:
 // the migrate engine is the blocker, the query path is not.
 //
 // RESOLUTION (proven here): the ORM-notes pattern. Prisma AUTHORS the schema

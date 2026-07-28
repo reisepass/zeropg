@@ -3,7 +3,7 @@
 // the proven path: Prisma authors the schema, zeropg's single writer applies the
 // committed migrations at boot (via @zeropg/cli's migrateDeploy()), and the
 // Prisma client queries over the wire via @prisma/adapter-pg (see
-// ORM-ADAPTER-NOTES.md, verified 2026-06-21).
+// docs/ORM-ADAPTER-NOTES.md, verified 2026-06-21).
 //
 // Regenerate the client, then author the next migration with the zeropg CLI
 // (which needs no external Postgres — it uses a throwaway PGlite shadow):
