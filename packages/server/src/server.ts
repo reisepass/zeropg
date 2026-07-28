@@ -337,20 +337,60 @@ export class ZeroPGServer {
     return this.json(res, 404, { error: 'not found' })
   }
 
+  /**
+   * POST /sql body:
+   *   { sql: string, params?: unknown[], multi?: boolean }
+   *
+   * `params` are bound server-side ($1/$2 ...), which is what every repository
+   * layer emits and the only safe way to pass user values: inlining them into
+   * the string is an injection hazard.
+   *
+   * `multi: true` routes to exec() (simple protocol), the only way to send
+   * several statements in one request, which is what a migration file is.
+   * It is an EXPLICIT flag rather than a sniff of the SQL text: a heuristic
+   * looking for semicolons guesses wrong on a semicolon inside a string literal
+   * or a function body, and a silently mis-routed migration is worse than a
+   * clear error. exec() returns no rows, so the response says so via
+   * `multi: true` and omits `rows` rather than faking an empty array.
+   * The two are mutually exclusive: the simple protocol cannot bind parameters.
+   */
   private async sql(req: IncomingMessage, res: ServerResponse) {
     if (!this.db) return this.json(res, 503, this.readinessBody())
     const raw = (await this.readBody(req)).toString()
     try {
-      const { sql } = JSON.parse(raw) as { sql: string }
+      const { sql, params, multi } = JSON.parse(raw) as {
+        sql: string
+        params?: unknown[]
+        multi?: boolean
+      }
+      if (multi && params && params.length > 0) {
+        return this.json(res, 400, {
+          error:
+            'multi: true runs the simple protocol, which cannot bind parameters. ' +
+            'Send params without multi, or split the statements into one request each.',
+        })
+      }
       const t0 = performance.now()
-      const r = await this.db.query(sql)
       // DDL changes the schema PostgREST introspected at startup; nudge it to
       // reload its cache so new tables/columns appear under /rest immediately.
-      if (this.pgrest && /\b(create|alter|drop|grant|revoke|comment)\b/i.test(sql)) {
-        this.pgrest.reloadSchema()
+      const isDdl = /\b(create|alter|drop|grant|revoke|comment)\b/i.test(sql)
+      if (multi) {
+        await this.db.exec(sql)
+        if (this.pgrest && isDdl) this.pgrest.reloadSchema()
+        return this.json(res, 200, {
+          // No rows by construction: exec() is the simple protocol. Stated
+          // explicitly so a caller does not read an empty array as "0 results".
+          multi: true,
+          rows: null,
+          ms: Math.round((performance.now() - t0) * 100) / 100,
+          durability: this.db.durabilityMode,
+        })
       }
+      const r = await this.db.query(sql, params)
+      if (this.pgrest && isDdl) this.pgrest.reloadSchema()
       return this.json(res, 200, {
         rows: r.rows,
+        rowCount: r.affectedRows ?? r.rows.length,
         ms: Math.round((performance.now() - t0) * 100) / 100,
         execMs: Math.round(r.execMs * 100) / 100,
         commit: r.commit,
@@ -495,6 +535,15 @@ later; this HTTP-only platform exposes the faces above.
       if (this.db) await this.db.close() // sleep-mode flush + lease release
     } catch (e) {
       this.log('shutdown-flush-failed', { error: e instanceof Error ? e.message : String(e) })
+    }
+    // Close the public HTTP listener last, so /ready keeps answering while the
+    // flush above runs. Without this the listener holds the event loop open and
+    // an embedding process (a test, a fleet tool) hangs after shutdown()
+    // resolves; the signal handlers only got away with it by calling exit().
+    if (this.http) {
+      const http = this.http
+      this.http = null
+      await new Promise<void>((res) => http.close(() => res()))
     }
   }
 
