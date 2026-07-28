@@ -1,0 +1,66 @@
+# E11 baseline: does a public `postgres://` with scale-to-zero actually work on
+# Fly.io? One Machine, raw public TCP on 5432, stopped when idle.
+#
+# The two settings that carry the whole experiment:
+#   [[services.ports]] port = 5432 with NO handlers -> Fly forwards raw TCP
+#     untouched. No TLS termination, no HTTP parsing. libpq talks straight to
+#     pglite-socket. Cloud Run cannot do this at any price, which is the entire
+#     reason the wire-router shim exists.
+#   auto_stop_machines = "stop" + min_machines_running = 0 -> the Machine is
+#     STOPPED when idle and costs nothing, and the Fly proxy starts it again on
+#     an inbound connection. Whether that start HOLDS the connection or refuses
+#     it is the question; see docs/EXPERIMENTS-QUEUE.md E11 step 2.
+#
+# Storage is a Tigris bucket provisioned fresh for this experiment. The
+# credentials in .tigrisfly.env are NOT used: they were exposed in a session
+# transcript on 2026-07-28 and are considered compromised pending rotation.
+
+app = "zeropg-e11-fly"
+primary_region = "iad" # Tigris home region, so bucket latency is not the variable
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # Bind the wire server to all interfaces so the Fly proxy can reach it. The
+  # loopback default exists for the HTTP-only platforms and would make 5432
+  # unreachable here.
+  ZEROPG_WIRE_HOST = "0.0.0.0"
+  ZEROPG_WIRE_PORT = "5432"
+  ZEROPG_PREFIX = "e11/baseline"
+  ZEROPG_DURABILITY = "sleep"
+  ZEROPG_POSTGREST = "off"
+  APP_LABEL = "zeropg E11 Fly.io baseline (raw public wire, scale-to-zero)"
+
+# The experiment: real Postgres wire protocol on public TCP 5432.
+# handlers = [] is load-bearing. Any handler here would put a Fly proxy layer in
+# the path and the test would no longer be about raw TCP.
+[[services]]
+  protocol = "tcp"
+  internal_port = 5432
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [[services.ports]]
+    port = 5432
+    handlers = []
+
+# HTTP control face (/wake, /ready, POST /sql, /metrics). Not part of the
+# measurement; it is here so the Machine's state can be inspected out of band.
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
