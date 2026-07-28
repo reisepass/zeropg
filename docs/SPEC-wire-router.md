@@ -57,8 +57,39 @@ Three options, and on GCP only one works:
 3. **Proxy raw TCP** to a platform that accepts it - Fly.io, Azure Container Apps. Simplest,
    but not available on the flagship platform.
 
-A router without (1) can accept your connection and then do nothing useful with it on GCP.
-Do not ship the router without the bridge.
+> **SETTLED 2026-07-28 by experiment E9: option (1) is DEAD. Do not build the bridge.**
+>
+> An open WebSocket pins a Cloud Run instance awake and billable at exactly **1:1**. Measured
+> on a deployed service with `min-instances=0`: a 301-second idle connection carrying zero
+> bytes produced **301.9 billable seconds**, `instance_count` pinned at 1 for the whole hold
+> and 0.0 the bucket after close. The instance is not merely alive, it has **full CPU** - a
+> server-side tick counter advanced exactly 60 ticks per 60 seconds of wall clock with no
+> traffic on the socket. There is no throttled-but-open state to exploit.
+>
+> So a tunnelled Postgres connection is an always-on billed instance for as long as the client
+> stays connected. Scale-to-zero collapses entirely, and the shim's whole reason for existing
+> goes with it.
+>
+> **Independently fatal even if billing were free:** the Cloud Run request timeout is a hard
+> cap on connection lifetime. The `--timeout=300` service tore the connection down at 300991ms
+> with close code **1006** (abnormal, `wasClean: false`), platform-initiated. The maximum is
+> **3600 seconds, enforced at the API** (`--timeout=3601` is rejected outright). Every Postgres
+> connection through such a tunnel would be severed at 60 minutes with an abnormal close, and
+> pools would churn against it forever.
+>
+> Full measurements in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md) E9.
+>
+> **What survives.** Option (2), a local warm set, is untouched - it never involved Cloud Run.
+> Option (3) is untouched: Fly.io and Azure Container Apps accept real TCP, so a router fronting
+> those needs no tunnel at all. And the HTTP `/sql` face on Cloud Run is untouched, because
+> those are short requests rather than held connections.
+>
+> **What this changes about the product.** A router on GCP can host databases locally or front
+> non-GCP backends, but it cannot make Cloud Run backends reachable over `postgres://` at a
+> price anyone would pay. If public `postgres://` matters, the backends move off Cloud Run.
+
+Superseded framing, kept for the record: the original spec said a router without (1) can accept
+your connection and then do nothing useful on GCP, and must not ship without the bridge. E9 shows the bridge itself is the non-viable part.
 
 ## 3. Routing requires parsing the startup packet
 
