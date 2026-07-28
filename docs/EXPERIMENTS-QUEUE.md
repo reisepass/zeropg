@@ -198,6 +198,28 @@ state to exploit. This matches the documented behaviour ("A Cloud Run instance t
 WebSocket connection is considered active, so CPU is allocated"), and the measurement makes it a
 fact rather than a doc claim.
 
+**Confirmed over 20 minutes, ended by the client rather than the platform.** The 300s run above
+is the clearer teardown evidence, but it is short enough that someone could argue the instance
+simply had not been reaped yet. So the `--timeout=3600` service was given the same idle socket
+for a full 20 minutes:
+
+```
+request log:   status 101   latency 1199.975145s   /wire
+client:        {"event":"close","heldMs":1199961,"code":1005,"wasClean":true}
+
+billable_instance_time: twenty consecutive 60.2-60.4 second buckets,
+                        17:23 12.46, 17:24 11.70, then 0.0 from 17:25 onward
+                        TOTAL 1201.6 billable seconds for a 1200s hold
+server ticks:  137 -> 1276 across twenty one-minute heartbeats, no gap
+```
+
+**1201.6 billed seconds for 1200 seconds of silence**, and the ticks advance ~60 per minute for
+the entire twenty minutes with no throttling interval anywhere. This run closed with code
+**1005, `wasClean: true`** - our client hung up deliberately - which makes the contrast with the
+300s run's platform-initiated 1006 exact rather than inferred. Billing then decays over roughly
+two buckets and sits at 0.0. Idle time does not accumulate toward scale-down while a socket is
+open; the hold is what keeps the instance alive, and only closing it releases the instance.
+
 ### The request timeout is a hard cap on connection lifetime
 
 The `--timeout=300` connection died at **300991ms** with WebSocket close code **1006** (abnormal,
