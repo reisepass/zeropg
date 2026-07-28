@@ -147,3 +147,38 @@ already; this adds the VM column.
 
 **Decides.** What we tell people the product is for, and at what fleet size we should stop
 recommending it.
+
+---
+
+## E10. Does a per-BURST WebSocket tunnel keep the shim viable? **OPEN, and it is the one that matters**
+
+**Why.** [E9](#e9-does-an-open-websocket-pin-a-cloud-run-instance-awake-and-billable-done---yes-11)
+answered a narrower question than it appeared to: it measured a tunnel **held open and idle**,
+because that is what the spec specified. It was briefly over-read as killing the tiny-VM shim
+outright. It does not.
+
+A shim terminates the client's connection, so client-connection lifetime and backend-tunnel
+lifetime are independent. The client holds `postgres://` open for hours; the router opens a
+tunnel only when a query arrives and closes it when the burst ends. E9's own control makes this
+look good: **billing stopped the instant the socket closed**, the next 60s bucket read `0.0`,
+no idle tail. A burst tunnel would be billed for the burst and nothing more, which beats the
+HTTP face where Cloud Run's 15-minute reaper bills 20 minutes for a 5-minute session.
+
+**The open question is latency, not cost or correctness.** Closing the tunnel may let the
+instance scale to zero, in which case the next burst pays a full cold start (3.5s to 11s). Or
+Cloud Run may keep it warm-but-unbilled for some window, in which case bursts are cheap and
+fast. E9 measured `billable_instance_time`, not instance lifetime, so nothing here is known.
+
+**Setup.** Reuse `experiments/e9-ws-pin/`. Open a tunnel, send a trivial query, close it, wait
+N seconds, reopen and time the round trip. Sweep N across roughly 5s, 30s, 60s, 300s, 900s.
+Record for each: time-to-first-byte on the reopen, and whether `billable_instance_time` accrued
+during the gap. That distinguishes "instance stayed warm and free", "instance stayed warm and
+billed" and "instance died, full cold start".
+
+**Also test the transaction rule**, since it is the correctness half: drive a client through
+`BEGIN; ...; COMMIT` with an idle gap in the middle and confirm the router refuses to close the
+tunnel while `ReadyForQuery` reports `T`, and does close it on `I`.
+
+**Decides.** Whether the tiny-VM shim in front of Cloud Run backends is viable at all, and
+therefore whether step 4 of the build order in [SPEC-wire-router.md](SPEC-wire-router.md) gets
+built. Steps 1-3 do not depend on it.

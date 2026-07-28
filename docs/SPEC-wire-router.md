@@ -57,7 +57,13 @@ Three options, and on GCP only one works:
 3. **Proxy raw TCP** to a platform that accepts it - Fly.io, Azure Container Apps. Simplest,
    but not available on the flagship platform.
 
-> **SETTLED 2026-07-28 by experiment E9: option (1) is DEAD. Do not build the bridge.**
+> **NARROWED 2026-07-28 by experiment E9. A HELD tunnel is dead. A per-burst tunnel is not
+> tested and is probably the right design.**
+>
+> An earlier revision of this callout said "option (1) is DEAD, do not build the bridge". That
+> overstated the result. E9 tested a tunnel **held open and idle**, because that is what
+> section 2 specified. It says nothing about a tunnel opened per query burst and closed
+> immediately, which is the obvious fix and which the same measurement makes look attractive.
 >
 > An open WebSocket pins a Cloud Run instance awake and billable at exactly **1:1**. Measured
 > on a deployed service with `min-instances=0`: a 301-second idle connection carrying zero
@@ -84,9 +90,43 @@ Three options, and on GCP only one works:
 > those needs no tunnel at all. And the HTTP `/sql` face on Cloud Run is untouched, because
 > those are short requests rather than held connections.
 >
-> **What this changes about the product.** A router on GCP can host databases locally or front
-> non-GCP backends, but it cannot make Cloud Run backends reachable over `postgres://` at a
-> price anyone would pay. If public `postgres://` matters, the backends move off Cloud Run.
+> **What this changes about the product.** A router that holds one tunnel per client connection
+> cannot make Cloud Run backends reachable over `postgres://` at a price anyone would pay. That
+> specific design is out.
+>
+> ### The per-burst tunnel, which E9 did not test and which the same numbers favour
+>
+> **The point of a shim is that it terminates the client connection.** Client-connection
+> lifetime and backend-tunnel lifetime are therefore independent. The client can hold a
+> `postgres://` session open for hours while the router opens a tunnel only when a query
+> arrives and closes it as soon as the burst ends.
+>
+> E9's own control measurement is the encouraging part: **billing stopped the instant the socket
+> closed** - the 60s bucket after close read `0.0`, with no idle tail at all. So a burst tunnel
+> is billed for the burst and nothing else, which is *better* than the HTTP face, where Cloud
+> Run's 15-minute reaper bills 20 minutes for a 5-minute session.
+>
+> The objection recorded in E9 is that this "gives up session state, transactions, and the
+> single-session model PGlite requires". Two of those three are weaker than they look **because
+> of** PGlite's constraints rather than in spite of them:
+>
+> - **Session state**: PGlite is one shared session for every connection. Per-connection session
+>   isolation does not exist today - session GUCs and `SET ROLE` already leak across connections
+>   and that is documented. There is little per-connection state to lose that was not already
+>   shared.
+> - **Transactions**: a real problem, and a solvable one. The router parses the protocol, so it
+>   sees the `ReadyForQuery` status byte (`I` idle, `T` in transaction, `E` failed transaction).
+>   Rule: only close the tunnel on `I`. Never mid-transaction.
+> - **Named prepared statements**: genuinely lost across a tunnel close. They already collide
+>   with `42P05` on the shared session, so the population that depends on them is blocked today
+>   regardless.
+>
+> **The real unknown is latency, not correctness.** If closing the tunnel lets the instance
+> scale to zero, the next burst pays a full cold start (3.5s to 11s). If Cloud Run keeps the
+> instance warm-but-unbilled for a while, it does not. E9 measured billing, not instance
+> lifetime, so this is open. Tracked as **E10** in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md).
+>
+> Until E10 runs, do not conclude either way. Steps 1-3 of the build order do not depend on it.
 
 Superseded framing, kept for the record: the original spec said a router without (1) can accept
 your connection and then do nothing useful on GCP, and must not ship without the bridge. E9 shows the bridge itself is the non-viable part.
