@@ -28,6 +28,31 @@ Build it once. Pick the box later. Do not fork the codebase for the two shapes.
 > nearly as much resident memory as a medium one. And a `t4g.nano` cannot host zeropg at all.
 > Tracked as E8 in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md).
 
+## 0. Scope: this is optional, and most people will not need it
+
+**Decided 2026-07-28.** The shim exists for exactly one situation: **you want a public
+`postgres://` URL and your backends are on Cloud Run.** Everything else has a simpler answer.
+
+| what you want | what you need | shim? |
+|---|---|---|
+| app talks to its own database, Cloud Run | same container, second process, or a sidecar on loopback | **no** |
+| several databases warm on one box | the router, sections 3-6 of this spec | **no** |
+| public `postgres://`, backends on Fly.io or Azure Container Apps | the wire frontend with TLS and SCRAM. Those platforms accept real public TCP, so clients dial them directly | **no** |
+| public `postgres://`, backends on Cloud Run | the shim, plus the per-burst tunnel of section 2 | **yes** |
+
+Cloud Run's refusal of inbound raw TCP is the only thing the shim works around. It is not a
+general-purpose component and should not be presented as one, or made a prerequisite for
+anything else in the roadmap.
+
+**Consequence for priority.** The router work in sections 3-6 serves the always-on-box case,
+which the cost model favours from roughly the second or third database onward. That has more
+users than the shim does. Build order in section 8 already reflects this: steps 1-3 stand
+alone and involve no Cloud Run at all.
+
+> **Parked idea, not in scope.** An always-on box in the path could do more than wake and
+> route - buffering or batching writes is the obvious one. Recorded so it is not lost, and
+> deliberately not designed here.
+
 ## 1. Why this exists
 
 zeropg's flagship platform cannot hand out a `postgres://` URL. Cloud Run accepts HTTP/1.1,
