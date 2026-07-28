@@ -297,7 +297,111 @@ Build-vs-adopt is also open. **`pg-gateway`** (supabase-community, TypeScript, a
 wire server designed to front PGlite, believed to support TLS and SASL) may make this an
 adoption rather than a build. Verify existence, license, and maturity before scoping a build.
 
-## 7. OPEN: the credential model
+## 7. DECIDED 2026-07-28: one credential per instance, and store the verifier not the password
+
+> Full design in [WIRE-AUTH-RESEARCH-2026-07-28.md](WIRE-AUTH-RESEARCH-2026-07-28.md),
+> section "DESIGN: CREDENTIAL AND AUTHENTICATION MODEL". Summary of the decisions:
+
+**The bearer token is redundant. Delete it as a per-instance concept.** A zeropg instance is
+one database, one role, one writer. The wire, `POST /sql` and `POST /flush` all confer
+*exactly the same authority*: arbitrary superuser SQL. Two secrets guarding one authority is
+not defence in depth, it is two things to leak and two to rotate. Collapse to the Postgres
+role password: the wire verifies it with SCRAM-SHA-256, HTTP verifies the same password via
+`Authorization: Basic postgres:<pw>` (also accept `Bearer <pw>`, because agents reach for it).
+Neon is the precedent and it is decisive - their HTTP `/sql` takes a `Neon-Connection-String`
+header carrying the same role password as the wire.
+
+**The token survives only at fleet scope**, in the console and inspector, where the principal
+is a human in a browser spanning N databases and there is no per-database credential to
+present. Rename `INSPECTOR_TOKEN` so nobody confuses it with instance auth.
+
+### The correction that rescues the bucket idea: store the SCRAM verifier
+
+My "anyone with bucket read already has the whole database" argument **fails four ways if you
+store cleartext**:
+
+1. Bucket read gives you the database *as of the last commit*, offline, with no lease. A live
+   password gives you **write** to the primary. Storing cleartext escalates read into write.
+2. The inspector service account holds bucket read on **every** fleet prefix. Cleartext there
+   converts a deliberate asymmetry into fleet-wide write compromise - literally the line
+   `docs/EDITOR-AUTH-SECURITY.md` says not to cross.
+3. `fleet export`, `gsutil cp -r`, archives and backups are designed to carry data, not
+   credentials, and have different retention. A dump handed to a contractor would contain the
+   production password.
+4. GCS uniform bucket-level access has no per-prefix IAM, and `scripts/deploy.sh` puts every
+   service in **one bucket** under a per-service prefix. A single `objectViewer` grant is
+   every instance's password.
+
+**So store the SCRAM verifier, never the password.** `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`
+is a one-way image, so bucket read grants nothing new against a 192-bit random secret, and the
+original argument is restored. One stored artifact serves both faces: given cleartext from
+Basic you recompute SaltedPassword to ClientKey to H(ClientKey) and constant-time compare
+against StoredKey. User-supplied passwords are never written at all.
+
+### Provisioning precedence
+
+1. `ZeroPGServerOptions.password` (code wins)
+2. `ZEROPG_PASSWORD_FILE` (K8s / Docker / Cloud Run secret-as-file)
+3. `ZEROPG_PASSWORD` env
+4. bucket-managed `auth.json` at the prefix root
+5. `ZEROPG_AUTH=trust`, explicit only
+
+If 1-3 resolve, compute the verifier and CAS it into `auth.json` so env and bucket cannot
+drift. If none resolve and the store is writable, mint 192 bits, PUT `auth.json` with
+if-none-match (create-only CAS, the same primitive as the manifest), and write the cleartext
+to a **single-read claim object** that `zeropg fleet credential <name>` GETs-then-DELETEs,
+expiring after 24h. **Never print the password to stdout** - Cloud Logging is readable by
+`roles/logging.viewer` for 30 days. Note `collectGarbage` only walks `generations/`, so
+root-level `auth.json` is safe from GC.
+
+Rejected outright: platform secret-manager SDKs inside the server (every platform is a
+dependency plus an IAM surface, and Cloud Run and K8s already project secrets into env or
+files), and derivation from bucket credentials (the remote client has none, and on Cloud Run
+the bucket credential is a rotating metadata OAuth token with no stable long-lived key).
+
+### Fail-closed matrix
+
+| bind | credential | behavior |
+|---|---|---|
+| loopback | none | start in trust mode, one WARN. Preserves every current example and the PostgREST sidecar |
+| loopback | set | enforced everywhere except the always-open health tier |
+| non-loopback | none | **refuse to start, exit 78**, naming the env var and the escape |
+| non-loopback, HTTP | set | start (the platform terminates TLS); reject credentialed requests arriving over cleartext |
+| non-loopback wire | set, no TLS | **refuse.** SCRAM protects the password but not the data. Neon's posture, not Supabase's |
+| any non-loopback | `ZEROPG_AUTH=trust` | refuse |
+
+`wireHost=0.0.0.0` with no credential is the worst case in the system and becomes a hard
+refusal. The single escape is `ZEROPG_ALLOW_INSECURE_BIND=i-understand` - **a value, not a
+boolean**, so it cannot be set by typo and it greps. When it fires, `/ready` and the landing
+page carry `"insecure": true` and the fleet CLI renders it red.
+
+**Always unauthenticated:** `/up`, `/healthz`, `/livez`, `/ready`, `/wake`. They are the
+scale-to-zero primitive - a cold client must reach them before it has anything. `bootError` is
+redacted to a code when unauthenticated. `/metrics` and `/flush` require the credential.
+
+`--allow-unauthenticated` stays in `deploy.sh`: public one-click URLs are the product, and the
+fix is the app-level credential, not IAM.
+
+### Rotation
+
+`auth.json` carries `{current, previous, previousExpiresAt, epoch}`; both verifiers
+authenticate during a 1h overlap. Instances re-read at boot, and they die constantly so most
+pick it up for free. Writing `auth.json` needs bucket **write** IAM, which the operator has
+and the read-only inspector does not, so the existing IAM boundary does the authorization -
+no new trust boundary, no control plane. Rotation must never roll a sleep-durability instance
+without `POST /flush` first. Recovery of a lost password is a reset, never a reveal.
+
+### The regression net
+
+`zeropg fleet doctor` actively probes every service for an unauthenticated `POST /sql` and a
+wrong-password wire accept. That is what proves the MongoDB default is actually gone, rather
+than believed gone.
+
+---
+
+Original open framing follows, superseded by the above.
+
+## 7b. Superseded: the credential model as it stood before the design landed
 
 The design sketched and provisionally agreed, subject to the research still running:
 
