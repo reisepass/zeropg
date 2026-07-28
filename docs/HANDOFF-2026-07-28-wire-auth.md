@@ -196,10 +196,23 @@ Four fixes dispatched, in priority order if context runs short (the agent was at
    `packages/client/src/remote.ts` is gone.
 2. **DONE, same commit.** `POST /sql` accepts multi-statement SQL via `db.exec()`
    (`zeropg.ts:1242`) behind an explicit `multi: true` flag, not SQL sniffing.
-3. Connection-cap rejection becomes a real `ErrorResponse` (SQLSTATE `53300`) emitted from
-   WireFrontend, replacing pglite-socket's raw `"Too many connections\n"` write. Plus
-   `maxConnections` as an option accounting for PostgREST's pool.
-4. README connection ladder corrected so `gs://` is not advertised as working.
+3. **DONE, commit `059842f`, verified with real psql.** WireFrontend now enforces the
+   connection cap itself and answers with a real `ErrorResponse`: severity FATAL, SQLSTATE
+   `53300 too_many_connections`, message naming the current limit and the option that raises
+   it. The check runs after SSL negotiation, when the client is ready to parse a message
+   rather than a negotiation byte. The inner server gets one extra slot so it never hits its
+   own limit first and falls back to the raw string. Slots release on socket close so the cap
+   does not leak under churn. psql now prints
+   `FATAL: too many connections for this zeropg instance (limit 2). Close idle connections,
+   lower your pool size, or raise the maxConnections option.` and node-postgres reports
+   `code 53300` instead of `undefined`.
+4. **DONE, commit `257e09a`.** Connection ladder states which rungs work today and which do
+   not.
+
+**Outstanding, not done:** accept `query` as an alias for `sql` in the `/sql` body, so callers
+reaching for Neon's shape work too. The agent hit its context limit first. Roughly two lines
+in the destructure at `packages/server/src/server.ts`, prefer `sql` when both are present,
+clear error when neither is given, and mention both spellings in the doc comment.
 
 Commit `d071f75` is verified by `packages/client/test/remote-sql.test.ts`, 11 assertions
 against a real `ZeroPGServer` over HTTP: multi-statement migration, parameterized
