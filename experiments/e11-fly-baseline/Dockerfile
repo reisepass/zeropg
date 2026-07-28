@@ -15,6 +15,7 @@ COPY image-package.json package.json
 RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 
 COPY dist/server.mjs ./server.mjs
+COPY dist/prebind.mjs ./prebind.mjs
 COPY dist/seed.tar.gz ./seed.tar.gz
 
 ENV NODE_ENV=production
@@ -23,4 +24,7 @@ ENV ZEROPG_POSTGREST=off
 EXPOSE 8080
 EXPOSE 5432
 
-CMD ["node", "server.mjs"]
+# prebind.mjs owns public 5432 from the first tick and holds clients during the
+# PGlite restore, then splices them to the real wire on an internal port. See
+# the file header for the measured race this exists to close.
+CMD ["node", "prebind.mjs"]

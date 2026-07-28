@@ -511,7 +511,7 @@ re-scheduling penalty that a 100ms TTFB measurement would hide.
 
 ---
 
-## E11. Fly.io baseline: does a public `postgres://` with scale-to-zero actually work? **OPEN, unblocked**
+## E11. Fly.io baseline: does a public `postgres://` with scale-to-zero actually work? **DONE - YES, after fixing a race that is ours**
 
 **Why.** Fly.io forwards real public TCP (`[[services.ports]] port = 5432, handlers = []`) and
 stops idle Machines (`auto_stop_machines` / `auto_start_machines`, `min_machines_running = 0`).
@@ -546,6 +546,180 @@ theater. Test `sslmode=require`, `verify-full` against a real cert, and a wrong 
 **Decides.** Whether the product's public-`postgres://` story is "deploy to Fly" rather than
 "run a shim in front of Cloud Run". If Fly passes, the shim drops to one row of the scope table
 in SPEC-wire-router.md section 0 and stays there.
+
+### Result, 2026-07-28. It works, and the one thing that broke was our code, not Fly's
+
+`experiments/e11-fly-baseline/`, app `zeropg-e11-fly`, one `shared-cpu-1x` / 1GB Machine in
+`iad`, dedicated IPv4 `37.16.12.130`, storage a **freshly provisioned** Tigris bucket
+(`zeropg-e11-bucket`). The credentials in `.tigrisfly.env` were deliberately not used; they were
+exposed in a session transcript on 2026-07-28 and are treated as compromised.
+
+Machine config as deployed, read back from the API rather than from `fly.toml`:
+
+```
+internal_port 5432  autostop True  autostart True  min_running 0
+   port 5432  handlers None          <- raw TCP, no proxy layer in the path
+internal_port 8080  autostop True  autostart True  min_running 0
+   port 80  handlers ['http'] ; port 443 handlers ['tls','http']
+```
+
+**Step 1: it genuinely stops.** After ~10 minutes idle, unprompted:
+
+```
+21:07:41 proxy: App zeropg-e11-fly has excess capacity, autostopping machine 0804045bd07668.
+               0 out of 1 machines left running (region=iad, process group=app)
+21:07:41 app:   {"event":"shutdown","signal":"SIGINT","pendingFlush":false}
+21:07:42 app:   [656.932940] reboot: Restarting system
+21:07:44        state: stopped
+```
+
+A stopped Machine bills only for its root volume, not CPU or RAM. `min_machines_running = 0`
+held: zero machines left running, and the app stayed addressable.
+
+**Step 2, the whole question: the connection is HELD, not refused.** TCP connects in ~30ms even
+against a stopped Machine - the Fly proxy accepts immediately and boots the VM behind the held
+socket. This is the thing Cloud Run cannot do at any price, and it is the E1 counterpart passing.
+
+But on the first pass **psql failed 3 times out of 3**, at ~10s:
+
+```
+psql: error: connection to server at "37.16.12.130", port 5432 failed:
+      server closed the connection unexpectedly
+real 9.979s
+```
+
+while the raw-wire probe succeeded twice and failed once. Mixed results from identical
+conditions, which is the signature of a race rather than a platform limit. The proxy logs name
+it exactly:
+
+```
+21:12:20  proxy: Starting machine
+21:12:22  proxy: machine started in 1.37s              <- VM alive in 1.4s
+21:12:27  proxy: waiting for machine to be reachable on 0.0.0.0:5432 (waited 5.27s so far)
+21:12:30  proxy: [error] failed to connect to machine: gave up after 15 attempts (in 8.07s)
+21:12:30  app:   {"event":"wire-up","port":5432}       <- we bind ~0.5s too late
+```
+
+versus the run that worked: `machine became reachable in 8.468s`. **The Fly proxy waits about
+8.4 seconds for the internal port. `ZeroPGServer` binds 5432 only after the PGlite restore
+(~4.2s), and the total lands either side of that budget essentially at random - the two outcomes
+above are ~100ms apart.** Nothing about Fly is at fault; our server is simply not listening yet.
+
+**The fix, and proof.** `prebind.mjs` binds the public port in the process's first tick, parks
+arriving clients (buffering their bytes, replying nothing) while the restore runs, then splices
+them onto the real wire on an internal port. That is the spec's own "hold the connection during
+a cold start" ([SPEC-wire-router.md](SPEC-wire-router.md) section 4) moved one layer out:
+
+```
+{"prebind":true,"event":"public-port-bound","port":5432,"sinceStartMs":32}
+proxy: machine became reachable in 3.299229061s          <- was 8.4s, now 3.3s
+{"prebind":true,"event":"client-parked","parked":1,"sinceStartMs":407}
+{"prebind":true,"event":"inner-wire-ready","sinceStartMs":5480,"parked":1}
+{"prebind":true,"event":"client-spliced","heldMs":5074}  <- client held 5.1s, then served
+```
+
+After the fix, **6 cold connections out of 6 succeeded, psql included**, with no `gave up` line
+anywhere in the logs:
+
+```
+                       raw wire probe        psql (libpq, DEFAULT sslmode)
+   before the fix      10.3s / 10.4s / drop  FAIL / FAIL / FAIL  (~10s each)
+   after  the fix      10.57s/10.26s/10.30s  10.47s / 10.57s / 10.56s
+```
+
+**Step 3: connect-to-first-row.** Phase-split by `connect-timing.mjs`, which speaks the wire
+directly so psql's own startup does not contaminate the number:
+
+```
+                 TCP     SSL-neg    startup    query     TOTAL
+  cold (stopped) 30ms    ~10.0s     ~140ms     ~135ms    10.3-10.6s
+  warm           29ms     236ms      130ms      129ms    0.52-0.56s
+```
+
+The cold path is ~10.5s, of which ~4.2s is the PGlite restore from Tigris and the rest is VM
+start plus the proxy's own retry cadence. The warm path is ~0.55s, and ~265ms of that is
+round-trip latency from this box to `iad` rather than server time. Both are dominated by things
+that are not the database.
+
+**libpq's default `sslmode` works with no query-string workaround at all**, which is the part
+that makes this a real `postgres://` story:
+
+```
+$ psql "postgres://postgres@37.16.12.130:5432/postgres" -c "select version()"
+ PostgreSQL 18.3 (PGlite 0.5.4) on wasm32-unknown-linux-gnu, ... 32-bit
+```
+
+The `WireFrontend` answers `SSLRequest` with `N` and libpq falls back to plaintext. No
+`?sslmode=disable`, which every previous zeropg deployment required.
+
+**Durability held across every stop/start.** A row written through the raw wire before the
+first autostop was still there after ~6 stop/start cycles, with the restore reporting
+`snapshotBytes: 5158807, fresh: false` each time.
+
+### Step 4: the bucket is protected. The CLIENT is not. This is the one to fix before shipping.
+
+`min_machines_running` is a floor, not a ceiling, so a second Machine was cloned deliberately
+while the first was serving. The lease behaved exactly as designed:
+
+- The second Machine blocked on the lease for **25.6 seconds** (`leaseMs: 25621`) rather than
+  opening the database immediately, then took over once the 60s TTL let it.
+- The first Machine, now stale, was **fenced at commit**, repeatedly and permanently:
+
+```
+{"event":"wire-flush-failed","reason":"timer",
+ "error":"writer fenced: lease with token 2 is no longer ours (manifest CAS failed at commit)"}
+```
+
+**So the bucket cannot be corrupted by a second Machine. That is the guarantee, and it holds.**
+
+**But a client can still be served by the loser.** With both Machines up, an `INSERT` sent to
+the stale one was accepted locally and returned a successful result to the caller:
+
+```
+stale machine 1:  {"rows":[{"id":35}],"rowCount":1,"ms":6.72}       <- reported SUCCESS
+real lease holder: id 1, id 34 only                                 <- id 35 is not there
+```
+
+and a plain `psql` to the public IP was routed by the Fly proxy to that stale Machine, so the
+phantom row was visible to a normal client. The write is fenced at flush and will never reach
+the bucket, so it is silently lost. Under `durability: "sleep"` the acknowledgement happens
+before the commit that gets fenced, which means **the fence protects storage integrity but does
+not protect the client from a false success**.
+
+This is not a Fly defect - it is what happens when two Machines exist and only one can hold the
+lease. It matters here because Fly's proxy will happily load-balance across both. Concretely,
+before this shape ships: `--ha=false` on every deploy is necessary but not sufficient (nothing
+stops a later `clone`, a rolling deploy, or an autoscale from making a second), and a fenced
+writer must refuse *new connections and queries* rather than only failing its flush. The
+cheapest correct behaviour is for a fenced instance to close its wire listener and exit, so the
+proxy stops routing to it.
+
+### What it means for the design
+
+**Answer: yes. A public `postgres://` with scale-to-zero works on Fly, and no shim is needed.**
+
+Clients dial the backend directly at libpq defaults, idle costs nothing, and the cold path is
+~10.5s held rather than refused. That is the row of the scope table in
+[SPEC-wire-router.md](SPEC-wire-router.md) section 0 that reads "public `postgres://`, backends
+on Fly.io or Azure Container Apps -> no shim", and it is now measured rather than assumed.
+
+Against [E10](#e10-does-a-per-burst-websocket-tunnel-keep-the-shim-viable-done---yes-warm-free-and-100ms):
+both paths now work, and they are for different situations rather than in competition. Fly gives
+a genuine public URL with no extra moving parts and a ~10.5s cold hit. The Cloud Run shim keeps
+databases on the flagship platform reachable, with ~100ms warm bursts, at the cost of running
+and operating the shim. Fly is the simpler default for the public-URL story; the shim stays the
+answer when the backends must be on Cloud Run.
+
+**Not done, deliberately.** TLS and SCRAM are step 5 and were explicitly out of scope for this
+baseline. They matter more here than anywhere else in the project - on Fly the port is genuinely
+public, so `sslmode=require`, `verify-full` against a real cert, and a wrong-password rejection
+are load-bearing rather than theater. **Until then this configuration is an unauthenticated
+Postgres on a public IP and must not be used for anything real.**
+
+**Reproduce.** `experiments/e11-fly-baseline/`;
+`flyctl deploy --remote-only --ha=false -a <app>` with the `fly.toml` in that directory, then
+`./cold-cycle.sh <app> <machine-id> <ip> 3`. Phase timings from
+`node connect-timing.mjs <ip> 5432 <label>`.
 
 ---
 

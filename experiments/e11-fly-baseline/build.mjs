@@ -2,7 +2,7 @@
 // approach as experiments/e3-service/build.mjs). @electric-sql/pglite and
 // @electric-sql/pglite-socket are left external so PGlite's WASM/data assets
 // resolve from node_modules at runtime; all @zeropg/* workspace code is inlined.
-// PostgREST is NOT bundled — it is a separate static binary the Dockerfile adds.
+// PostgREST is NOT bundled - it is a separate static binary the Dockerfile adds.
 
 import { build } from 'esbuild'
 import { ZeroPG } from '@zeropg/objectstore-fs'

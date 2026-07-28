@@ -60,6 +60,9 @@ function queryMessage(sql) {
 }
 
 const t = {}
+/** Set as soon as any outcome has been printed, so exactly one line is emitted
+ *  per run regardless of which path the connection took. */
+let reported = false
 const t0 = process.hrtime.bigint()
 const ms = () => Number(process.hrtime.bigint() - t0) / 1e6
 
@@ -103,6 +106,7 @@ sock.on('data', (chunk) => {
         sock.write(queryMessage('select 1'))
       } else if (phase === 'query' && sawFirstRow) {
         t.totalMs = ms()
+        reported = true
         report()
         sock.end()
         return
@@ -141,10 +145,26 @@ function report() {
 const round = (v) => (typeof v === 'number' ? Math.round(v * 10) / 10 : null)
 
 sock.on('error', (e) => {
+  reported = true
   console.log(JSON.stringify({
     label: LABEL, host: HOST, port: PORT,
     outcome: 'SOCKET-ERROR', code: e.code, msg: String(e.message),
-    atMs: round(ms()),
+    reachedPhase: phase, atMs: round(ms()), partial: t,
+  }))
+  process.exit(1)
+})
+
+// A cold Machine can accept the TCP connection at the proxy and then have the
+// peer hang up before the handshake completes - the socket simply ends, with no
+// error event. Without this the process exited silently and reported nothing,
+// which reads as "no result" when it is in fact a meaningful outcome.
+sock.on('close', (hadError) => {
+  if (reported) return
+  reported = true
+  console.log(JSON.stringify({
+    label: LABEL, host: HOST, port: PORT,
+    outcome: 'CLOSED-BEFORE-FIRST-ROW', hadError,
+    reachedPhase: phase, atMs: round(ms()), partial: t,
   }))
   process.exit(1)
 })
