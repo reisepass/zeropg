@@ -55,9 +55,17 @@ try {
     PORT: String(CTRL), ZEROPG_WIRE_PORT: String(WIRE), ZEROPG_REST_PORT: String(REST),
     ZEROPG_POSTGREST_BIN: PGRST_BIN,
     PGRST_JWT_SECRET: JWT_SECRET,
-    // bind wire on 0.0.0.0 so the GoTrue container reaches it via host-gateway
+    // Bind wire on 0.0.0.0 so the GoTrue container reaches it via host-gateway.
+    // Loopback would be unreachable from inside Docker. Real exposure while this
+    // runs: PGlite has no authentication of any kind, so anything that reaches
+    // this port is `postgres` superuser. Local test harness only, never a
+    // deployment shape. See docs/CONNECTION-SECURITY-AND-WIRE.md.
     ZEROPG_WIRE_HOST: '0.0.0.0',
   }
+  console.warn(
+    `[db] WARNING: Postgres wire bound on 0.0.0.0:${WIRE} with NO authentication. ` +
+      `Local test harness - do not run on an untrusted network.`,
+  )
   const db = spawn('node', [join(root, 'zeropg-db', 'server.mjs')], { env: dbEnv, stdio: ['ignore', 'pipe', 'pipe'] })
   procs.push(db)
   db.stdout.on('data', (b) => process.stdout.write(`[db] ${b}`))

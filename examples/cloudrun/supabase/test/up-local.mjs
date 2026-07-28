@@ -41,6 +41,16 @@ function waitHttp(url, pred, ms = 90_000) {
 
 await execFileP('docker', ['rm', '-f', CONTAINER]).catch(() => {})
 
+// The wire binds 0.0.0.0 because the GoTrue CONTAINER reaches it back through
+// host-gateway; loopback would be unreachable from inside Docker. That is a real
+// exposure for as long as this harness runs: PGlite has no authentication of any
+// kind, so anything that can reach this port is `postgres` superuser. Local dev
+// only, never a deployment shape. See docs/CONNECTION-SECURITY-AND-WIRE.md.
+console.warn(
+  `[up] WARNING: the Postgres wire is bound on 0.0.0.0:${WIRE} with NO authentication ` +
+    `(PGlite has none). Anyone who can reach this host on that port is superuser. ` +
+    `This is a local test harness - do not run it on an untrusted network.`,
+)
 const dbEnv = {
   ...process.env,
   ZEROPG_BUCKET: process.env.ZEROPG_BUCKET || 'zeropg-experiments-euw1',
