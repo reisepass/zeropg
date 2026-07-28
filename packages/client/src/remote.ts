@@ -17,23 +17,22 @@ class RemoteClient implements Client {
   constructor(private rc: ZeroPGRemoteClient) {}
 
   async query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
-    if (params && params.length > 0) {
-      throw new Error(
-        'remote engine: parameterized queries are not supported over HTTP /sql. ' +
-          'Inline the values (server-side prepared statements are a wire-protocol feature; ' +
-          'use a postgres:// / wire connection if you need bound parameters).',
-      )
-    }
-    const { rows } = await this.rc.sql<T>(sql)
-    // /sql returns JSON rows only — no type OIDs. Derive field names from the
+    // Params are bound server-side by POST /sql, which forwards them to
+    // ZeroPG.query(sql, params). Never inline values into the string: that is
+    // an injection hazard, and it is what a repository layer emitting $1/$2
+    // would otherwise be forced into.
+    const { rows, rowCount } = await this.rc.sql<T>(sql, params)
+    // /sql returns JSON rows only - no type OIDs. Derive field names from the
     // first row so the pg-shaped `fields` is non-empty for tooling.
     const first = rows[0] as Record<string, unknown> | undefined
     const fields: FieldInfo[] = first ? Object.keys(first).map((name) => ({ name })) : []
-    return { rows, rowCount: rows.length, fields }
+    return { rows, rowCount, fields }
   }
 
+  /** Multi-statement SQL (migrations) goes over the simple protocol, which is
+   *  the only path that accepts several statements in one request. */
   async exec(sql: string): Promise<void> {
-    await this.rc.sql(sql)
+    await this.rc.execMulti(sql)
   }
 
   async transaction<T>(_fn: (tx: Queryable) => Promise<T>): Promise<T> {

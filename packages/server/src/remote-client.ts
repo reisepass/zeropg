@@ -72,17 +72,42 @@ export class ZeroPGRemoteClient {
     await this.waitReady()
   }
 
-  /** Run SQL over HTTP (POST /sql). Auto-waits for readiness on first use. */
-  async sql<T = Record<string, unknown>>(sql: string): Promise<{ rows: T[]; ms: number }> {
+  /** Run SQL over HTTP (POST /sql). Auto-waits for readiness on first use.
+   *  `params` are bound server-side ($1/$2 ...) - pass user values this way
+   *  rather than inlining them into the string. */
+  async sql<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<{ rows: T[]; rowCount: number; ms: number }> {
     await this.ensureReady()
     const res = await fetch(`${this.base}/sql`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...this.headers },
-      body: JSON.stringify({ sql }),
+      body: JSON.stringify(params && params.length ? { sql, params } : { sql }),
     })
-    const body = (await res.json()) as { rows?: T[]; ms?: number; error?: string }
+    const body = (await res.json()) as {
+      rows?: T[]
+      rowCount?: number
+      ms?: number
+      error?: string
+    }
     if (!res.ok) throw new Error(body.error ?? `sql failed (${res.status})`)
-    return { rows: body.rows ?? [], ms: body.ms ?? 0 }
+    const rows = body.rows ?? []
+    return { rows, rowCount: body.rowCount ?? rows.length, ms: body.ms ?? 0 }
+  }
+
+  /** Run MULTI-STATEMENT SQL (a migration) in one request, over the simple
+   *  protocol. Returns no rows by construction; use sql() to read data. */
+  async execMulti(sql: string): Promise<{ ms: number }> {
+    await this.ensureReady()
+    const res = await fetch(`${this.base}/sql`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...this.headers },
+      body: JSON.stringify({ sql, multi: true }),
+    })
+    const body = (await res.json()) as { ms?: number; error?: string }
+    if (!res.ok) throw new Error(body.error ?? `sql failed (${res.status})`)
+    return { ms: body.ms ?? 0 }
   }
 
   /** Talk to the PostgREST auto-REST surface under /rest. `path` is everything

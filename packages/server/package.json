@@ -8,6 +8,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./wire-frontend": {
+      "types": "./dist/wire-frontend.d.ts",
+      "import": "./dist/wire-frontend.js"
     }
   },
   "files": [
@@ -28,6 +32,14 @@
   "peerDependencies": {
     "@electric-sql/pglite": "*",
     "@electric-sql/pglite-socket": "*"
+  },
+  "peerDependenciesMeta": {
+    "@electric-sql/pglite": {
+      "optional": true
+    },
+    "@electric-sql/pglite-socket": {
+      "optional": true
+    }
   },
   "description": "Early experiment in the cheapest possible scale-to-zero Postgres. Standalone dedicated-Postgres server for zeropg: one scale-to-zero container holding the lease + PGlite + ObjectStoreFS, exposing the real Postgres wire protocol (pglite-socket) on a local port, a default-on PostgREST auto-REST API, and an HTTP control face (/wake, /ready, POST /sql) a remote app connects to.",
   "license": "MIT",

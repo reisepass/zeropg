@@ -14,6 +14,15 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 
+/**
+ * Wire connections PostgREST holds open when it is running. PGlite is a single
+ * in-process session multiplexed by pglite-socket, so a pool of 1 matches it
+ * (see PGRST_DB_POOL below). Exported because ZeroPGServer has to subtract these
+ * from the wire connection cap to work out the user-visible budget: PostgREST is
+ * default-on and consumes slots the caller never opened.
+ */
+export const POSTGREST_POOL_SIZE = 1
+
 export interface PostgrestOptions {
   /** Path to the postgrest binary. */
   bin: string
@@ -92,8 +101,9 @@ export class PostgrestProcess {
       PGRST_SERVER_PORT: String(o.restPort),
       // PGlite is a single in-process session multiplexed by pglite-socket. A pool
       // of 1 matches that (PGlite runs one query at a time anyway) and avoids
-      // cross-connection session state surprises.
-      PGRST_DB_POOL: '1',
+      // cross-connection session state surprises. ZeroPGServer budgets against
+      // this via POSTGREST_POOL_SIZE; keep the two in step.
+      PGRST_DB_POOL: String(POSTGREST_POOL_SIZE),
       PGRST_DB_POOL_ACQUISITION_TIMEOUT: '10',
       // Prepared statements are keyed per session, but every pooled connection
       // lands on the SAME PGlite session via the multiplexer, so libpq's auto

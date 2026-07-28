@@ -16,8 +16,13 @@ await db.end()
 | --- | --- |
 | `memory://` | embedded PGlite, in-process, ephemeral |
 | `file://./dev.db` | embedded PGlite on a NodeFS datadir, guarded by a cross-process lock |
-| `http(s)://host` | bucket-backed scale-to-zero zeropg over HTTP |
+| `http(s)://host` | bucket-backed scale-to-zero zeropg, reached through a deployed instance |
 | `postgres://…` | a real, always-on Postgres via node-postgres |
+
+**Not wired yet:** `gs://` / `r2://` / `s3://` / `cos://`, which would run the bucket-backed
+engine *embedded in your process* with no instance in between. `connect()` throws a clear
+error for these. To use a bucket today, deploy [`@zeropg/server`](../server) pointed at it
+and connect to that instance over `http(s)://`.
 
 The result shape (`{ rows, rowCount, fields }`), `transaction(fn)`, and `end()` match `pg`, so graduating to a real Postgres is a URL change, not a rewrite.
 

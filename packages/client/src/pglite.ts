@@ -4,11 +4,32 @@
 // durability/single-writer story for the remote rungs lives in @zeropg/server
 // and ObjectStoreFS.
 
-import { PGlite } from '@electric-sql/pglite'
+import type { PGlite } from '@electric-sql/pglite'
 import { resolve } from 'node:path'
 import { acquireDatadirLock, type DatadirLock } from './lockfile.js'
 import { recordOpen } from './breadcrumb.js'
 import type { Client, ConnectOptions, Engine, FieldInfo, QueryResult, Queryable } from './types.js'
+
+// @electric-sql/pglite is an OPTIONAL peer: it is the 26 MB WASM engine, and a
+// project that has graduated to a real postgres:// host needs none of it. Only
+// memory:// and file:// do, so it is imported for TYPES above (erased at build)
+// and loaded on demand here, with an actionable error when it is absent. A
+// static value-import would make merely importing @zeropg/client fail without it.
+type PGliteCtor = typeof import('@electric-sql/pglite').PGlite
+let pgliteCtor: PGliteCtor | null = null
+
+export async function loadPGlite(): Promise<PGliteCtor> {
+  if (pgliteCtor) return pgliteCtor
+  try {
+    pgliteCtor = (await import('@electric-sql/pglite')).PGlite
+    return pgliteCtor
+  } catch {
+    throw new Error(
+      "memory:// and file:// connection strings need the optional peer dependency '@electric-sql/pglite'. " +
+        'Install it: `npm install @electric-sql/pglite` (or pnpm/yarn add @electric-sql/pglite).',
+    )
+  }
+}
 
 // Whether the installed PGlite build takes its OWN cross-process datadir lock
 // (the reisepass/pglite-kill-dash-9 fork does, baked into NodeFS). If it does,
@@ -16,11 +37,17 @@ import type { Client, ConnectOptions, Engine, FieldInfo, QueryResult, Queryable 
 // incompatible token formats, so running both stalls ~10s while each treats the
 // other's lock as foreign and reclaims it. Resolution order: explicit option ->
 // env var -> a static `managesDataDirLock` marker the fork can advertise.
+//
+// Stays synchronous (it is public API and callers use it inline), so it reads the
+// marker off the CACHED constructor rather than loading PGlite itself. Every
+// caller reaching the marker check has already gone through loadPGlite(), so the
+// cache is populated by then; if it somehow is not, this falls back to false (the
+// wrapper lock), which is the same behavior as a build without the marker.
 export function nativeDatadirLockEnabled(opts: { nativeDatadirLock?: boolean }): boolean {
   if (opts.nativeDatadirLock !== undefined) return opts.nativeDatadirLock
   const env = process.env.ZEROPG_NATIVE_DATADIR_LOCK
   if (env === '1' || env === 'true') return true
-  return (PGlite as unknown as { managesDataDirLock?: boolean }).managesDataDirLock === true
+  return (pgliteCtor as unknown as { managesDataDirLock?: boolean } | null)?.managesDataDirLock === true
 }
 
 interface PgliteRow {
@@ -110,12 +137,16 @@ class PgliteClient implements Client {
 }
 
 export async function connectMemory(): Promise<Client> {
-  const pg = await PGlite.create()
+  const PGliteClass = await loadPGlite()
+  const pg = await PGliteClass.create()
   return new PgliteClient(pg, null, 'memory', null, true)
 }
 
 export async function connectFile(dataDir: string, opts: ConnectOptions): Promise<Client> {
   const abs = resolve(dataDir)
+  // Load before nativeDatadirLockEnabled() below, which reads a static marker
+  // off the loaded PGlite build to decide whether to take the wrapper lock.
+  const PGliteClass = await loadPGlite()
 
   if (!opts.noHmrPin) {
     const existing = pins().get(abs)
@@ -133,7 +164,7 @@ export async function connectFile(dataDir: string, opts: ConnectOptions): Promis
     : await acquireDatadirLock(abs, { acquireTimeoutMs: opts.acquireTimeoutMs })
   let pg: PGlite
   try {
-    pg = await PGlite.create({ dataDir: abs })
+    pg = await PGliteClass.create({ dataDir: abs })
   } catch (e) {
     if (lock) await lock.release()
     throw e

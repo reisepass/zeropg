@@ -90,9 +90,14 @@ export async function connect(url?: string, opts: ConnectOptions = {}): Promise<
     case 's3':
     case 'cos':
       throw new Error(
-        `connect: bucket-scheme '${scheme}://' (embedded bucket-backed engine) is not wired yet. ` +
-          'For a deployed scale-to-zero instance use its http(s):// URL today; ' +
-          'embedded ObjectStoreFS-from-URL is the next increment of Track E2.',
+        `connect: '${scheme}://' (the bucket-backed engine embedded in THIS process) is ` +
+          'not wired yet. The bucket-backed engine itself works and is what the demos ' +
+          'run on, but today you reach it through a deployed instance that holds the ' +
+          "bucket: deploy @zeropg/server pointed at your bucket, then connect to the " +
+          "instance's URL, e.g. connect('https://my-instance.example.run'). Local " +
+          "alternatives that need no deployment: connect('file://./dev.db') for a " +
+          "Postgres in a directory, or connect('memory://') for tests. See " +
+          'docs/LIMITATIONS.md for what is and is not wired.',
       )
     default:
       throw new Error(`connect: unsupported scheme '${scheme}://' in ${target}`)

@@ -26,7 +26,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { BlobStore } from '@zeropg/blobstore'
 import { ZeroPG, FencedError, LockedError, type Durability } from '@zeropg/objectstore-fs'
-import { PostgrestProcess, postgrestBootstrapSql } from './postgrest.js'
+import { PostgrestProcess, postgrestBootstrapSql, POSTGREST_POOL_SIZE } from './postgrest.js'
+import { WireFrontend } from './wire-frontend.js'
 
 let PGLiteSocketServer: typeof import('@electric-sql/pglite-socket').PGLiteSocketServer
 
@@ -48,6 +49,18 @@ export interface ZeroPGServerOptions {
   wireHost?: string
   /** Local PostgREST port (loopback; reverse-proxied under /rest). Default 3000. */
   restPort?: number
+  /**
+   * Wire connections available TO THE CALLER, i.e. the user-visible budget.
+   * Default 10, which matches a node-postgres Pool at its own default max of 10.
+   *
+   * The arithmetic: PostgREST is default-on and quietly holds
+   * POSTGREST_POOL_SIZE connections the caller never opened, so the cap actually
+   * programmed into the wire layer is this value PLUS PostgREST's pool when it
+   * is enabled. Budgeting the other way (subtracting PostgREST from a fixed
+   * total) is what made a default pg.Pool of 10 fail against a hardcoded cap of
+   * 10: the caller's tenth connection lost to a slot they could not see.
+   */
+  maxConnections?: number
   /** Lease holder id (instance identity). */
   holder?: string
   durability?: Durability
@@ -76,7 +89,7 @@ interface BootTimings {
 
 export class ZeroPGServer {
   private db: ZeroPG | null = null
-  private wire: import('@electric-sql/pglite-socket').PGLiteSocketServer | null = null
+  private wire: WireFrontend | null = null
   private pgrest: PostgrestProcess | null = null
   private http: Server | null = null
 
@@ -98,7 +111,15 @@ export class ZeroPGServer {
   readonly opts: Required<
     Pick<
       ZeroPGServerOptions,
-      'port' | 'wirePort' | 'wireHost' | 'restPort' | 'postgrest' | 'postgrestBin' | 'restSchemas' | 'label'
+      | 'port'
+      | 'wirePort'
+      | 'wireHost'
+      | 'restPort'
+      | 'postgrest'
+      | 'postgrestBin'
+      | 'restSchemas'
+      | 'label'
+      | 'maxConnections'
     >
   > &
     ZeroPGServerOptions
@@ -111,6 +132,7 @@ export class ZeroPGServer {
       wirePort: opts.wirePort ?? Number(process.env.ZEROPG_WIRE_PORT ?? 5432),
       wireHost: opts.wireHost ?? process.env.ZEROPG_WIRE_HOST ?? '127.0.0.1',
       restPort: opts.restPort ?? Number(process.env.ZEROPG_REST_PORT ?? 3000),
+      maxConnections: opts.maxConnections ?? Number(process.env.ZEROPG_MAX_CONNECTIONS ?? 10),
       postgrest: opts.postgrest ?? !/^(off|false|0)$/i.test(process.env.ZEROPG_POSTGREST ?? ''),
       postgrestBin: opts.postgrestBin ?? process.env.ZEROPG_POSTGREST_BIN ?? 'postgrest',
       restSchemas: opts.restSchemas ?? process.env.ZEROPG_REST_SCHEMAS ?? 'public',
@@ -158,16 +180,44 @@ export class ZeroPGServer {
       if (!PGLiteSocketServer) {
         ;({ PGLiteSocketServer } = await import('@electric-sql/pglite-socket'))
       }
-      this.wire = new PGLiteSocketServer({
-        db: this.db.raw,
+      // The front-end owns o.wirePort and answers SSLRequest/GSSENCRequest with
+      // 'N' before proxying plaintext to the inner PGLiteSocketServer on a private
+      // loopback port. Without it, any libpq/pgx client at its default
+      // sslmode=prefer hangs silently: pglite-socket has no SSL negotiation.
+      const db = this.db.raw
+      // Connection budget. o.maxConnections is what the CALLER gets; PostgREST,
+      // when enabled, holds POSTGREST_POOL_SIZE more that the caller never
+      // opened. So the cap programmed into the wire layer is the sum, and a
+      // caller's pool of exactly o.maxConnections fits. The front-end enforces
+      // it (in protocol, 53300); the inner server gets headroom so it never hits
+      // its own limit first and writes its raw non-protocol rejection.
+      const restSlots = o.postgrest ? POSTGREST_POOL_SIZE : 0
+      const wireCap = o.maxConnections + restSlots
+      this.wire = new WireFrontend({
         port: o.wirePort,
         host: o.wireHost,
-        // PostgREST opens a small pool; allow several concurrent loopback conns.
-        maxConnections: 10,
+        maxConnections: wireCap,
+        // Report the CALLER's budget, not wireCap: quoting the sum would name a
+        // limit the user never set (10 configured, "limit 11" printed).
+        reportedLimit: o.maxConnections,
+        limitOptionName: 'maxConnections (ZEROPG_MAX_CONNECTIONS)',
+        createInner: (cfg) =>
+          new PGLiteSocketServer({
+            db,
+            host: cfg.host,
+            port: cfg.port,
+            maxConnections: wireCap + 1,
+          }),
       })
       await this.wire.start()
       this.bootTimings.wireMs = performance.now() - tw
-      this.log('wire-up', { port: o.wirePort, ms: Math.round(this.bootTimings.wireMs) })
+      this.log('wire-up', {
+        port: o.wirePort,
+        ms: Math.round(this.bootTimings.wireMs),
+        maxConnections: o.maxConnections,
+        postgrestSlots: restSlots,
+        wireCap,
+      })
 
       // Persist raw-wire writes (which bypass ZeroPG's dirty/commit path). Baseline
       // the write counter at the post-restore state, then poll on an interval.
@@ -326,20 +376,60 @@ export class ZeroPGServer {
     return this.json(res, 404, { error: 'not found' })
   }
 
+  /**
+   * POST /sql body:
+   *   { sql: string, params?: unknown[], multi?: boolean }
+   *
+   * `params` are bound server-side ($1/$2 ...), which is what every repository
+   * layer emits and the only safe way to pass user values: inlining them into
+   * the string is an injection hazard.
+   *
+   * `multi: true` routes to exec() (simple protocol), the only way to send
+   * several statements in one request, which is what a migration file is.
+   * It is an EXPLICIT flag rather than a sniff of the SQL text: a heuristic
+   * looking for semicolons guesses wrong on a semicolon inside a string literal
+   * or a function body, and a silently mis-routed migration is worse than a
+   * clear error. exec() returns no rows, so the response says so via
+   * `multi: true` and omits `rows` rather than faking an empty array.
+   * The two are mutually exclusive: the simple protocol cannot bind parameters.
+   */
   private async sql(req: IncomingMessage, res: ServerResponse) {
     if (!this.db) return this.json(res, 503, this.readinessBody())
     const raw = (await this.readBody(req)).toString()
     try {
-      const { sql } = JSON.parse(raw) as { sql: string }
+      const { sql, params, multi } = JSON.parse(raw) as {
+        sql: string
+        params?: unknown[]
+        multi?: boolean
+      }
+      if (multi && params && params.length > 0) {
+        return this.json(res, 400, {
+          error:
+            'multi: true runs the simple protocol, which cannot bind parameters. ' +
+            'Send params without multi, or split the statements into one request each.',
+        })
+      }
       const t0 = performance.now()
-      const r = await this.db.query(sql)
       // DDL changes the schema PostgREST introspected at startup; nudge it to
       // reload its cache so new tables/columns appear under /rest immediately.
-      if (this.pgrest && /\b(create|alter|drop|grant|revoke|comment)\b/i.test(sql)) {
-        this.pgrest.reloadSchema()
+      const isDdl = /\b(create|alter|drop|grant|revoke|comment)\b/i.test(sql)
+      if (multi) {
+        await this.db.exec(sql)
+        if (this.pgrest && isDdl) this.pgrest.reloadSchema()
+        return this.json(res, 200, {
+          // No rows by construction: exec() is the simple protocol. Stated
+          // explicitly so a caller does not read an empty array as "0 results".
+          multi: true,
+          rows: null,
+          ms: Math.round((performance.now() - t0) * 100) / 100,
+          durability: this.db.durabilityMode,
+        })
       }
+      const r = await this.db.query(sql, params)
+      if (this.pgrest && isDdl) this.pgrest.reloadSchema()
       return this.json(res, 200, {
         rows: r.rows,
+        rowCount: r.affectedRows ?? r.rows.length,
         ms: Math.round((performance.now() - t0) * 100) / 100,
         execMs: Math.round(r.execMs * 100) / 100,
         commit: r.commit,
@@ -484,6 +574,15 @@ later; this HTTP-only platform exposes the faces above.
       if (this.db) await this.db.close() // sleep-mode flush + lease release
     } catch (e) {
       this.log('shutdown-flush-failed', { error: e instanceof Error ? e.message : String(e) })
+    }
+    // Close the public HTTP listener last, so /ready keeps answering while the
+    // flush above runs. Without this the listener holds the event loop open and
+    // an embedding process (a test, a fleet tool) hangs after shutdown()
+    // resolves; the signal handlers only got away with it by calling exit().
+    if (this.http) {
+      const http = this.http
+      this.http = null
+      await new Promise<void>((res) => http.close(() => res()))
     }
   }
 

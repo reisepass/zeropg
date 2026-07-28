@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepack": "tsc -p tsconfig.build.json",
-    "test": "tsx test/client.test.ts && tsx test/lock-multiprocess.test.ts",
+    "test": "tsx test/client.test.ts && tsx test/lock-multiprocess.test.ts && tsx test/wire.test.ts && tsx test/wire-sslmode.test.ts && tsx test/wire-maxconn.test.ts && tsx test/remote-sql.test.ts",
     "test:stress": "tsx test/lock-stress.test.ts"
   },
   "description": "Early experiment in the cheapest possible scale-to-zero Postgres. The unified zeropg client (Track E): one connect(DATABASE_URL) factory and one node-postgres-shaped interface over four engines (in-process PGlite for memory://, file:// with a cross-process lockfile, bucket-backed scale-to-zero zeropg over HTTP, and a graduated postgres:// passthrough). Only the connection string changes from laptop to bucket to always-on server.",
@@ -49,6 +49,9 @@
     "pg": "*"
   },
   "peerDependenciesMeta": {
+    "@electric-sql/pglite": {
+      "optional": true
+    },
     "@electric-sql/pglite-socket": {
       "optional": true
     },
