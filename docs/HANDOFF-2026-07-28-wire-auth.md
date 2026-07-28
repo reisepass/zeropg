@@ -4,6 +4,28 @@ Written mid-session because the machine may go away. Read this first, then
 [CONNECTION-SECURITY-AND-WIRE.md](CONNECTION-SECURITY-AND-WIRE.md) for decisions and
 [WIRE-AUTH-RESEARCH-2026-07-28.md](WIRE-AUTH-RESEARCH-2026-07-28.md) for the evidence.
 
+## Read this first: a latent one-packet DoS
+
+Verified 2026-07-28 by probing a live PGlite. Certain packets must **never** reach
+`execProtocolRaw`:
+
+- `PasswordMessage` (`'p'`) and any unknown type (`'q'`) cause an **infinite synchronous spin**
+  in `_PostgresMainLoopOnce` that blocks the whole Node event loop. A 20s `setTimeout` never
+  fired; the process had to be killed. That is a remote, unauthenticated, single-packet denial
+  of service.
+- `SSLRequest` and `GSSENCRequest` throw `ExitStatus: exit(1)` and **permanently corrupt the
+  WASM instance**; the next startup packet throws `RuntimeError: null function or function
+  signature mismatch`.
+- `CancelRequest` throws `Cannot process startup packet`.
+
+**We are not currently exposed only because pglite-socket's framer mis-sizes those packets and
+buffers forever instead of forwarding them.** That is luck, not design.
+
+Consequence for everything below: any frontend we own or adopt must treat forwarded message
+types as an **allowlist, never a passthrough**. Becoming more faithful at framing without that
+allowlist turns a latent bug into a live remote DoS. Needs a regression test firing each packet
+and asserting the process survives.
+
 ## The single most important result
 
 **The named-prepared-statement wall is ~45 lines, not a deep rewrite.**

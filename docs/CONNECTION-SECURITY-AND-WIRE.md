@@ -203,7 +203,35 @@ The deeper bug behind all three: one `Client` interface, two engines that accept
 things. An app developed against `file://` works completely and breaks on its first deployed
 write. That divergence is the design defect, not any individual missing feature.
 
-## 6. OPEN: replacing pglite-socket with a wire server we own
+## 5.5. CRITICAL, found 2026-07-28: forwarding the wrong packet to PGlite is a one-packet DoS
+
+**Do not let these message types reach `execProtocolRaw`.** Verified by probing a live PGlite:
+
+| packet | effect on the WASM instance |
+|---|---|
+| `SSLRequest` (80877103) | throws `ExitStatus: exit(1)` and **permanently corrupts the instance**. The next startup packet throws `RuntimeError: null function or function signature mismatch` and the response stream desynchronizes |
+| `GSSENCRequest` (80877104) | identical |
+| `CancelRequest` (80877102) | throws `Cannot process startup packet` |
+| `PasswordMessage` (`'p'`) | **infinite synchronous spin** inside `_PostgresMainLoopOnce`, blocking the entire Node event loop. A 20-second `setTimeout` never fired; the process had to be killed |
+| unknown type (`'q'`) | same infinite spin |
+
+The last two are a **remote, unauthenticated, single-packet denial of service** against any
+zeropg instance whose wire port is reachable.
+
+**Why we are not currently vulnerable, and why that is luck rather than design:**
+pglite-socket's framer mis-sizes those packets and buffers forever instead of forwarding
+them. We survive because the shim is sloppy, not because anything checks.
+
+**This constrains every design in this document.** Any frontend we own, or adopt, must treat
+the set of message types it forwards as an **allowlist**, never a passthrough. Getting more
+faithful at framing without adding that allowlist would convert a latent bug into a live
+remote DoS. `WireFrontend` (commit `9da362e`) already intercepts SSLRequest and GSSENCRequest,
+which is exactly right and now has a much stronger justification than "libpq hangs".
+
+Add a regression test that fires each of these packets at the wire and asserts the process
+stays alive and the instance stays usable.
+
+## 6. RESOLVED: replacing pglite-socket with a wire server we own
 
 Decision pending. `WireFrontend` (section 3) is the first step and already exists - it owns
 the public port and peeks the startup bytes. The question is how much further to go.
@@ -219,16 +247,38 @@ What owning the full frontend would unlock:
   `docs/POSTGRES-APP-COMPAT.md` Limitation 5.
 - **Cold-start absorption.** See section 8.
 
-### ANSWERED 2026-07-28: the double-handshake question no longer blocks anything
+### ANSWERED 2026-07-28: we can own auth entirely. The question is closed.
 
 The question was: can we terminate auth ourselves and hand PGlite a byte stream, or does
 PGlite generate its own AuthenticationOk / BackendKeyData / ReadyForQuery such that our own
 SASL exchange produces a **double authentication sequence** that confuses clients?
 
-**Yes, PGlite emits its own handshake, so the double sequence is real. And it is ~20 lines to
-handle:** frame and discard the backend's handshake up to its `ReadyForQuery`, then forward
-everything after. Prototyped and driven with real psql. Alternatively the in-process path
-avoids it entirely. Either way it stops gating build-vs-adopt.
+**There is no double-auth sequence, because there is no auth.** A brand-new PGlite answers
+`Query "SELECT 1"` correctly with **no startup packet ever sent** - it is already a logged-in
+single-user backend. The handshake only appears if you choose to forward a startup packet.
+
+Where it comes from when you do: PGlite runs the real Postgres C path.
+`execProtocolRawSync` (`pglite/src/pglite.ts:876`) branches on `message[0] === 0` into
+`#processStartupPacket` (line 1308), calling the genuine `ProcessStartupPacket()` with
+`ssl_done=true, gss_done=true`, then `_pgl_sendConnData()`. That emits the 429-byte block:
+`AuthenticationOk`, 16 `ParameterStatus` messages, `BackendKeyData(pid=42, key=2875488)`,
+`ReadyForQuery('I')`. **The WASM Postgres does 100% of the handshake; the shim does 0%.**
+
+Two clean implementations, and the second is better:
+
+- **(a) Never forward the startup packet** and synthesize `ParameterStatus` yourself. This is
+  what the existing pg-gateway spike does at `experiments/prisma-spike/pggw.ts`, faking
+  `serverVersion: '16.3'` - note the fake drifts from the real `18.3`.
+- **(b) Forward one startup packet at boot, cache the real 429-byte block, strip `R` and `K`,
+  rewrite the trailing `Z` to `'I'`, and replay it per connection.** Clients then see PGlite's
+  actual GUCs rather than our guesses.
+
+**And PGlite enforces nothing.** `{user: nosuchuser, database: nosuchdb, password: hunter2}`
+returns `AuthenticationOk` immediately, with `current_user` = `postgres`. `options=-c
+search_path=...`, `application_name`, and `client_encoding=LATIN1` are all silently discarded:
+a following `SHOW` returns `public`, empty, and `UTF8`. So any user/role story we want is
+ours to build on top, and any client-supplied startup option we care about must be replayed
+by us as explicit SQL.
 
 **The stronger result, independently reproduced twice:** PGlite's startup handshake is a
 hardcoded constant. It does not depend on the datadir and does not depend on anything the
