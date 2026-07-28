@@ -1,4 +1,15 @@
-# Nostr relay on zeropg — STATUS: IN PROGRESS (paused 2026-06-23)
+# Nostr relay on zeropg — STATUS: SUPERSEDED (this snapshot is from 2026-06-23)
+
+> **SUPERSEDED 2026-07-28.** This doc is a paused-work snapshot and its status line is
+> stale. Both **nostream** and our own **znostr-relay** were subsequently verified
+> locally *and* live on Cloud Run, with cold-restart durability proof. See
+> `docs/POSTGRES-APP-COMPAT.md:216-239` and the README. **sqlx-based nostr-rs-relay
+> remains blocked** by the named-prepared-statement collision, which is the one claim
+> here still current — and see `docs/TODO-pglite-socket-prepared-statements.md` for the
+> 2026-07-28 update showing that fix is roughly 45 lines on pg-gateway.
+>
+> Kept for the per-relay evaluation detail, which is still accurate. Do not read the
+> status line as current.
 
 Goal: a Nostr relay that runs on zeropg (PGlite over the pglite-socket wire, DB in
 GCS) and **scales to zero** — i.e. the Postgres-in-object-storage IS the only state,

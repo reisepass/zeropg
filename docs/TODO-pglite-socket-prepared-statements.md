@@ -1,5 +1,28 @@
 # TODO: fix named-prepared-statement collisions in pglite-socket
 
+> **UPDATE 2026-07-28 — the approach changed, the design below is still right.**
+>
+> This doc and `docs/POSTGRES-APP-COMPAT.md:169-177` disagreed on scope. This one called
+> the name-rewriting fix "a bounded, localized change ... not a deep rewrite"; the compat
+> doc, assessing against pglite-socket source, called it "a DEEP/architectural change"
+> because pglite-socket frames by length prefix only and forwards opaque bytes, so
+> rewriting names would mean adding a protocol parser to it.
+>
+> **The compat doc was right about pglite-socket. This doc was right about the problem.**
+> Built and verified on **pg-gateway**, which already parses the protocol, the rewriter is
+> roughly 45 lines: without it a second connection preparing `s1` fails `42P05`; with
+> per-connection name prefixing on Parse/Bind/Describe/Close/Execute both connections
+> prepare `s1` and the first still resolves. Two caveats found in testing: SQL-level
+> `PREPARE`/`DEALLOCATE` bypass the rewriter (`26000`), and `pg_prepared_statements`
+> shows the prefixed name.
+>
+> So the message-by-message design below stands. The host changes from "fork
+> pglite-socket" to "do it on pg-gateway", which is already a devDependency here and
+> already spiked at `experiments/prisma-spike/pggw.ts`. Blocking prerequisite before any
+> swap: pg-gateway has **no cross-connection serialization**, and pglite-socket's
+> transaction-aware `QueryQueueManager` is what makes RLS isolation safe today. See
+> `docs/HANDOFF-2026-07-28-wire-auth.md`.
+
 **Status:** open. **Impact:** unblocks every driver that uses *named* server-side
 prepared statements over the zeropg wire — most importantly **sqlx** (all Rust
 apps, e.g. nostr-rs-relay), and anything else that breaks under pgBouncer
@@ -13,12 +36,18 @@ enhancement surfaced by the "real apps on zeropg" exercise.
 > any future driver in that class).
 >
 > **`pgx` (Go) does NOT need this fix — it has a DSN-only escape hatch.** Set
-> `?default_query_exec_mode=simple_protocol` on the connection string and pgx uses
-> the simple protocol (no server-side prepares), the pgx equivalent of node-postgres's
-> unnamed path. **Verified end to end with cocoon** (GORM+pgx PDS) locally and on
-> Cloud Run. So the screen is: **Go/pgx apps → set `default_query_exec_mode=simple_protocol`,
+> `?default_query_exec_mode=cache_describe` on the connection string, with pool > 1.
+> **Verified end to end with cocoon** (GORM+pgx PDS) locally and on Cloud Run.
+> So the screen is: **Go/pgx apps → set `default_query_exec_mode=cache_describe`,
 > let them through; Rust sqlx/Diesel → no URL escape hatch → still blocked until this
 > fix lands.** See `docs/POSTGRES-APP-COMPAT.md` Limitation 5.
+>
+> **CORRECTED 2026-07-28.** This paragraph previously prescribed
+> `default_query_exec_mode=simple_protocol`. That is wrong and was superseded by the
+> webhookx result: `simple_protocol` sends `[]byte` params untyped and breaks JSONB
+> columns with `22P02`. Use `cache_describe`. Pool must be > 1, because pool=1
+> deadlocks golang-migrate's advisory-lock connection. See
+> `docs/POSTGRES-APP-COMPAT.md:153-167` and `docs/LIMITATIONS.md:42`.
 
 ## The problem
 
@@ -125,6 +154,6 @@ for completeness only.
 - Current Nostr-on-zeropg pivot (nostream / node-postgres, which sidesteps this):
   tracked by the background `nostr-agent`.
 - AT Proto PDS on zeropg: **cocoon** (Go/pgx) sidesteps this via
-  `default_query_exec_mode=simple_protocol` and is deployed
+  `default_query_exec_mode=cache_describe` and is deployed
   (`examples/cloudrun/pds/`); **rsky-pds** (Rust/Diesel) is blocked by exactly this
   issue and waits on the fix above.

@@ -297,5 +297,3 @@ connection so any wire client must use `connection_limit=1`.
    single-applier-enforced.
 5. Worked example repos for both ORMs showing the same code local → bucket →
    `postgres://` with migrations.
-</content>
-</invoke>
