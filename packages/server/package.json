@@ -1,6 +1,6 @@
 {
   "name": "@zeropg/server",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,7 +10,10 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "src"],
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepack": "tsc -p tsconfig.build.json"
@@ -19,8 +22,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@zeropg/blobstore": "^0.0.1",
-    "@zeropg/objectstore-fs": "^0.0.1"
+    "@zeropg/blobstore": "^0.1.0",
+    "@zeropg/objectstore-fs": "^0.1.0"
   },
   "peerDependencies": {
     "@electric-sql/pglite": "*",
