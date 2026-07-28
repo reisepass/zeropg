@@ -139,9 +139,17 @@ and their hba permits it. Appending `?sslmode=require` then fails with
 `SELF_SIGNED_CERT_IN_CHAIN` against their private CA, and the internet's answer is
 `rejectUnauthorized: false`, which lands you back at unverified.
 
-**Design lesson for us: Neon's posture is the right one.** Require TLS, use a publicly
-trusted or explicitly distributed CA, and never ship a connection string whose happy path is
-plaintext.
+**Design lesson, REVERSED by experiment. See CONNECTION-SECURITY-AND-WIRE.md section 7c.**
+The initial read from the docs was that Neon's posture is right: require TLS. Then someone
+actually ran it. Against a TLS-required server, `new pg.Client({connectionString})` with no
+ssl option **fails with `08P01`**, because node-postgres defaults `ssl: false` and sends the
+StartupMessage with no SSLRequest at all. That is the single most common way a Node app
+connects, so requiring TLS breaks the north star outright. Neon only survives it by shipping
+`?sslmode=require` inside every connection string they hand out.
+
+**We take Supabase's posture here: TLS offered, never required.** Tri-state
+`off | optional | required`, default `optional`. It also keeps every currently-verified app
+working byte-identically with its existing `sslmode=disable`.
 
 ## Prior art in this repo: mostly settled, do not redo
 

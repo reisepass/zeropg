@@ -367,7 +367,7 @@ the bucket credential is a rotating metadata OAuth token with no stable long-liv
 | loopback | set | enforced everywhere except the always-open health tier |
 | non-loopback | none | **refuse to start, exit 78**, naming the env var and the escape |
 | non-loopback, HTTP | set | start (the platform terminates TLS); reject credentialed requests arriving over cleartext |
-| non-loopback wire | set, no TLS | **refuse.** SCRAM protects the password but not the data. Neon's posture, not Supabase's |
+| non-loopback wire | set, no TLS | **DISPUTED - see section 7c. The credential designer said refuse; the wire designer ran an experiment showing that breaks the north star. Do not implement this row yet.** |
 | any non-loopback | `ZEROPG_AUTH=trust` | refuse |
 
 `wireHost=0.0.0.0` with no credential is the worst case in the system and becomes a hard
@@ -396,6 +396,95 @@ without `POST /flush` first. Recovery of a lost password is a reset, never a rev
 `zeropg fleet doctor` actively probes every service for an unauthenticated `POST /sql` and a
 wrong-password wire accept. That is what proves the MongoDB default is actually gone, rather
 than believed gone.
+
+## 7c. THE ONE REAL DISAGREEMENT: is TLS required or merely offered?
+
+Two designers reached opposite conclusions. The disagreement is worth more than either answer,
+so it is recorded rather than smoothed away.
+
+**The credential designer said: require TLS on any non-loopback wire.** SCRAM protects the
+password but not the data, and without channel binding it does not authenticate the server.
+Neon's posture, not Supabase's.
+
+**The wire designer ran the experiment and it breaks the north star.** Against a
+TLS-configured pg-gateway fronting PGlite:
+
+| client | result |
+|---|---|
+| `psql`, no sslmode param | works |
+| `psql sslmode=prefer` | works |
+| `psql sslmode=require` | works |
+| `psql sslmode=verify-full`, pinned CA | works |
+| `psql sslmode=disable` | rejected, `FATAL: SSL connection is required` |
+| **`new pg.Client({connectionString})`, no ssl option** | **FAILS, `08P01`** |
+
+The last row is the whole argument. node-postgres defaults `ssl: false` and sends the
+StartupMessage with **no SSLRequest at all**, so a TLS-required server rejects the single most
+common way a Node app connects. Neon only survives this by shipping `?sslmode=require` inside
+every connection string they hand out.
+
+**Recommendation: Supabase's posture here, not Neon's. TLS offered, never required.** Tri-state
+`off | optional | required`, defaulting to `optional`. That also means every currently-verified
+app - Cal.com, Documenso, NocoDB, cocoon, webhookx, PostgREST, GoTrue, nostream - keeps working
+byte-identically with its existing `sslmode=disable`, which is the entire migration story.
+
+Note this reverses the "Neon's posture is the right one" line elsewhere in these docs, which
+was written before the experiment existed. **The experiment wins.**
+
+**TLS by topology, which is what actually decides it:**
+
+- Cloud Run loopback sidecar, the recommended and only real cloud topology: the raw wire port
+  is not exposed at all. TLS is theater - an attacker on that loopback already has code
+  execution in the container. Same for local `serveWire`, console, and fleet.
+- **Fly.io is the genuine exception.** It forwards a real public TCP port, so TLS plus SCRAM
+  there are load-bearing.
+
+Build TLS anyway, for two non-security reasons: `sslmode=require` appears hardcoded in config
+templates in the wild, and one code path beats two.
+
+**Certificate handling has a scale-to-zero-specific trap.** Self-signed, generated once and
+**persisted in the object store next to the manifest under the lease**. A cert regenerated per
+boot would break pinning on a database that boots constantly. Overridable by PEM file or env.
+`verify-full` works only against a pinned CA or a user-supplied real cert. No ACME.
+
+## 7d. Two more experimental results that change the wire plan
+
+**pg-gateway must be vendored, not depended on.** One `psql sslmode=verify-full` with a
+mismatched CA - unauthenticated, one packet - raised a TLS `unknown_ca` alert that surfaced as
+an uncaught `ERR_INVALID_STATE: WritableStream is locked` at `connection.ts:228` and **killed
+the entire Node process.** It escapes a `try/catch` around `fromNodeSocket` because it is
+thrown from an unawaited continuation inside `init()`. Reproduced a second time from an
+unrelated cert-loading error. Unfixable from outside the library, and the library is a beta on
+a branch unmerged for 19 months. Vendor a subset: connection, message buffers, `auth/sasl/*`,
+crypto, the node TLS adapter. Drop deno, web, md5, cert.
+
+**The naive adoption shape silently corrupts transactions.** Two clients each running
+`BEGIN; SET LOCAL myapp.uid='X'; pg_sleep; SELECT current_setting; COMMIT`:
+
+- under pglite-socket: `AAA saw AAA | BBB saw BBB`
+- under pg-gateway + `db.runExclusive(execProtocolRaw)`: `AAA saw AAA | BBB saw <empty>`
+
+**A's COMMIT terminated B's transaction and discarded B's `SET LOCAL`.** `runExclusive`
+serializes per message, not per transaction. This is exactly the failure PostgREST's
+per-request `BEGIN; SET LOCAL ROLE; ...; COMMIT` depends on not happening, so it is the RLS
+isolation risk made concrete. **The transaction-affinity queue is a correctness prerequisite,
+not polish.**
+
+Port it from pglite-socket's `QueryQueueManager`, but improve it: batch to the **Sync/Query
+boundary** rather than pglite-socket's per-message granularity, which still lets un-synced
+Parse/Bind/Execute sequences interleave on the shared unnamed portal. Verified that three
+Query messages in one `execProtocolRaw` call return three complete result sets.
+
+**Handshake replay beats synthesis.** Never forward the startup packet. Harvest PGlite's real
+429-byte block once at boot, strip `R` and `K`, force the trailing `Z` to `'I'`, and emit all
+16 real `ParameterStatus` messages per connection. pg-gateway sends only `server_version`;
+replaying the real block is strictly safer for pgjdbc and anything reading
+`standard_conforming_strings`, `DateStyle` or `TimeZone`.
+
+**Roles: map everything to `postgres`.** PGlite discards the startup `user` field entirely.
+Accept any username, verify the password, stay `postgres`. Zero regression risk, and it
+preserves the working Supabase story where PostgREST connects as `postgres` and does its own
+`SET LOCAL ROLE`.
 
 ---
 
