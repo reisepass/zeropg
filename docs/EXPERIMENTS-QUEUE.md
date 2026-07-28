@@ -327,3 +327,95 @@ traffic. Our own frontend has to decide that per-listener.
 **Decides.** The defect is real and the "adopting as a dependency is disqualified"
 conclusion stands. But it is a ~15-line fix in code we would own, not an architectural
 flaw, so it argues for vendoring rather than against pg-gateway as a starting point.
+
+---
+
+## E10. Does prepared-statement namespacing unblock sqlx? **DONE - namespacing works, sqlx stays blocked**
+
+**Why.** [TODO-pglite-socket-prepared-statements.md](TODO-pglite-socket-prepared-statements.md)
+calls this "the single highest-value enhancement surfaced by the real-apps
+exercise", because named prepared statements are what block Rust sqlx and Diesel,
+neither of which has a DSN escape hatch the way Go's pgx does
+(`default_query_exec_mode=cache_describe`). The rewriter was previously built and
+verified; this rebuilds it, then asks the question that was not asked - whether
+fixing names is sufficient.
+
+### Result, 2026-07-28. The rewriter works. It is not enough.
+
+`experiments/pg-gateway/lib/stmt-rewriter.ts`, roughly 45 lines of real logic,
+prefixes statement and portal names per connection on Parse/Bind/Describe/Close/Execute.
+`e-prepared-stmts.ts` drives it with real node-postgres clients:
+
+```
+=== collision [rewriter OFF] ===
+  A prepares s1: rows=1
+  B prepares s1: ERROR 42P05 prepared statement "s1" already exists
+
+=== collision [rewriter ON] ===
+  A prepares s1: rows=1
+  B prepares s1: rows=2
+  A re-executes s1: 1
+
+=== many connections, same statement names, concurrent ===
+  8 connections x 5 rounds of prepared "shared": 0 failure(s)
+```
+
+Reproduced as previously recorded, and it holds under 8-way concurrency with every
+connection reusing the same name.
+
+### The blocking finding: advisory locks are unfixable at the wire layer
+
+```
+pg_try_advisory_lock(42) from 3 separate connections: [true, true, true]
+rows in pg_locks where locktype='advisory': 1
+```
+
+**All three connections were granted the same exclusive lock.** Confirmed to be
+inherent, not an artifact of the gateway or the rewriter - calling
+`pg_try_advisory_lock(42)` three times against a bare `PGlite` instance with no wire
+at all returns `true, true, true` with one row in `pg_locks`. Advisory locks are
+session-scoped and **re-entrant within a session**. Multiplexing N connections onto
+one session means they are all the same lock holder, so mutual exclusion silently
+degrades to a no-op.
+
+This is the mechanism behind the previously measured result, and it means:
+
+- **sqlx is NOT unblocked by statement namespacing.** `sqlx migrate` serializes on
+  `pg_advisory_lock`. With namespacing it gets past 42P05 and then races on
+  migrations instead - arguably a worse failure, because 42P05 is a loud error and a
+  lost migration race is silent corruption.
+- The same applies to golang-migrate, Diesel's migration harness, and anything else
+  using advisory locks as a distributed mutex.
+- No wire-layer rewrite can fix it. The lock namespace is the session, and the whole
+  premise is one shared session. Fixing it means either a real lock manager in the
+  router keyed by connection id, or a per-connection PGlite, which is the thing the
+  architecture exists to avoid.
+
+**So the value of the rewriter is narrower than the TODO claims.** It unblocks
+drivers that merely *name* statements. It does not unblock the migration path for
+any driver that also takes an advisory lock, which is most of them.
+
+### The edges, all confirmed
+
+| edge | result |
+| --- | --- |
+| SQL-level `PREPARE p1` | `42P05` - it is a `Query` message carrying SQL text, so the rewriter never sees a name field |
+| `DEALLOCATE d1` after a protocol prepare | `26000 prepared statement "d1" does not exist` - client asks for the unprefixed name |
+| `pg_prepared_statements` | shows `c1_d1` - leaks the internal prefix, and shows every other connection's statements |
+| `ErrorResponse` text | **fixed here.** `rewriteIncoming()` strips the prefix from ErrorResponse/NoticeResponse |
+
+The ErrorResponse un-prefixing was previously listed as unhandled and is now
+implemented. It was verified with a negative control rather than trusted, because
+node-postgres raises its own client-side error for a duplicate name that never
+reaches the server and would have made the test pass vacuously. Driving a raw
+`Describe('S', 'ghost')` over a hand-built socket:
+
+```
+without rewriteIncoming:  prepared statement "c1_ghost" does not exist
+with    rewriteIncoming:  prepared statement "ghost" does not exist
+```
+
+**Decides.** Build the rewriter, it is cheap and correct. But do not put "unblocks
+sqlx" on it in any roadmap or marketing copy - that claim is now measured false. The
+advisory-lock semantics are the real blocker for Rust migration tooling, they sit
+below the wire, and they need their own entry.
