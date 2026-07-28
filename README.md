@@ -28,15 +28,28 @@ single-file model have to be translated away. zeropg is the experiment in removi
 trade-off:
 
 ```
-memory://          in-process Postgres, for tests
-file://./dev.db    local Postgres in a directory, for dev (cross-process lockfile included)
-gs://my-bucket     scale-to-zero Postgres in YOUR bucket, for the idle-95%-of-the-day phase
-postgres://...     a normal always-on Postgres, when you outgrow all of this
+WORKS TODAY
+  memory://           in-process Postgres, for tests
+  file://./dev.db     local Postgres in a directory, for dev (cross-process lockfile included)
+  https://my-instance scale-to-zero Postgres in YOUR bucket, reached through a deployed
+                      instance that holds it, for the idle-95%-of-the-day phase
+  postgres://...      a normal always-on Postgres, when you outgrow all of this
+
+NOT WIRED YET
+  gs:// r2:// s3:// cos://   the same bucket-backed engine EMBEDDED in your process,
+                             with no instance in between
 ```
 
 One `connect(DATABASE_URL)` interface ([`@zeropg/client`](packages/client), on npm)
-covers the whole ladder; only the URL changes. The rungs that matter here are the middle
-ones. When to step off the ladder, and how: [docs/GRADUATION.md](docs/GRADUATION.md)
+covers the ladder; only the URL changes.
+
+The bucket rung is real and is what every demo below runs on, but today you reach it by
+pointing `connect()` at a **deployed instance** over `https://`, not by handing a bucket
+URL straight to the client. Passing `gs://` / `r2://` / `s3://` / `cos://` to `connect()`
+throws an error pointing at the `https://` form. The embedded bucket engine is the next
+increment of that rung; see [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+
+When to step off the ladder, and how: [docs/GRADUATION.md](docs/GRADUATION.md)
 (roughly: at ~0.5GB of data, sustained concurrent writes, or >4-5 awake-hours/day).
 
 ## See it live (real cold starts, scale to zero)

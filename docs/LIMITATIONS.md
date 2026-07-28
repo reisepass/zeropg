@@ -31,6 +31,16 @@ the cost math in [../BREAK-EVEN.md](../BREAK-EVEN.md), the exit in [GRADUATION.m
    (since the last flush) if the instance dies uncleanly. The serverless-native default
    is `sleep`; know what you picked.
 
+## Not wired yet (works in principle, no code path today)
+
+- **Bucket connection strings passed straight to `connect()`.** `gs://` / `r2://` /
+  `s3://` / `cos://` throw from `connect()`. The bucket-backed engine itself is real and
+  is what every demo runs on, but reaching it means deploying `@zeropg/server` pointed at
+  the bucket and connecting to that instance over `http(s)://`. What is missing is only
+  the *embedded* form, where the client opens the bucket in your own process with no
+  instance in between. Until then the working rungs are `memory://`, `file://`,
+  `http(s)://`, and `postgres://`.
+
 ## Driver / ORM compatibility
 
 | stack | verdict | detail |
