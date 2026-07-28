@@ -222,8 +222,20 @@ open, and may collapse the HTTP bearer token into a real Postgres password once 
 - A separate agent designing cold-start absorption at the wire, cross-referencing
   `docs/LAZY-PAGEFAULT-RESTORE-from-blob.md`.
 
-**The unsettled question that gates everything:** can we terminate auth ourselves and then
-hand PGlite a byte stream, or does PGlite generate its own AuthenticationOk / BackendKeyData /
-ReadyForQuery such that our own SASL exchange produces a double authentication sequence?
-pg-gateway's existing PGlite examples suggest this is solved, but confirm it in code before
-committing.
+**That question is now ANSWERED and no longer gates anything.** PGlite does emit its own
+handshake, so the double sequence is real, and handling it is ~20 lines: frame and discard
+the backend's handshake up to its `ReadyForQuery`, then forward the rest. Prototyped against
+real psql. The in-process path avoids it entirely.
+
+Better still, PGlite's handshake is a **hardcoded constant** - independently reproduced twice,
+byte-identical at 429 bytes with the same SHA-256 across a fresh instance, a second instance,
+a datadir carrying `ALTER DATABASE ... SET`, that datadir reopened, and a client sending
+`user=alice database=nope application_name=myapp`, down to `BackendKeyData pid=42
+secret=2875488`. So synthesizing it before the database exists loses nothing already lost.
+
+See [COLDSTART-ABSORPTION.md](COLDSTART-ABSORPTION.md). Its two consequences for this plan:
+
+- The `maxConnections` raw-string fix (item 3 above) is promoted from nice-to-have to
+  **prerequisite**. Handshake-early would tell a client "connected", hold it for seconds,
+  then kill it with a non-protocol string.
+- pg-gateway does not send `BackendKeyData` today, which the handshake-early design needs.

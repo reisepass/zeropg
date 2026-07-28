@@ -219,15 +219,29 @@ What owning the full frontend would unlock:
   `docs/POSTGRES-APP-COMPAT.md` Limitation 5.
 - **Cold-start absorption.** See section 8.
 
-The single most important unverified question, which must be settled by experiment before
-committing to build:
+### ANSWERED 2026-07-28: the double-handshake question no longer blocks anything
 
-> Can we terminate auth ourselves and then hand PGlite a byte stream, or does PGlite
-> generate its own AuthenticationOk / BackendKeyData / ReadyForQuery such that doing our own
-> SASL exchange produces a **double authentication sequence** that confuses clients?
+The question was: can we terminate auth ourselves and hand PGlite a byte stream, or does
+PGlite generate its own AuthenticationOk / BackendKeyData / ReadyForQuery such that our own
+SASL exchange produces a **double authentication sequence** that confuses clients?
 
-Read the actual PGlite code under `node_modules/@electric-sql/pglite/dist/` rather than
-speculating. Everything else in the build-vs-adopt decision depends on the answer.
+**Yes, PGlite emits its own handshake, so the double sequence is real. And it is ~20 lines to
+handle:** frame and discard the backend's handshake up to its `ReadyForQuery`, then forward
+everything after. Prototyped and driven with real psql. Alternatively the in-process path
+avoids it entirely. Either way it stops gating build-vs-adopt.
+
+**The stronger result, independently reproduced twice:** PGlite's startup handshake is a
+hardcoded constant. It does not depend on the datadir and does not depend on anything the
+client sends. Probed across a fresh instance, a second instance, a datadir carrying
+`ALTER DATABASE ... SET`, that datadir reopened, and a client sending
+`user=alice database=nope application_name=myapp` - all byte-identical, 429 bytes, same
+SHA-256, down to `BackendKeyData pid=42 secret=2875488`.
+
+So synthesizing the handshake before the database exists loses nothing that was not already
+lost. Fourteen of fifteen ParameterStatus keys are constants, `server_version` is pinned by
+`package.json`, and only `TimeZone` tracks the process `TZ`, which we control.
+
+Full evidence and design: [COLDSTART-ABSORPTION.md](COLDSTART-ABSORPTION.md).
 
 Build-vs-adopt is also open. **`pg-gateway`** (supabase-community, TypeScript, a Postgres
 wire server designed to front PGlite, believed to support TLS and SASL) may make this an
@@ -297,7 +311,34 @@ SQL with a single shared secret. It converts wide-open into one-secret-away. The
 topology stays loopback-sidecar. **Auth is the backstop for when someone ignores that, not
 permission to expose the face.**
 
-## 8. OPEN: cold-start absorption at the wire
+## 8. DESIGNED, not yet built: cold-start absorption at the wire
+
+> **Assessed 2026-07-28 with a working prototype. See
+> [COLDSTART-ABSORPTION.md](COLDSTART-ABSORPTION.md) for the full design.** Headline results,
+> which supersede the speculation kept below:
+>
+> - **It works.** Prototype frontend, real clients, deliberately slow restore. node-postgres
+>   at library defaults against an 11s restore: connect resolved at **4ms**, first query
+>   returned correct rows at **10880ms**. Real psql at default `sslmode=prefer` against a 6s
+>   restore: connect at 989ms, rows at 6.7s.
+> - **No blocking timeout finding.** No mainstream stack breaks on defaults at 5s or 11s. The
+>   one hazard is an *explicitly set* query timeout (verified: `pg` with
+>   `query_timeout=5000` dies at 5005ms). That is a documentation obligation, not a blocker.
+> - **Why the seam exists**, verified in library source: node-postgres arms
+>   `connectionTimeoutMillis` at `node_modules/pg/lib/client.js:160` and clears it in
+>   `_handleReadyForQuery` at `client.js:366`. Connect-phase budgets stop at `ReadyForQuery`;
+>   query-phase budgets start there. Sending `ReadyForQuery` early moves the wait out of a
+>   budget that is often 5-10s into one that is unbounded by default.
+> - **Recommendation: build the cheap version, drop the deep version, drop BOTH middle
+>   tiers, drop schema-only.** Roughly 4-6 person-days remaining.
+> - **Cap the hold, do not hold forever.** 30s, with the leasing and restoring phases capped
+>   separately so the error names the phase it died in.
+> - **The `maxConnections` raw-string bug becomes a PREREQUISITE, not a nice-to-have.**
+>   Handshake-early would tell a client "connected", hold it for seconds, then kill it with a
+>   non-protocol string. The frontend must own the cap and emit `53300` first.
+> - Note for the pg-gateway adoption: it does **not** send `BackendKeyData` today.
+
+Original speculation follows.
 
 Today `boot()` runs `phase='restoring'` (`ZeroPG.open`) first and only reaches `phase='wire'`
 at `server.ts:155-168`. **The wire port does not listen during cold start**, so clients get
