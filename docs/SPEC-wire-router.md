@@ -44,6 +44,23 @@ Cloud Run's refusal of inbound raw TCP is the only thing the shim works around. 
 general-purpose component and should not be presented as one, or made a prerequisite for
 anything else in the roadmap.
 
+> **Both rows above are now measured, 2026-07-28.** E11 confirmed the Fly row end to end: libpq
+> at its **default** `sslmode` connects to a public IP with no query-string workaround, the
+> Machine autostops to zero, and a stopped Machine **holds** the connection while it boots
+> (~10.5s cold, ~0.55s warm). E10 confirmed the Cloud Run row: per-burst tunnels reopen in
+> ~100ms against a warm, unbilled instance.
+>
+> Fly is the simpler default for the public-`postgres://` story - no shim, no extra moving
+> parts. The shim remains the answer when the backends must be on Cloud Run.
+>
+> Two caveats carried out of E11, both recorded there in full. **(1)** The server must bind its
+> wire port *before* the PGlite restore, or Fly's proxy gives up waiting (~8.4s budget versus a
+> ~4.2s restore that lands either side of it at random); `experiments/e11-fly-baseline/prebind.mjs`
+> demonstrates the fix. **(2)** A second Machine cannot corrupt the bucket - the stale writer is
+> fenced at commit - but it *can* accept a write, return success, and have the proxy route
+> clients to it, so the row is silently lost. A fenced writer should close its listener and exit
+> rather than only failing its flush.
+
 **Consequence for priority.** The router work in sections 3-6 serves the always-on-box case,
 which the cost model favours from roughly the second or third database onward. That has more
 users than the shim does. Build order in section 8 already reflects this: steps 1-3 stand
@@ -151,10 +168,38 @@ Three options, and on GCP only one works:
 > instance warm-but-unbilled for a while, it does not. E9 measured billing, not instance
 > lifetime, so this is open. Tracked as **E10** in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md).
 >
-> Until E10 runs, do not conclude either way. Steps 1-3 of the build order do not depend on it.
+> ### SETTLED 2026-07-28 by E10: the per-burst tunnel works. Build step 4.
+>
+> Cloud Run keeps the instance **warm and unbilled** between bursts. Measured on a deployed
+> service with `min-instances=0`, sweeping gaps of 5s / 30s / 60s / 300s / 900s with nothing
+> connected during the gap:
+>
+> - **The instance never died**, not even across 15 minutes. One instance (`boot=41d8b82a`)
+>   served the entire 22-minute sweep with the tunnel closed for all but a few hundred ms.
+> - **Reopen cost 93-117ms**, flat against gap length. No burst paid a cold start.
+> - **Billing read 0.0 s/min** for the fifteen consecutive buckets spanning the 900s gap,
+>   against the **60.2 s/min** a *held* socket costs. Same platform, same config.
+>
+> So the shim's premise survives: one cheap always-on box fronting many scale-to-zero
+> databases, paying only for the bursts. The 60-minute request-timeout ceiling also stops
+> mattering, because it caps a tunnel's lifetime and a burst tunnel lives for a burst.
+>
+> **The `ReadyForQuery` rule is confirmed sufficient** for the transaction half: a real wire
+> proxy driven by real psql refused to close on `T` and `E`, closed on `I`, and the COMMIT
+> issued after the gap survived.
+>
+> **A correction E10 forced, which matters for how the earlier result is read.** E9's claim
+> that a pinned instance has "full CPU" rested on a `setInterval` tick keeping pace with wall
+> clock. That is not a CPU measurement - a tick callback is nearly free and keeps firing under
+> heavy throttling. Running a fixed CPU-bound unit of work inside each tick shows it taking
+> ~50ms with a socket open and **4-13.9 seconds** during a gap, an 80-190x throttle, which
+> agrees with the billing metric. E9's billing numbers stand; only the tick-to-CPU inference
+> was wrong.
 
 Superseded framing, kept for the record: the original spec said a router without (1) can accept
-your connection and then do nothing useful on GCP, and must not ship without the bridge. E9 shows the bridge itself is the non-viable part.
+your connection and then do nothing useful on GCP, and must not ship without the bridge. E9 was
+then read as showing the bridge itself is the non-viable part - which E10 has since narrowed to
+the *held* bridge specifically. A per-burst bridge is viable and is what gets built.
 
 ## 3. Routing requires parsing the startup packet
 
@@ -294,13 +339,13 @@ describes.
 2. **Warm set greater than 1, with the full eviction protocol** and a test that asserts writes
    survive an eviction under load. This is the step that can lose data if rushed.
 3. **Cold-start holding**, per section 4.
-4. ~~**WebSocket bridge and remote placement.**~~ **BLOCKED, and not by difficulty.** E9 in
-   [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md) measured an open WebSocket pinning a Cloud Run
-   instance awake and billable 1:1 for the connection's whole life. The bridge would work and
-   would deliver nothing: every database with a connected client becomes always-on, so you pay
-   for the shim box *and* the fleet it was supposed to keep asleep. Do not build this until
-   there is a reachability answer that does not hold a request open, or the databases move to a
-   platform with real TCP ingress (see E1).
+4. **WebSocket bridge and remote placement - build it PER BURST, never held.** Unblocked
+   2026-07-28 by E10. A tunnel opened per query burst and closed on `ReadyForQuery = 'I'`
+   reopens in ~100ms against an instance that Cloud Run keeps warm and **bills at 0.0 s/min**,
+   verified across gaps up to 15 minutes. The design constraint is absolute and is the whole
+   difference between this and the version E9 killed: **a held tunnel bills 1:1 (60.2 s/min)
+   and must never ship.** Close on `I`, never on `T` or `E`; E10's proxy demonstrates the rule.
+   Lower priority than steps 1-3, which serve more users, but no longer blocked.
 5. **TLS and SCRAM**, only if a genuinely public port is the goal. On a private network or
    loopback these are theater. See the fork in
    [HANDOFF-2026-07-28-wire-auth.md](HANDOFF-2026-07-28-wire-auth.md).
@@ -319,9 +364,18 @@ involvement.
   WebSocket carrying zero bytes, with full CPU throughout, and billing dropping to 0.0 the
   moment the socket closed.** The request timeout is also a hard cap on connection lifetime: a
   300s-timeout service tore the connection down at 300991ms with close code 1006, and 3600s is
-  an API-enforced maximum. So option (1) in section 2 pins every backend awake for as long as a
-  client is connected, at roughly $52/month per connected database, and the scale-to-zero
-  premise collapses. **Step 4 of the build order does not achieve what it was for.** Full
-  numbers and the reproduction recipe in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md) E9.
+  an API-enforced maximum. So a *held* tunnel pins every backend awake for as long as a client
+  is connected, at roughly $52/month per connected database. Full numbers in
+  [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md) E9.
+  **Narrowed 2026-07-28 by E10: this applies to held tunnels only.** A per-burst tunnel leaves
+  the instance warm and bills 0.0 s/min, so step 4 is viable after all - built per burst.
+  E10 also corrected E9's "full CPU" claim, which came from a tick counter that keeps firing
+  under throttling; a real CPU work unit shows an 80-190x throttle between bursts.
+- ~~**Does a public `postgres://` with scale-to-zero work on Fly.io?**~~ **SETTLED 2026-07-28
+  by E11: yes.** libpq at its default `sslmode` reaches a public IP with no workaround, the
+  Machine autostops to zero, and a stopped Machine holds the connection while it boots (~10.5s
+  cold, ~0.55s warm). Two caveats: bind the wire port before the restore or Fly's ~8.4s proxy
+  budget expires, and a fenced writer must close its listener rather than only failing its
+  flush, because the proxy will route clients to a stale Machine that acks writes it then loses.
 - **Whether a real Postgres could be the router**, giving a TCP endpoint plus federation in
   one box. Blocked on the same FDW connection-holding problem in section 7.
