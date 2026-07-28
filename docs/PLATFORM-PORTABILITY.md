@@ -11,6 +11,22 @@ cost notes), [COLDSTART-MODEL.md](COLDSTART-MODEL.md) (our measured cold starts)
 [../BREAK-EVEN.md](../BREAK-EVEN.md) (per-cloud cost crossovers),
 [CONNECTION-SECURITY-AND-WIRE.md](CONNECTION-SECURITY-AND-WIRE.md).
 
+> **CORRECTION 2026-07-28, read before the table.** This document's entire comparison is built
+> on requirement 1, "multiple containers in one scheduling unit sharing localhost". **That
+> requirement is not load-bearing and treating it as mandatory produced at least one wrong
+> verdict.** zeropg is a Node library, not a mandatory separate service: it can run fully
+> in-process inside the app's own process, or as a second process inside one container. The
+> sidecar is a convenience, not a constraint.
+>
+> Consequently the "AWS App Runner is a hard no" verdict below, which rests purely on App
+> Runner having no sidecar support, **does not follow.** App Runner's real disqualifiers, if
+> any, are idle billing and CPU throttling between requests, which are being re-checked. Every
+> other row scored on requirement 1 should be read with the same suspicion.
+>
+> The corrected AWS analysis, including AWS Lambda (omitted here entirely) and the always-on
+> VM economics, is in [AWS-SCALE-TO-ZERO.md](AWS-SCALE-TO-ZERO.md). Open experiments are
+> tracked in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md).
+
 ## 0. The deployment shape we are trying to port
 
 The reference is the live stripped-Supabase service,
