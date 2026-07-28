@@ -375,26 +375,39 @@ gap    reopen TTFB   query   same instance?   ticks in gap    CPU work unit duri
 30s        110ms      3ms    yes  41d8b82a      5 / 30          5   47ms / 8600ms / 9390ms
 60s         97ms      2ms    yes  41d8b82a      8 / 60          8   52ms / 8701ms / 9099ms
 300s        93ms      4ms    yes  41d8b82a     27 / 300        27  356ms / 11200ms / 13900ms
+900s       117ms      4ms    yes  41d8b82a     79 / 900        79   57ms / 11699ms / 13570ms
 ```
 
-**No gap ever cost a cold start.** The instance identity (`boot`) was the same `41d8b82a`
-across every gap up to and including 300 seconds, so nothing was restarted and no burst paid
-the 3.5s-11s restore. Reopen time-to-first-byte sat in a **93-110ms** band with no upward trend
-against gap length - that is the round trip to europe-west1 plus the TLS and WebSocket
+**No gap ever cost a cold start, including 15 minutes.** The instance identity (`boot`) was the
+same `41d8b82a` across the entire sweep - one instance survived from 20:50 to 21:12 with the
+tunnel closed for all but a few hundred milliseconds of it. Nothing was restarted and no burst
+paid the 3.5s-11s restore. Reopen time-to-first-byte sat in a **93-117ms** band with no upward
+trend against gap length - that is the round trip to europe-west1 plus the TLS and WebSocket
 handshake, not a wake.
+
+The 900s row matters most: it is longer than Cloud Run's documented ~15-minute idle reaper, and
+the instance still survived it. So the warm window is at least 15 minutes, and this sweep never
+found its edge.
 
 **And the gap is not billed.** `run.googleapis.com/container/billable_instance_time`, 60s
 buckets, over the sweep:
 
 ```
-20:50  0.0     20:53  0.1     20:56  0.0
-20:51  0.4     20:54  0.0     20:57  0.1
-20:52  0.1     20:55  0.0     20:58  0.0
+20:50  0.0     20:56  0.0     21:02  0.0     21:08  0.0
+20:51  0.4     20:57  0.1     21:03  0.0     21:09  0.0
+20:52  0.1     20:58  0.0     21:04  0.0     21:10  0.0
+20:53  0.1     20:59  0.0     21:05  0.0     21:11  0.0
+20:54  0.0     21:00  0.0     21:06  0.0     21:12  0.1   <- burst ending the 900s gap
+20:55  0.0     21:01  0.0     21:07  0.0
 ```
+
+The 900s gap spans 20:57 to 21:12 and every one of those fifteen buckets reads **0.0**, while
+the instance that answered at 21:12 is the same `41d8b82a` that answered at 20:57. Alive for
+fifteen minutes, billed for none of it.
 
 Set against E9's held socket, which billed **60.2 seconds per 60-second bucket** on the same
 configuration, this is the whole result in one comparison: **held tunnel 60.2 s/min, per-burst
-tunnel ~0.1 s/min, and the instance survives either way.** The tenths that do appear are the
+tunnel 0.0 s/min, and the instance survives either way.** The tenths that do appear are the
 bursts themselves.
 
 ### The tick counter is not a CPU measurement, and E9's use of it overstated its case
@@ -481,12 +494,14 @@ tunnel, quietly reverting to E9's billed-held-tunnel economics. The harness now 
   and a burst tunnel lives for a burst. The client's own `postgres://` session is terminated at
   the router and is unaffected.
 
-**What this does NOT establish.** The upper end of the sweep is unfinished: 900s was still
-running when this was written, so the warm window's outer edge is unmeasured and the instance
-may well die somewhere between 300s and 900s. That only costs a cold start on the first burst
-after a long quiet period, which is the case the product already absorbs. Also untested: bursts
-against a backend doing real PGlite work rather than an echo, and concurrent bursts from several
-routed databases at once.
+**What this does NOT establish.** The sweep never found the warm window's outer edge - 900s was
+the longest gap tested and the instance survived it, so the edge is somewhere beyond 15 minutes
+and unmeasured. Whatever it is, exceeding it costs one cold start on the first burst after a
+long quiet period, which is the case the product already absorbs. Also untested: bursts against
+a backend doing real PGlite work rather than an echo (the probe replies from memory, so nothing
+here says a burst carrying a real query stays this cheap), concurrent bursts from several routed
+databases at once, and whether a burst *arriving during* the throttled state pays a
+re-scheduling penalty that a 100ms TTFB measurement would hide.
 
 **Reproduce.** `experiments/e10-ws-burst/{server.mjs,burst.mjs,Dockerfile}`; deploy with
 `--min-instances=0 --max-instances=1 --timeout=3600`, run
