@@ -206,3 +206,124 @@ already; this adds the VM column.
 
 **Decides.** What we tell people the product is for, and at what fleet size we should stop
 recommending it.
+
+---
+
+## E9. Is the pg-gateway TLS process kill real, and is it patchable? **DONE - real, and patchable in ~15 lines**
+
+**Why.** [WIRE-AUTH-DECISION-2026-07-28.md](WIRE-AUTH-DECISION-2026-07-28.md) section 4
+disqualifies adopting pg-gateway as a dependency on the strength of this one defect.
+It deserved a reproduction rather than a citation, because if it is real it is a
+one-packet unauthenticated remote DoS on every zeropg database container, and if it is
+patchable the "we must own the source either way" conclusion still holds but for a
+much cheaper reason.
+
+### Result, 2026-07-28. Real. Reproduced. Worse than a hang, and trivially remote.
+
+`experiments/pg-gateway/e-tls-kill.ts` spawns a child server per scenario so a real
+process death is observable as an exit code. The server has every guard an application
+can apply from outside the library: `socket.on('error')`, a `try/catch` around
+`fromNodeSocket`, and a `.catch()` on its promise.
+
+| scenario | outcome |
+| --- | --- |
+| `psql sslmode=verify-full`, mismatched CA | **process DIED, exit=1** |
+| `psql sslmode=verify-ca`, mismatched CA | **process DIED, exit=1** |
+| `psql sslmode=require` (client accepts cert) | survived, `select 1` returned |
+| same attack + process-level `unhandledRejection` handler | survived |
+
+```
+Error: ...SSL routines:ssl3_read_bytes:tlsv1 alert unknown ca...
+  reason: 'tlsv1 alert unknown ca', code: 'ERR_SSL_TLSV1_ALERT_UNKNOWN_CA'
+node:internal/webstreams/writablestream:215
+=> process DIED (exit=1 sig=null)
+```
+
+**No credentials, no valid startup packet, no account.** The attacker only has to
+complete a TCP handshake and refuse the certificate, which every stock libpq does
+automatically under `sslmode=verify-full` against a cert it cannot chain. A *misconfigured
+client* kills the database. This is as likely to fire by accident as by malice.
+
+### Mechanism, from the recovered source
+
+Two independent defects compose, and both are needed for the process to die:
+
+1. **`connection.ts:162`, the constructor calls `this.init(duplex)` and discards the
+   promise.** Every rejection out of `init()` is an unhandledRejection, and Node's
+   default for that is process exit. This is *why* the caller's `try/catch` and
+   `.catch()` around `fromNodeSocket` cannot see it: they wrap the constructor, not
+   the dangling continuation it launched.
+2. **`connection.ts:228`, the `catch` block itself throws.** `processData()`'s `finally`
+   has already run `streamWriter.releaseLock()`, but by then the underlying
+   `WritableStream` is errored and locked by the TLS machinery. Both branches of the
+   handler touch it anyway - `getWriter()`/`close()` on the `BackendError` path,
+   `abort()` on the other - and each raises `ERR_INVALID_STATE: Invalid state:
+   WritableStream is locked`. A throw from inside a catch, on an orphaned promise.
+
+### The patch, and proof it works
+
+`experiments/pg-gateway/vendor/patched/` holds the recovered source with three patches.
+`e-tls-kill-patched.ts` runs the identical attack **with no process-level handler at all**,
+so a survival is the source patch and nothing else:
+
+```
+[child] onConnectionError: ERR_SSL_TLSV1_ALERT_UNKNOWN_CA ...tlsv1 alert unknown ca...
+[child] onConnectionError: ERR_INVALID_STATE Invalid state: WritableStream is locked
+[child] ALIVE 1 ... ALIVE 5
+ok   process SURVIVED 3 cert-rejection attacks with no process-level handler
+ok   the failure is still observable through the error sink
+ok   legitimate psql client served afterwards (777)
+```
+
+- **PATCH 1a**: keep the `init()` promise and attach a handler, so a failure is
+  attributable instead of fatal.
+- **PATCH 1b**: wrap the `catch` body in its own `try/catch`. Cleanup on an
+  already-broken stream is best-effort; there is no peer left to tell.
+- **PATCH 2**: replace `console.error(err)` with an `onConnectionError` option. Upstream
+  lets a remote peer drive this process's stderr volume with no way to route, count or
+  rate-limit it.
+
+Total: about 15 lines. **A process-level `unhandledRejection` handler also stops the
+death** (scenario 4) and is the only mitigation available without owning the source - but
+it is a blunt instrument that swallows every unrelated bug in the process too, so it is a
+stopgap, not a fix.
+
+### The regression suite matters more than the patch
+
+`e-patched-regression.ts` exists because a crash fix that quietly broke authentication
+would otherwise read as a pass. Against real psql, all green:
+
+```
+ok   SCRAM-SHA-256 accepted the correct password over TLS
+ok   SCRAM-SHA-256 REJECTED the wrong password
+ok   md5 accepted the correct password via node:crypto MD5
+ok   md5 REJECTED the wrong password
+ok   sslmode=require still works
+ok   sslmode=verify-full with the CORRECT CA still works
+ok   sslmode=disable is refused when tls is configured
+ok   plaintext gateway (no tls option) still works
+```
+
+**The `@std/crypto` audit came in far under budget.** Section 4 budgets "~60 LOC" to rip
+out `@std/crypto` and a supply-chain audit for the inlined WASM. The real dependency
+surface is four functions - `copy`, `concat`, `encodeHex`, `decodeBase64`/`encodeBase64` -
+and **only `auth/md5.ts` ever reaches `@std/crypto` at all**, for the single reason that
+Web Crypto has no MD5. `src/crypto.ts` already does SCRAM's PBKDF2/HMAC/digest against the
+global `SubtleCrypto`. So the 196 KB Rust wasm-bindgen blob exists solely to serve the
+legacy auth method we do not intend to offer, and `crypto.createHash('md5')` retires it.
+`vendor/patched/src/std-shim.ts` is the whole replacement.
+
+One gotcha worth recording, since it cost a debugging cycle and would recur: `md5.ts`
+imports the shim as `crypto`, **shadowing the global**, then calls
+`crypto.getRandomValues()` in `generateMd5Salt()`. A shim exposing only `subtle` turns
+that into a TypeError that surfaces as "server closed the connection unexpectedly" - it
+looks like a protocol bug, not a missing method. The shim must spread `globalThis.crypto`.
+
+**Also confirmed, and it constrains the deployment shape:** pg-gateway has no
+"TLS optional" mode. `connection.ts:370` refuses plaintext startup whenever `tls` is
+configured, so one gateway cannot serve both `sslmode=disable` loopback traffic and TLS
+traffic. Our own frontend has to decide that per-listener.
+
+**Decides.** The defect is real and the "adopting as a dependency is disqualified"
+conclusion stands. But it is a ~15-line fix in code we would own, not an architectural
+flaw, so it argues for vendoring rather than against pg-gateway as a starting point.
