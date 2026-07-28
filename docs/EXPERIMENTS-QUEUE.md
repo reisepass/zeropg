@@ -328,7 +328,7 @@ is recorded only so the reader knows the pin applies to *held* connections speci
 **Reproduce.** `experiments/e9-ws-pin/{server.mjs,hold.mjs,Dockerfile}`; deploy with
 `--min-instances=0 --max-instances=1`, run `node hold.mjs wss://<url>/wire 12`, then read
 `run.googleapis.com/container/billable_instance_time` over the window.
-## E10. Does a per-BURST WebSocket tunnel keep the shim viable? **OPEN, and it is the one that matters**
+## E10. Does a per-BURST WebSocket tunnel keep the shim viable? **DONE - YES. Warm, free, and ~100ms**
 
 **Why.** [E9](#e9-does-an-open-websocket-pin-a-cloud-run-instance-awake-and-billable-done---yes-11)
 answered a narrower question than it appeared to: it measured a tunnel **held open and idle**,
@@ -360,6 +360,139 @@ tunnel while `ReadyForQuery` reports `T`, and does close it on `I`.
 **Decides.** Whether the tiny-VM shim in front of Cloud Run backends is viable at all, and
 therefore whether step 4 of the build order in [SPEC-wire-router.md](SPEC-wire-router.md) gets
 built. Steps 1-3 do not depend on it.
+
+### Result, 2026-07-28. The per-burst tunnel works. Between bursts the instance is warm AND free.
+
+Ran on `experiments/e10-ws-burst/`, deployed to Cloud Run `e10-ws-burst` (europe-west1,
+`--min-instances=0 --max-instances=1`, 1 vCPU / 512 MiB, `--timeout=3600`). Each burst opens a
+WebSocket, waits for the hello frame, sends one trivial query, reads the reply, and closes.
+The gap that follows carries **no open connection at all**.
+
+```
+gap    reopen TTFB   query   same instance?   ticks in gap    CPU work unit during gap
+                                              (vs wall clock)  (n, min / median / max)
+ 5s        107ms      3ms    yes  41d8b82a      2 / 5           2   50ms / 4056ms / 4056ms
+30s        110ms      3ms    yes  41d8b82a      5 / 30          5   47ms / 8600ms / 9390ms
+60s         97ms      2ms    yes  41d8b82a      8 / 60          8   52ms / 8701ms / 9099ms
+300s        93ms      4ms    yes  41d8b82a     27 / 300        27  356ms / 11200ms / 13900ms
+```
+
+**No gap ever cost a cold start.** The instance identity (`boot`) was the same `41d8b82a`
+across every gap up to and including 300 seconds, so nothing was restarted and no burst paid
+the 3.5s-11s restore. Reopen time-to-first-byte sat in a **93-110ms** band with no upward trend
+against gap length - that is the round trip to europe-west1 plus the TLS and WebSocket
+handshake, not a wake.
+
+**And the gap is not billed.** `run.googleapis.com/container/billable_instance_time`, 60s
+buckets, over the sweep:
+
+```
+20:50  0.0     20:53  0.1     20:56  0.0
+20:51  0.4     20:54  0.0     20:57  0.1
+20:52  0.1     20:55  0.0     20:58  0.0
+```
+
+Set against E9's held socket, which billed **60.2 seconds per 60-second bucket** on the same
+configuration, this is the whole result in one comparison: **held tunnel 60.2 s/min, per-burst
+tunnel ~0.1 s/min, and the instance survives either way.** The tenths that do appear are the
+bursts themselves.
+
+### The tick counter is not a CPU measurement, and E9's use of it overstated its case
+
+E9 concluded "the instance is not merely alive, it has **full CPU**" from a `setInterval` tick
+advancing 60 times per 60 seconds. The first E10 sweep reproduced exactly that: ticks kept pace
+across the gaps, and the run was on course to be written up as WARM-WITH-CPU (billed).
+
+That reading is wrong, and the billing metric above is the proof. A `setInterval` callback that
+increments an integer is nearly free, so it keeps firing on schedule on an instance throttled to
+a small fraction of a core. **Ticks measure scheduling, not capacity.** So the probe was changed
+to run a fixed CPU-bound unit of work (a 2M-iteration arithmetic loop) inside each tick and
+record how long it took. The same unit of work:
+
+- **~50ms** while a socket is open (E9's condition), and
+- **4,056ms to 13,900ms** during a gap with nothing connected
+
+which is an **80x to 190x** throttle. The instance is held in memory with its CPU almost
+entirely withdrawn. That is precisely the "warm but unbilled" state E10 was written to look for,
+and E9's instrument could not have detected it. The billing metric and the work-unit timing are
+independent measurements and they agree.
+
+This does not overturn any E9 number: E9's billing figures stand, and a *held* socket really is
+billed 1:1 with full CPU. What is corrected is the inference that ticks alone establish CPU
+allocation.
+
+### The transaction rule holds, and the close is genuinely conditional
+
+`experiments/e10-ws-burst/txn-rule.mjs` is a real Postgres wire proxy - it parses the actual
+byte stream in both directions and applies a 3s idle-close timer gated on the `ReadyForQuery`
+status byte. Driven by a real `psql` session against the live E11 Fly backend, with 6s gaps so
+the timer fires repeatedly inside each state:
+
+```
+{"event":"ready-for-query","status":"I"}
+{"event":"ready-for-query","status":"T"}
+{"event":"tunnel-close-REFUSED","readyForQueryStatus":"T","reason":"...inside a transaction, MUST NOT close"}
+{"event":"tunnel-close-REFUSED","readyForQueryStatus":"T","reason":"...inside a transaction, MUST NOT close"}
+{"event":"ready-for-query","status":"E"}
+{"event":"tunnel-close-REFUSED","readyForQueryStatus":"E","reason":"...inside a transaction, MUST NOT close"}
+{"event":"tunnel-close-REFUSED","readyForQueryStatus":"E","reason":"...inside a transaction, MUST NOT close"}
+{"event":"ready-for-query","status":"I"}
+{"event":"tunnel-close-ALLOWED","readyForQueryStatus":"I","reason":"ReadyForQuery=I, session is idle, safe to close"}
+
+  PASS  proxy parsed ReadyForQuery='T' / 'E' / 'I'
+  PASS  close REFUSED while ReadyForQuery='T'
+  PASS  close REFUSED while ReadyForQuery='E'
+  PASS  close ALLOWED once ReadyForQuery='I'
+  PASS  no close ever ALLOWED on a non-'I' status
+  PASS  row committed across the gap survived (count=1, got 1)
+  RESULT: PASS
+```
+
+The `COMMIT` issued after a 6s gap succeeded and the row is visible on a separate direct
+connection, so the refusal protected real work rather than only logging that it would. A failed
+transaction (`E`) is held open too, and released only when `ROLLBACK` returns the session to
+`I` - the close is conditional in both directions, not a disguised "never close".
+
+**A trap worth recording, because it fails silently and in the SAFE direction.** The first
+version of the parser walked Postgres message framing from byte zero and never found a single
+`ReadyForQuery`: every decision saw `status: null`. The cause is that libpq at its default
+`sslmode` sends an `SSLRequest` first, and the server answers with a **single bare byte** (`N`)
+that is not a length-framed message. Feeding that byte to the framing walker desyncs it
+permanently - it reads `N` as a message type and the next four bytes, really the head of
+`AuthenticationOk`, as a length. Nothing errors. The proxy simply never observes a transaction
+state again, and because `null` is not `'I'` it refuses every close, so the test still *passed
+every behavioural assertion*. A router built this way would look correct and would never close a
+tunnel, quietly reverting to E9's billed-held-tunnel economics. The harness now asserts that
+`T`, `E` and `I` were each actually parsed, so a null-status run fails loudly.
+
+### What it means for the design
+
+**Answer: yes, the per-burst tunnel keeps the shim viable. Step 4 of the build order is back on.**
+
+- **Cost.** A burst tunnel is billed for the burst and nothing else. Idle gaps up to 300s cost
+  ~0.1 s/min against E9's 60.2 s/min, so the shim's premise - one cheap always-on box fronting
+  many scale-to-zero databases - survives intact.
+- **Latency.** ~100ms to reopen, flat across gap length. There is no cold start to absorb at
+  these gaps, so [COLDSTART-ABSORPTION.md](COLDSTART-ABSORPTION.md)'s hold-the-first-query
+  machinery is not needed on the warm path (it is still needed for the genuinely-cold first hit).
+- **Correctness.** The `ReadyForQuery` rule is sufficient for the transaction half and is cheap
+  to implement, since the router parses the protocol anyway to route by database name.
+- **The 60-minute request-timeout ceiling stops mattering.** It caps a single tunnel's lifetime,
+  and a burst tunnel lives for a burst. The client's own `postgres://` session is terminated at
+  the router and is unaffected.
+
+**What this does NOT establish.** The upper end of the sweep is unfinished: 900s was still
+running when this was written, so the warm window's outer edge is unmeasured and the instance
+may well die somewhere between 300s and 900s. That only costs a cold start on the first burst
+after a long quiet period, which is the case the product already absorbs. Also untested: bursts
+against a backend doing real PGlite work rather than an echo, and concurrent bursts from several
+routed databases at once.
+
+**Reproduce.** `experiments/e10-ws-burst/{server.mjs,burst.mjs,Dockerfile}`; deploy with
+`--min-instances=0 --max-instances=1 --timeout=3600`, run
+`node burst.mjs wss://<url>/wire 5 30 60 300 900`, then read
+`run.googleapis.com/container/billable_instance_time` over the window. Transaction rule:
+`./txn-rule-drive.sh <backend-host> 5432` against any real Postgres wire endpoint.
 
 ---
 
