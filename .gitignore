@@ -39,3 +39,6 @@ experiments/prisma-spike/dbpush.ts
 
 # local marketing prep - never commit (personal/company channel drafts)
 local-writing/
+
+# router scratch probes (throwaway)
+scratch/
