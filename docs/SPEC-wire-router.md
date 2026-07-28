@@ -11,10 +11,22 @@ keeps warm:
 | warm set | box | what it behaves like | cold start on first hit |
 |---|---|---|---|
 | `0` | GCP `e2-micro`, ~1 GB | pure protocol terminator and waker | always paid |
-| `1-2` | 2-4 GB | shim that also hosts the hottest database | zero for the warm set |
-| `3-4 medium`, `15-20 small` | 8 GB | actual database host | zero for the warm set |
+| `1-2` | 2 GiB | shim that also hosts the hottest database | zero for the warm set |
+| `16-18` | 8 GiB | actual database host | zero for the warm set |
 
 Build it once. Pick the box later. Do not fork the codebase for the two shapes.
+
+> **CORRECTED 2026-07-28, capacity is per INSTANCE, not per byte.** An earlier draft of this
+> table said "3-4 medium, 15-20 small" on 8 GiB, extrapolating from "a 500 MB database wants
+> about 2 GiB comfortable". That is wrong. Measured resident memory is roughly **constant per
+> PGlite instance and almost independent of database size**: about 400 MB on Linux at a 7.7 MB
+> database and about 420-440 MB at a 509 MB database. The footprint is PGlite's WASM heap, not
+> your data. (A macOS spot-check gave much larger and noisier figures, with RSS falling after
+> inserts, so treat the Linux numbers as the planning ones and re-measure on the target OS.)
+>
+> Two consequences. Capacity is a function of instance **count**, so a small database costs
+> nearly as much resident memory as a medium one. And a `t4g.nano` cannot host zeropg at all.
+> Tracked as E8 in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md).
 
 ## 1. Why this exists
 
@@ -143,6 +155,28 @@ New:
 - **WebSocket-to-wire bridge** in `@zeropg/server`, plus the client half in the router.
 - **Placement policy**: a single function `where(databaseName) -> local | remote | cold`, so
   that the local-only build and the local-plus-remote build differ by one branch body.
+
+## 6.5. The wire path needs a background timer. The HTTP path does not.
+
+Load-bearing for anything that wants to host the router on freeze-between-requests compute
+such as AWS Lambda.
+
+- **Engine, HTTP `/sql`, `durability: 'strict'`**: genuinely zero CPU between requests. Lease
+  renewal is on the request path (`packages/objectstore-fs/src/zeropg.ts:1275`, "E4 bet b: no
+  background work"), WAL shipping happens inside `commit()`, and the engine's only
+  `setInterval` is gated on `durability === 'interval'` (`zeropg.ts:470`).
+- **Wire path**: `packages/server/src/server.ts:225-228` starts `wireFlushTimer` on a 5s
+  interval **unconditionally, in every durability mode**. It exists because raw-wire writes
+  hit PGlite directly and never pass through `ZeroPG.query()`/`exec()`, so they bypass the
+  dirty flag and the durable commit that flag triggers. The timer watches Postgres' own
+  row-modification counters and commits only when they advance.
+
+**So the router, which is by definition a wire-path component, cannot run on compute that is
+frozen between requests.** Writes arriving over the wire would never be flushed. That rules
+out AWS Lambda as a router host, whatever it may be worth as a host for the HTTP face.
+
+An always-on VM has no such problem, which is a further argument for the shape this spec
+describes.
 
 ## 7. Non-goals
 
