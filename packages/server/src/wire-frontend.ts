@@ -45,6 +45,51 @@ export interface WireFrontendOptions {
    *  port this front-end chose. Kept as a factory so this module never needs to
    *  import the optional @electric-sql/pglite-socket dependency itself. */
   createInner: (cfg: { host: string; port: number }) => InnerSocketServer
+  /** Max concurrent client connections. Over-cap connections are refused with a
+   *  real ErrorResponse (SQLSTATE 53300). Must match the inner server's own
+   *  maxConnections so the cap is enforced HERE, where we can speak protocol,
+   *  rather than by the inner server, which cannot. */
+  maxConnections?: number
+  /** Name used in the over-cap message to tell the operator which knob to turn
+   *  (e.g. 'maxConnections'). */
+  limitOptionName?: string
+  /** Limit quoted in the over-cap message. Defaults to maxConnections, but a
+   *  caller that reserves slots for itself should report the USER-VISIBLE budget
+   *  instead: ZeroPGServer adds PostgREST's pool to the enforced cap, and
+   *  quoting that sum would name a number the user never configured. */
+  reportedLimit?: number
+}
+
+/**
+ * Encode a Postgres ErrorResponse ('E'). pglite-socket's own over-cap path
+ * writes the raw string "Too many connections\n" and ends the socket, which is
+ * not protocol: libpq reports "server closed the connection unexpectedly" and
+ * node-postgres reports "Connection terminated unexpectedly", both of which read
+ * like the server crashed. A real ErrorResponse gives the client a SQLSTATE and
+ * a message it can print.
+ *
+ * Wire format: 'E', int32 length, then NUL-terminated (fieldCode, value) pairs,
+ * terminated by a zero byte. S/V severity, C SQLSTATE, M message are the fields
+ * every driver reads.
+ */
+function errorResponse(severity: string, code: string, message: string): Buffer {
+  const fields = [
+    ['S', severity],
+    ['V', severity],
+    ['C', code],
+    ['M', message],
+  ] as const
+  const parts: Buffer[] = []
+  for (const [key, value] of fields) {
+    parts.push(Buffer.from(key, 'ascii'), Buffer.from(value, 'utf8'), Buffer.from([0]))
+  }
+  parts.push(Buffer.from([0])) // end of field list
+  const body = Buffer.concat(parts)
+  const out = Buffer.alloc(5 + body.length)
+  out.write('E', 0, 'ascii')
+  out.writeInt32BE(4 + body.length, 1) // length covers itself, not the type byte
+  body.copy(out, 5)
+  return out
 }
 
 /** Pick a free TCP port by binding an ephemeral server and reading it back. */
@@ -70,17 +115,33 @@ export class WireFrontend {
   private readonly requestedPort: number
   private readonly createInner: WireFrontendOptions['createInner']
 
+  private readonly maxConnections: number
+  private readonly limitOptionName: string
+  private readonly reportedLimit: number
+
   private front: Server | null = null
   private inner: InnerSocketServer | null = null
   private innerPort = 0
   private boundPort = 0
   private readonly conns = new Set<Socket>()
+  /** Connections that got past the cap and were handed to the inner server.
+   *  Counted separately from `conns`: a socket still negotiating has not taken
+   *  a slot yet, and one refused over-cap never takes one. */
+  private live = 0
   private stopped = false
 
   constructor(opts: WireFrontendOptions) {
     this.host = opts.host ?? '127.0.0.1'
     this.requestedPort = opts.port && opts.port > 0 ? opts.port : 0
     this.createInner = opts.createInner
+    this.maxConnections = opts.maxConnections ?? 100
+    this.limitOptionName = opts.limitOptionName ?? 'maxConnections'
+    this.reportedLimit = opts.reportedLimit ?? this.maxConnections
+  }
+
+  /** Connections currently held against the cap. */
+  get activeConnections(): number {
+    return this.live
   }
 
   /** The public port callers connect to (valid after start()). */
@@ -155,6 +216,35 @@ export class WireFrontend {
     // our manual write of `pending`, once we pipe below.
     client.pause()
     client.removeListener('data', onData)
+
+    // Enforce the cap HERE rather than letting the inner server do it. Its own
+    // over-cap path writes a raw non-protocol string, which surfaces to clients
+    // as "server closed the connection unexpectedly" / "Connection terminated
+    // unexpectedly" - indistinguishable from a crash. We own the public port, so
+    // we can answer in protocol. Checked after negotiation because the client is
+    // only ready to parse an ErrorResponse once it has stopped expecting an
+    // SSL negotiation byte.
+    if (this.live >= this.maxConnections) {
+      client.write(
+        errorResponse(
+          'FATAL',
+          '53300', // too_many_connections
+          `too many connections for this zeropg instance (limit ${this.reportedLimit}). ` +
+            `Close idle connections, lower your pool size, or raise the ${this.limitOptionName} option.`,
+        ),
+      )
+      client.end()
+      return
+    }
+
+    this.live++
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      this.live--
+    }
+    client.once('close', release)
 
     const inner = connect({ host: '127.0.0.1', port: this.innerPort })
 

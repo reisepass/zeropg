@@ -109,15 +109,22 @@ export async function serveWire(opts: ServeWireOptions = {}): Promise<WireServer
   // WireFrontend). Without it, libpq/pgx at their default sslmode=prefer hang:
   // pglite-socket does not implement SSL negotiation. The inner PGLiteSocketServer
   // is bound by the front-end on a private loopback port.
+  const maxConnections = opts.maxConnections ?? 100
   const server = new WireFrontend({
     host,
     port: opts.port && opts.port > 0 ? opts.port : 0,
+    maxConnections,
+    limitOptionName: 'maxConnections',
     createInner: (cfg) =>
       new PGLiteSocketServer({
         db: pglite,
         host: cfg.host,
         port: cfg.port,
-        maxConnections: opts.maxConnections ?? 100,
+        // Headroom above the front-end's cap so the front-end is the one that
+        // refuses, in protocol. If the inner server hit its own limit first it
+        // would write a raw non-protocol string and the client would see a
+        // bare disconnect instead of a 53300.
+        maxConnections: maxConnections + 1,
       }),
   })
   try {

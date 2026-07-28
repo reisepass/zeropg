@@ -26,7 +26,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { BlobStore } from '@zeropg/blobstore'
 import { ZeroPG, FencedError, LockedError, type Durability } from '@zeropg/objectstore-fs'
-import { PostgrestProcess, postgrestBootstrapSql } from './postgrest.js'
+import { PostgrestProcess, postgrestBootstrapSql, POSTGREST_POOL_SIZE } from './postgrest.js'
 import { WireFrontend } from './wire-frontend.js'
 
 let PGLiteSocketServer: typeof import('@electric-sql/pglite-socket').PGLiteSocketServer
@@ -49,6 +49,18 @@ export interface ZeroPGServerOptions {
   wireHost?: string
   /** Local PostgREST port (loopback; reverse-proxied under /rest). Default 3000. */
   restPort?: number
+  /**
+   * Wire connections available TO THE CALLER, i.e. the user-visible budget.
+   * Default 10, which matches a node-postgres Pool at its own default max of 10.
+   *
+   * The arithmetic: PostgREST is default-on and quietly holds
+   * POSTGREST_POOL_SIZE connections the caller never opened, so the cap actually
+   * programmed into the wire layer is this value PLUS PostgREST's pool when it
+   * is enabled. Budgeting the other way (subtracting PostgREST from a fixed
+   * total) is what made a default pg.Pool of 10 fail against a hardcoded cap of
+   * 10: the caller's tenth connection lost to a slot they could not see.
+   */
+  maxConnections?: number
   /** Lease holder id (instance identity). */
   holder?: string
   durability?: Durability
@@ -99,7 +111,15 @@ export class ZeroPGServer {
   readonly opts: Required<
     Pick<
       ZeroPGServerOptions,
-      'port' | 'wirePort' | 'wireHost' | 'restPort' | 'postgrest' | 'postgrestBin' | 'restSchemas' | 'label'
+      | 'port'
+      | 'wirePort'
+      | 'wireHost'
+      | 'restPort'
+      | 'postgrest'
+      | 'postgrestBin'
+      | 'restSchemas'
+      | 'label'
+      | 'maxConnections'
     >
   > &
     ZeroPGServerOptions
@@ -112,6 +132,7 @@ export class ZeroPGServer {
       wirePort: opts.wirePort ?? Number(process.env.ZEROPG_WIRE_PORT ?? 5432),
       wireHost: opts.wireHost ?? process.env.ZEROPG_WIRE_HOST ?? '127.0.0.1',
       restPort: opts.restPort ?? Number(process.env.ZEROPG_REST_PORT ?? 3000),
+      maxConnections: opts.maxConnections ?? Number(process.env.ZEROPG_MAX_CONNECTIONS ?? 10),
       postgrest: opts.postgrest ?? !/^(off|false|0)$/i.test(process.env.ZEROPG_POSTGREST ?? ''),
       postgrestBin: opts.postgrestBin ?? process.env.ZEROPG_POSTGREST_BIN ?? 'postgrest',
       restSchemas: opts.restSchemas ?? process.env.ZEROPG_REST_SCHEMAS ?? 'public',
@@ -164,21 +185,39 @@ export class ZeroPGServer {
       // loopback port. Without it, any libpq/pgx client at its default
       // sslmode=prefer hangs silently: pglite-socket has no SSL negotiation.
       const db = this.db.raw
+      // Connection budget. o.maxConnections is what the CALLER gets; PostgREST,
+      // when enabled, holds POSTGREST_POOL_SIZE more that the caller never
+      // opened. So the cap programmed into the wire layer is the sum, and a
+      // caller's pool of exactly o.maxConnections fits. The front-end enforces
+      // it (in protocol, 53300); the inner server gets headroom so it never hits
+      // its own limit first and writes its raw non-protocol rejection.
+      const restSlots = o.postgrest ? POSTGREST_POOL_SIZE : 0
+      const wireCap = o.maxConnections + restSlots
       this.wire = new WireFrontend({
         port: o.wirePort,
         host: o.wireHost,
+        maxConnections: wireCap,
+        // Report the CALLER's budget, not wireCap: quoting the sum would name a
+        // limit the user never set (10 configured, "limit 11" printed).
+        reportedLimit: o.maxConnections,
+        limitOptionName: 'maxConnections (ZEROPG_MAX_CONNECTIONS)',
         createInner: (cfg) =>
           new PGLiteSocketServer({
             db,
             host: cfg.host,
             port: cfg.port,
-            // PostgREST opens a small pool; allow several concurrent loopback conns.
-            maxConnections: 10,
+            maxConnections: wireCap + 1,
           }),
       })
       await this.wire.start()
       this.bootTimings.wireMs = performance.now() - tw
-      this.log('wire-up', { port: o.wirePort, ms: Math.round(this.bootTimings.wireMs) })
+      this.log('wire-up', {
+        port: o.wirePort,
+        ms: Math.round(this.bootTimings.wireMs),
+        maxConnections: o.maxConnections,
+        postgrestSlots: restSlots,
+        wireCap,
+      })
 
       // Persist raw-wire writes (which bypass ZeroPG's dirty/commit path). Baseline
       // the write counter at the post-restore state, then poll on an interval.
