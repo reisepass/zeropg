@@ -1,8 +1,45 @@
 # Handoff: wire layer, TLS, auth. 2026-07-28
 
-Written mid-session because the machine may go away. Read this first, then
-[CONNECTION-SECURITY-AND-WIRE.md](CONNECTION-SECURITY-AND-WIRE.md) for decisions and
-[WIRE-AUTH-RESEARCH-2026-07-28.md](WIRE-AUTH-RESEARCH-2026-07-28.md) for the evidence.
+## The doc set, in reading order
+
+| doc | what it is |
+|---|---|
+| **this file** | orientation, what shipped, what is open |
+| [WIRE-AUTH-DECISION-2026-07-28.md](WIRE-AUTH-DECISION-2026-07-28.md) | **the decision document.** Milestones with post-critique estimates, the full error-string catalogue, the default-safety matrix, and the disagreements left open for the owner |
+| [CONNECTION-SECURITY-AND-WIRE.md](CONNECTION-SECURITY-AND-WIRE.md) | the security posture and how each finding was verified |
+| [PLATFORM-PORTABILITY.md](PLATFORM-PORTABILITY.md) | 12 deployment requirements across Cloud Run, ECS Fargate, App Runner, Azure Container Apps, Fly.io |
+| [COLDSTART-ABSORPTION.md](COLDSTART-ABSORPTION.md) | handshake-early / hold-query, with a working prototype and the client-timeout table |
+| [WIRE-AUTH-RESEARCH-2026-07-28.md](WIRE-AUTH-RESEARCH-2026-07-28.md) | raw evidence dossier from every research track |
+
+## THE FORK THAT DECIDES EVERYTHING ELSE
+
+**Is a public `postgres://` URL part of the product?**
+
+This question was not asked at the start and it turns out to govern the wire decision.
+
+The recommendation "do not replace pglite-socket, TLS and SCRAM are theater" rests on the
+wire only ever living on loopback. That is true **because Cloud Run cannot accept inbound raw
+TCP** - it is a Cloud Run property, not a zeropg property. Two platforms remove it while
+keeping scale-to-zero: **Azure Container Apps** (external TCP ingress plus a KEDA TCP scale
+rule that scales in to zero, VNet environment required) and **Fly.io**
+(`[[services.ports]] port = 5432, handlers = []`).
+
+On a public TCP port, TLS and SCRAM are mandatory rather than theater.
+
+- **Public `postgres://` is NOT the goal** - keep pglite-socket, bump it to `0.2.7`, keep
+  `WireFrontend` for GSSENC and the connection cap, and spend the effort on the HTTP driver
+  shim. This is milestone M1 and it is additive.
+- **Public `postgres://` IS the goal** - the vendored wire with TLS and SCRAM becomes
+  load-bearing and M2 is real work, 6-10 weeks.
+
+**Do M1 either way.** Nothing in it is wasted under either answer, and it is what unblocks a
+naive integrator on every platform. Decide the fork before starting M2.
+
+**The cheap experiment that decides how good the Azure path is:** does Container Apps TCP
+ingress **hold** an inbound connection while the replica cold-starts from zero, or drop it?
+If it drops, the handshake-early design cannot help there, because the platform kills the
+connection before our code sees it. If it holds, Azure is the strongest target available.
+Not yet run.
 
 ## Read this first: a latent one-packet DoS
 
