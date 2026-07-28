@@ -117,7 +117,7 @@ instance-death supervisor in milestone M1b actually catches all of them, includi
 
 ---
 
-## E7. Does pg-gateway preserve transaction isolation? **OPEN, blocking any wire swap**
+## E7. Does pg-gateway preserve transaction isolation? **DONE - no, and the port fixes it**
 
 **Why.** Verified that the naive adoption shape does **not**: under
 `db.runExclusive(execProtocolRaw)`, one client's `COMMIT` terminated another client's
@@ -131,6 +131,65 @@ client can send `BEGIN; SET ROLE service_role;` then RST), extended-protocol con
 a transaction left in the failed `Z(E)` state.
 
 **Decides.** Whether the wire swap is safe at all. This gates M2 entirely.
+
+### Result, 2026-07-28. Confirmed broken, and the ported queue fixes it completely.
+
+`experiments/pg-gateway/e7-tx-isolation.ts` runs five tests against two server
+shapes that differ **only** in serialization. Same pg-gateway handshake, same single
+PGlite instance in both.
+
+| Test | naive (`runExclusive(execProtocolRaw)`) | affinity (ported queue) |
+| --- | --- | --- |
+| 1. `SET LOCAL` isolation | FAIL - `AAA saw AAA \| BBB saw <empty>` | pass - `AAA saw AAA \| BBB saw BBB` |
+| 2. RLS cross-user bleed | **FAIL - B read A's rows** | pass - 0/20 bleed |
+| 3. RST mid-transaction | FAIL - next connection inherits the role | pass - rolled back |
+| 4. failed `Z(E)` state | FAIL - B gets `25P02` | pass - B returns 42 |
+| 5. extended protocol | FAIL - same bleed via Parse/Bind | pass |
+| | **7 failures** | **0 failures** |
+
+**Test 2 is worse than the previously recorded failure and is the finding that
+matters.** The prior record was that B's `SET LOCAL` got discarded. It is actually a
+live cross-user read. With RLS enabled and `USING (owner = current_setting('request.uid', true))`:
+
+```
+A saw [A-secret-1, A-secret-2]
+B saw [A-secret-1, A-secret-2, B-secret-1] (first of 20)
+```
+
+B's `BEGIN` landed inside A's still-open transaction, so B's `SET LOCAL ROLE` and
+`set_config(..., true)` were applied on top of A's, and B's `SELECT` ran with **both**
+users' rows visible. That is a Supabase-RLS-shaped tenant data leak, produced by two
+ordinary clients doing nothing abusive. Only 1/20 reads bled because after the first
+COMMIT the transaction closed, which makes it a race, which makes it worse - it is
+load-dependent and would pass a casual test.
+
+**Test 3 is the second unaccompanied hazard.** PGlite swallows `Terminate`, so a client
+that sends `BEGIN; SET LOCAL ROLE authenticated;` then RSTs leaves
+`db.isInTransaction() === true` forever under the naive shape. The very next connection
+authenticates as `postgres` and finds itself running as `authenticated` with the dead
+client's `request.uid` still set. `clearTransactionIfNeeded()` in the queue is what
+issues the `ROLLBACK`; it has to be wired to socket close, which the naive shape has
+no place to do.
+
+**What the port is.** `experiments/pg-gateway/lib/query-queue.ts`, ported literally
+from pglite-socket 0.2.2 `QueryQueueManager`. The rule is one line: while
+`db.isInTransaction()`, only dequeue messages whose `handlerId === lastHandlerId`.
+The `query = null; break` when the owning connection has nothing queued is load-bearing
+and is commented as such - `continue` spins, and serving anyone else is exactly the bug.
+
+**Method note that changes the vendoring plan.** The npm tarball's stated `files:
+["dist/**/*"]` does ship the source after all: `dist/chunk-PGRRI4HM.js.map` carries
+full `sourcesContent` for all 26 modules including `src/connection.ts` (620 lines) and
+`src/auth/sasl/scram-sha-256.ts`. Same for pglite-socket's map. So "vendor the source"
+does **not** require cloning an unmerged GitHub branch - the exact source for the
+published 0.3.0-beta.4 artifact is already in `node_modules`, and it is the source that
+corresponds to the tested binary rather than whatever `next` has drifted to. Recovered
+with `experiments/pg-gateway/extract-source.mjs`.
+
+**Decided.** The wire swap is safe **only** with the affinity queue. pg-gateway alone is
+not a drop-in for pglite-socket and adopting it without the queue is a data-isolation
+regression, not a feature trade. E7 no longer blocks M2; the queue port is now a
+requirement on it.
 
 ---
 
