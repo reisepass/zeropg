@@ -24,6 +24,15 @@ export interface RoutedInstance {
   flush(): Promise<void>
   /** Release the lease and free the memory. Called only after a confirmed flush. */
   close(): Promise<void>
+  /**
+   * Optional: are there writes the object store does not have yet?
+   *
+   * Only used to keep the background wire-flush timer from committing on an
+   * idle database. Answering `true` conservatively (or not implementing this at
+   * all, which is read as `true`) costs an object-store write; answering `false`
+   * when writes are in fact pending loses them, so when in doubt say true.
+   */
+  pendingWrites?(): Promise<boolean>
 }
 
 /** How a named database is brought into memory. */
@@ -63,6 +72,21 @@ export class WarmEntry {
   refs = 0
   /** Monotonic clock reading at the last attach or detach, for LRU. */
   lastUsedAt: number
+  /**
+   * Step 1 of the eviction protocol: stop accepting NEW connections for this
+   * database. Set before anything destructive happens, so a connection that
+   * arrives mid-eviction waits for a fresh instance instead of attaching to one
+   * whose lease is about to be released.
+   */
+  evicting = false
+  /**
+   * Set when a flush failed during eviction. Section 5 of the spec: refusing to
+   * evict is always better than losing writes, so a database that could not be
+   * flushed stays warm and the evictor picks a different one. Recorded rather
+   * than merely returned so the same database is not retried on every admission
+   * until its flush starts working again.
+   */
+  lastFlushError: string | null = null
 
   constructor(
     name: string,

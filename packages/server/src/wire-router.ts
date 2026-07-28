@@ -53,6 +53,12 @@ const NEWEST_PROTOCOL_MINOR = 0
  *  authentication_timeout and defaults it to 60s. */
 const DEFAULT_STARTUP_TIMEOUT_MS = 60_000
 
+/** How long eviction waits for a message already inside the engine to finish.
+ *  Short, because it only covers ONE in-flight protocol message, not a whole
+ *  client session. Overrunning it aborts the eviction rather than flushing
+ *  underneath a write that is still landing. */
+const DEFAULT_DRAIN_TIMEOUT_MS = 5_000
+
 export interface WireRouterOptions {
   /** Resolve a database name to a source, or null for "no such database". */
   catalog: Catalog
@@ -71,6 +77,22 @@ export interface WireRouterOptions {
   maxWarm?: number
   /** Milliseconds a connection may take to send a complete StartupMessage. */
   startupTimeoutMs?: number
+  /**
+   * How long eviction waits for the victim's in-flight engine message to
+   * finish before giving up on it. Default 5000. Exceeding it aborts that
+   * eviction (the database stays warm) rather than flushing under a write.
+   */
+  drainTimeoutMs?: number
+  /**
+   * Background flush cadence for raw-wire writes, milliseconds. Default 5000,
+   * matching ZeroPGServer's wireFlushTimer.
+   *
+   * This timer is not optional bookkeeping, it is the ONLY thing that makes a
+   * wire write durable. Wire messages reach PGlite directly and never pass
+   * through ZeroPG.query()/exec(), so they never set the dirty flag a durable
+   * commit is gated on. Set to 0 only in tests that mean to race it.
+   */
+  flushIntervalMs?: number
   /** Structured log sink. Defaults to silence. */
   onLog?: (event: string, fields: Record<string, unknown>) => void
   /** Injectable monotonic clock (tests / LRU determinism). */
@@ -98,6 +120,9 @@ export class WireRouter {
   private readonly catalog: Catalog
   private readonly maxWarm: number
   private readonly startupTimeoutMs: number
+  private readonly drainTimeoutMs: number
+  private readonly flushIntervalMs: number
+  private flushTimer: NodeJS.Timeout | null = null
   private readonly onLog: (event: string, fields: Record<string, unknown>) => void
   private readonly now: () => number
 
@@ -113,6 +138,8 @@ export class WireRouter {
     this.catalog = opts.catalog
     this.maxWarm = opts.maxWarm ?? 1
     this.startupTimeoutMs = opts.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
+    this.drainTimeoutMs = opts.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS
+    this.flushIntervalMs = opts.flushIntervalMs ?? 5_000
     this.onLog = opts.onLog ?? (() => {})
     this.now = opts.now ?? (() => performance.now())
     if (this.maxWarm < 1) throw new Error('maxWarm must be at least 1')
@@ -139,7 +166,34 @@ export class WireRouter {
 
   async start(): Promise<void> {
     await this.frontend.start()
+    if (this.flushIntervalMs > 0) {
+      this.flushTimer = setInterval(() => void this.flushAll(), this.flushIntervalMs)
+      this.flushTimer.unref?.()
+    }
     this.onLog('router-listening', { port: this.port, maxWarm: this.maxWarm })
+  }
+
+  /**
+   * Commit every warm database that has pending writes.
+   *
+   * Section 6.5 of the spec: the wire path needs a background timer and the
+   * HTTP path does not. Raw-wire writes bypass ZeroPG.query()/exec() and with
+   * them the dirty flag that gates a durable commit, so without this they sit
+   * in a WASM heap that a close, a crash, or an eviction can take with it.
+   */
+  private async flushAll(): Promise<void> {
+    for (const entry of [...this.warm.values()]) {
+      if (entry.evicting) continue // its own eviction owns the flush
+      try {
+        if (entry.instance.pendingWrites && !(await entry.instance.pendingWrites())) continue
+        await entry.instance.flush()
+      } catch (e) {
+        this.onLog('flush-failed', {
+          database: entry.name,
+          error: e instanceof Error ? e.message : String(e),
+        })
+      }
+    }
   }
 
   // ---- Connection handling ----
@@ -290,27 +344,25 @@ export class WireRouter {
 
   /** Resolve a name to a resident instance, starting it if needed. */
   private async acquire(database: string): Promise<WarmEntry> {
-    const existing = this.warm.get(database)
-    if (existing) return existing
-
-    const inFlight = this.opening.get(database)
-    if (inFlight) return inFlight
+    for (;;) {
+      const existing = this.warm.get(database)
+      // An entry being evicted is not attachable: its lease is about to go.
+      // Wait for the eviction to finish, then loop and start a fresh instance.
+      if (existing && !existing.evicting) return existing
+      if (existing) {
+        await this.evictions.get(database)?.catch(() => {})
+        continue
+      }
+      const inFlight = this.opening.get(database)
+      if (inFlight) return inFlight
+      break
+    }
 
     const source = this.catalog(database)
     if (!source) throw new UnknownDatabaseError(database)
 
-    if (this.warm.size + this.opening.size >= this.maxWarm) {
-      // Warm set > 1 with the full eviction protocol is step 2 of the build
-      // order. Until then, refuse in protocol rather than evict unsafely:
-      // eviction is a lease handoff and taking the lease from an awake
-      // sleep-durability instance drops its unflushed writes.
-      throw new WarmSetFullError(
-        database,
-        this.maxWarm,
-        `${[...this.warm.keys(), ...this.opening.keys()].join(', ')} ${
-          this.warm.size + this.opening.size === 1 ? 'is' : 'are'
-        } already resident`,
-      )
+    while (this.warm.size + this.opening.size >= this.maxWarm) {
+      await this.makeRoom(database)
     }
 
     const open = (async (): Promise<WarmEntry> => {
@@ -336,6 +388,163 @@ export class WireRouter {
     }
   }
 
+  // ---- Eviction (spec section 5): the step that can lose data ----
+
+  /** Evictions in progress, by database name. */
+  private readonly evictions = new Map<string, Promise<void>>()
+
+  /**
+   * Free one slot for `wanted`, or throw WarmSetFullError.
+   *
+   * LRU order, but a failed flush is NOT a failed admission: section 5 says
+   * refusing to evict is always better than losing writes, so a victim whose
+   * flush fails stays warm and the next-least-recently-used one is tried
+   * instead. Only when every candidate has been tried does admission fail, and
+   * then it fails in protocol rather than by evicting something unsafely.
+   */
+  private async makeRoom(wanted: string): Promise<void> {
+    const candidates = [...this.warm.values()]
+      .filter((e) => !e.evicting)
+      .sort((a, b) => a.lastUsedAt - b.lastUsedAt)
+
+    const refused: string[] = []
+    for (const victim of candidates) {
+      try {
+        await this.evict(victim, `making room for "${wanted}"`)
+        return
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        refused.push(`${victim.name} (${msg})`)
+        this.onLog('eviction-refused', { database: victim.name, wanted, error: msg })
+      }
+    }
+
+    // Nothing could be evicted. Either something else is already evicting (in
+    // which case waiting is right) or every candidate refused.
+    const inFlight = [...this.evictions.values()]
+    if (inFlight.length && refused.length === 0) {
+      await Promise.allSettled(inFlight)
+      return
+    }
+    throw new WarmSetFullError(
+      wanted,
+      this.maxWarm,
+      refused.length
+        ? `no resident database could be evicted safely: ${refused.join('; ')}`
+        : `${[...this.warm.keys(), ...this.opening.keys()].join(', ')} ${
+            this.warm.size + this.opening.size === 1 ? 'is' : 'are'
+          } already resident`,
+    )
+  }
+
+  /**
+   * The eviction protocol, spec section 5, in order and with no steps skipped.
+   *
+   *   1. Stop accepting new connections for that database.
+   *   2. Drain or forcibly fail in-flight connections with 57P01 admin_shutdown.
+   *   3. Flush and CONFIRM it committed.
+   *   4. Release the lease.
+   *   5. Close the instance and free the memory.
+   *
+   * If step 3 fails, do NOT proceed: the entry is restored to service and the
+   * caller picks a different victim. This is not defensive style, it is the
+   * whole point. Eviction is a lease handoff, and taking the lease from an
+   * awake sleep-durability instance is a live-verified way to drop its
+   * unflushed writes. Raw-wire writes are exactly the writes at risk, because
+   * they never pass through ZeroPG.query()/exec() and so never set the dirty
+   * flag; only the background timer or this flush commits them.
+   */
+  private async evict(entry: WarmEntry, reason: string): Promise<void> {
+    const existing = this.evictions.get(entry.name)
+    if (existing) return existing
+
+    const run = (async (): Promise<void> => {
+      const t0 = this.now()
+      // 1. Stop accepting new connections for that database. Set FIRST, before
+      //    anything destructive, so a connection arriving mid-eviction waits
+      //    for a fresh instance instead of attaching to a doomed lease.
+      entry.evicting = true
+
+      // 2. Drain or forcibly fail in-flight connections with admin_shutdown.
+      //    Queued messages are rejected rather than executed: running them
+      //    against an instance that is about to close would either lose their
+      //    results or, worse, apply writes after the flush that is supposed to
+      //    capture everything.
+      const attached = [...this.connections].filter((c) => c.entry === entry)
+      entry.queue.clearAll(`database "${entry.name}" is being evicted`)
+      for (const conn of attached) {
+        this.fail(
+          conn,
+          '57P01', // admin_shutdown
+          `terminating connection: database "${entry.name}" is being unloaded from this router (${reason})`,
+        )
+        conn.entry = null
+        entry.refs--
+      }
+      //    A message already inside execProtocolRawStream cannot be cancelled.
+      //    Wait it out, and treat a timeout as a refusal: flushing under a write
+      //    that is still landing is precisely the race this protocol exists to
+      //    prevent.
+      try {
+        await entry.queue.whenIdle(this.drainTimeoutMs)
+      } catch (e) {
+        entry.evicting = false
+        throw new Error(`drain failed: ${e instanceof Error ? e.message : String(e)}`)
+      }
+
+      // 3. Flush and CONFIRM. A rejection here aborts the eviction.
+      try {
+        await entry.instance.flush()
+        entry.lastFlushError = null
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        entry.lastFlushError = msg
+        entry.evicting = false
+        entry.lastUsedAt = this.now() // do not immediately re-pick this victim
+        this.onLog('eviction-flush-failed', { database: entry.name, reason, error: msg })
+        throw new Error(`flush failed, refusing to evict: ${msg}`)
+      }
+
+      // 4 + 5. Only now: release the lease and free the memory. close() on the
+      //        ZeroPG source does both, in that order.
+      this.warm.delete(entry.name)
+      try {
+        await entry.instance.close()
+      } catch (e) {
+        // The flush already committed, so the data is safe in the bucket. A
+        // failed close leaks memory and possibly a lease until it expires,
+        // which is worth logging but is not a correctness problem.
+        this.onLog('eviction-close-failed', {
+          database: entry.name,
+          error: e instanceof Error ? e.message : String(e),
+        })
+      }
+      this.onLog('evicted', {
+        database: entry.name,
+        reason,
+        ms: Math.round(this.now() - t0),
+        connectionsTerminated: attached.length,
+      })
+    })()
+
+    this.evictions.set(entry.name, run)
+    try {
+      await run
+    } finally {
+      this.evictions.delete(entry.name)
+    }
+  }
+
+  /** Evict a database by name. Returns false when it is not resident. Exposed
+   *  so an operator (or a test) can force the protocol without waiting for LRU
+   *  pressure. Throws if the flush fails, exactly as the LRU path does. */
+  async evictDatabase(name: string, reason = 'requested'): Promise<boolean> {
+    const entry = this.warm.get(name)
+    if (!entry) return false
+    await this.evict(entry, reason)
+    return true
+  }
+
   // ---- Steady state ----
 
   /**
@@ -347,7 +556,10 @@ export class WireRouter {
    */
   private pump(conn: Connection): void {
     const entry = conn.entry
-    if (!entry || conn.closed) return
+    // An evicting entry has already failed this connection with 57P01 and
+    // cleared its queue; queuing more would execute against an instance whose
+    // flush has been taken.
+    if (!entry || conn.closed || entry.evicting) return
     for (;;) {
       if (conn.buf.length < 5) return
       const len = conn.buf.readInt32BE(1)
@@ -404,7 +616,11 @@ export class WireRouter {
     if (!this.connections.delete(conn)) return
     conn.closed = true
     const entry = conn.entry
+    // Null when the connection was never routed, or when eviction already
+    // detached it (which decremented refs then). Either way there is no
+    // reference of ours left to release.
     if (!entry) return
+    conn.entry = null
     entry.queue.clearForHandler(conn.id)
     // A client that disconnects inside BEGIN leaves the SHARED session in an
     // open transaction. No later handler could ever end it, and the queue's
@@ -420,6 +636,10 @@ export class WireRouter {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer)
+      this.flushTimer = null
+    }
     await this.frontend.stop()
     for (const conn of [...this.connections]) conn.socket.destroy()
     this.connections.clear()

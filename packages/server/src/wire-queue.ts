@@ -65,6 +65,30 @@ export class QueryQueue {
     return this.queue.length
   }
 
+  /** True when nothing is queued and nothing is executing. */
+  get idle(): boolean {
+    return !this.processing && this.queue.length === 0
+  }
+
+  /**
+   * Resolve once the queue is drained and no message is executing.
+   *
+   * Eviction needs this: a message already inside `execProtocolRawStream`
+   * cannot be cancelled, and flushing while it runs would race a write that is
+   * still being applied. Rejects on timeout so a wedged backend turns into
+   * "refuse to evict this database" rather than an eviction that hangs the
+   * router.
+   */
+  async whenIdle(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (!this.idle) {
+      if (Date.now() >= deadline) {
+        throw new Error(`queue did not go idle within ${timeoutMs}ms`)
+      }
+      await new Promise((r) => setTimeout(r, 5))
+    }
+  }
+
   /** True when the shared session is inside a transaction owned by `handlerId`. */
   ownsOpenTransaction(handlerId: number): boolean {
     return this.engine.isInTransaction() && this.lastHandlerId === handlerId
