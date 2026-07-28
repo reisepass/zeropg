@@ -17,7 +17,25 @@ import { existsSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
 import { serveWire } from '../src/wire.js'
 
-const PSQL = '/usr/bin/psql'
+// Resolve real libpq rather than hardcoding a Linux path: on macOS psql ships
+// under Homebrew (/opt/homebrew/opt/libpq/bin) and is often not on PATH at all,
+// which used to make this suite unrunnable there. $PSQL overrides everything.
+function findPsql(): string | null {
+  if (process.env.PSQL) return existsSync(process.env.PSQL) ? process.env.PSQL : null
+  const candidates = [
+    '/usr/bin/psql',
+    '/usr/local/bin/psql',
+    '/opt/homebrew/bin/psql',
+    '/opt/homebrew/opt/libpq/bin/psql',
+    '/usr/local/opt/libpq/bin/psql',
+  ]
+  for (const dir of (process.env.PATH ?? '').split(':')) {
+    if (dir) candidates.push(`${dir}/psql`)
+  }
+  return candidates.find((p) => existsSync(p)) ?? null
+}
+
+const PSQL = findPsql()
 // Short enough that a regression fails the suite fast instead of hanging it.
 const TIMEOUT_MS = 10_000
 
@@ -112,9 +130,12 @@ async function framing(port: number, send: (s: Socket) => Promise<void>): Promis
 }
 
 async function main(): Promise<void> {
-  if (!existsSync(PSQL)) {
+  if (!PSQL) {
     // Do not silently pass: a missing psql means these cases were NOT verified.
-    throw new Error(`${PSQL} not found - cannot verify libpq SSL negotiation`)
+    throw new Error(
+      'psql not found - cannot verify libpq SSL negotiation. Install it ' +
+        '(macOS: brew install libpq) or set PSQL=/path/to/psql.',
+    )
   }
 
   const w = await serveWire()
