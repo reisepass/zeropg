@@ -151,7 +151,31 @@ Literal `"Too many connections\n"` confirms it.
 **Fix required:** replace with a protocol-legal `ErrorResponse` (SQLSTATE `53300`,
 `too_many_connections`). Owning the frontend makes this trivial.
 
-## 5. VERIFIED: the HTTP `/sql` face is a control surface, not a driver
+## 5. VERIFIED then FIXED: the HTTP `/sql` face rejected what real apps send
+
+**Fixed on the `blob-pglite-dev` VM in commit `d071f75`**, test-green with 11 assertions
+(`packages/client/test/remote-sql.test.ts`, drives a real `ZeroPGServer` over HTTP through
+the unified client). The shipped request shape:
+
+```json
+{ "sql": "insert into users (email) values ($1) returning id", "params": ["a@b.c"] }
+{ "sql": "create table a (...); create table b (...);", "multi": true }
+```
+
+`multi` and `params` are mutually exclusive and the combination is rejected with an error
+saying why, since the simple protocol cannot bind. A `multi` response carries `multi: true`
+and `rows: null` rather than an empty array a caller would misread as "0 results". The test
+covers a quote-laden value (`o'brien@x.com'; drop table users; --`) round-tripping verbatim
+with the table surviving.
+
+Neon's equivalent endpoint uses `{"query": ..., "params": [...]}`. Accepting `query` as an
+alias for `sql` is queued, so that both likely guesses at the API work.
+
+The same commit fixed a latent bug found on the way: **`shutdown()` never closed the public
+HTTP listener**, so an embedding caller hung after `shutdown()` resolved. The signal handlers
+only got away with it because they call `process.exit()`.
+
+Original diagnosis follows, kept because it explains why these were not deep problems.
 
 Three real gaps, all shallower than their error messages claim.
 

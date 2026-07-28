@@ -168,15 +168,25 @@ SSLRequest/GSSENCRequest, plus the peer-dep fix taking an install from 28 MB to 
 
 Four fixes dispatched, in priority order if context runs short (the agent was at 89%):
 
-1. `POST /sql` accepts bound params, forwarding to `ZeroPG.query(sql, params)` which already
-   takes them (`packages/objectstore-fs/src/zeropg.ts:1247`). Body shape must match Neon's.
-   Delete the now-false throw in `packages/client/src/remote.ts`.
-2. `POST /sql` accepts multi-statement SQL via `db.exec()` (`zeropg.ts:1242`), behind an
-   explicit field, not SQL sniffing.
+1. **DONE, commit `d071f75`, test-green.** `POST /sql` accepts bound params, forwarding to
+   `ZeroPG.query(sql, params)` which already took them
+   (`packages/objectstore-fs/src/zeropg.ts:1247`). The now-false throw in
+   `packages/client/src/remote.ts` is gone.
+2. **DONE, same commit.** `POST /sql` accepts multi-statement SQL via `db.exec()`
+   (`zeropg.ts:1242`) behind an explicit `multi: true` flag, not SQL sniffing.
 3. Connection-cap rejection becomes a real `ErrorResponse` (SQLSTATE `53300`) emitted from
    WireFrontend, replacing pglite-socket's raw `"Too many connections\n"` write. Plus
    `maxConnections` as an option accounting for PostgREST's pool.
 4. README connection ladder corrected so `gs://` is not advertised as working.
+
+Commit `d071f75` is verified by `packages/client/test/remote-sql.test.ts`, 11 assertions
+against a real `ZeroPGServer` over HTTP: multi-statement migration, parameterized
+INSERT/SELECT/UPDATE with a real `rowCount`, an injection attempt round-tripping as data with
+the table intact, and the `multi` + `params` rejection. It also fixed a latent bug where
+`shutdown()` left the public HTTP listener open, hanging any embedding caller.
+
+Queued but not yet done: accept `query` as an alias for `sql` in the `/sql` body, so callers
+reaching for Neon's shape also work.
 
 Also told the agent: pglite-socket 0.2.3 already added `handleSslRequest()` replying `'N'`,
 and the root `package.json` pins `^0.2.2`. Bump to `>=0.2.3`, re-run the sslmode tests, keep
