@@ -995,7 +995,7 @@ has to make the decision before pg-gateway's state machine starts.
 
 ---
 
-## E15. Where does the Fly cold path actually go, and does `suspend` remove it? **DONE - accounted for, and suspend is 9.6x faster but serves stale data**
+## E15. Where does the Fly cold path actually go, and does `suspend` remove it? **DONE - accounted for; suspend is 16x faster, serves stale data, and decays in ~2 minutes**
 
 **Why.** [E11](#e11-flyio-baseline-does-a-public-postgres-with-scale-to-zero-actually-work-done---yes-after-fixing-a-race-that-is-ours)
 measured the client-visible cold path at 10.3-10.6s and could name only ~5.6s of it:
@@ -1297,3 +1297,133 @@ prints a RESUME-versus-COLD-BOOT verdict from the guest's own evidence rather th
 how fast the number looked.
 Correctness: `npx tsx steal-lease.ts <prefix> write` while the Machine is `suspended`,
 then resume it and `psql` for the row count.
+
+### Result 4: the cheaper wins are mostly not there, and the suspend snapshot decays in ~2 minutes
+
+**A same-region client changes the warm number completely and the cold number not at all.**
+Every figure above was measured from this box to `iad`. Re-measured with the client
+*inside* `iad` (a second Fly Machine dialling the first), against the same target:
+
+```
+                    TCP    SSL-neg   startup   query     TOTAL
+  warm    in-region  8.1ms   16.5ms   10.6ms    2.7ms     37.8ms
+  warm    this box   29ms   249.4ms  134.3ms  133.8ms    546.6ms
+  cold    in-region  6.3ms   12.2s     26.2ms   17.7ms    12.2s
+  resume  in-region  4.2ms  665.3ms    10.5ms    4.7ms    684.7ms
+```
+
+**The warm path is 37.8ms, not 0.55s.** About 93% of the warm number every previous
+experiment quoted was round-trip latency from this box, not server time. E11's estimate of
+"~265ms of the warm number is RTT" was too conservative by roughly a factor of two.
+
+**The cold path does not improve in-region at all** (12.2s, if anything worse than the
+10.9s mean from outside). That is the confirmation that the cold path is server-side work,
+exactly as the phase table said, and nothing about client placement touches it.
+
+**Resume from in-region is 685ms**, of which only ~4ms is TCP. This is the number to quote
+for the suspend path: **685ms in-region, ~1.13s transatlantic.**
+
+**A bigger Machine buys nothing, because the bottleneck is not CPU.** `shared-cpu-4x` /
+2GB, four times the cores of the baseline:
+
+```
+                            total    kernel->exec   node startup
+  shared-cpu-1x / 1GB      10905ms        1165ms        2888ms
+  shared-cpu-4x / 2GB      11201ms        1357ms        2794ms   (mean of 2)
+```
+
+Node startup moved from 2888ms to 2794ms - about 3%, well inside run-to-run spread - while
+the total did not improve at all.
+
+> The first two reps on the big VM read 27.1s and were discarded, correctly: the trace
+> showed `fresh: true` and `leaseMs: 13605`. That was a first-boot `initdb` against an
+> empty bucket plus lease contention, not a cold start. Quoting it as "the big VM is
+> slower" would have been a measurement of the wrong thing.
+
+**And the ~2.9s of "Node startup" is not Node, and not our bundle.** Both were tested
+directly on the VM:
+
+```
+bare `node -e`, warm VM                     32-45ms
+`import('@electric-sql/pglite')` alone      46ms
+loading the whole server.mjs bundle         ~2ms to reach zeropg-open-enter
+bare `node -e` after `echo 3 > drop_caches` 43ms
+```
+
+Every one of those is two orders of magnitude below the 2755-2919ms that the same
+`process.uptime()` call reports during an actual cold boot. The cost is not the
+interpreter, not V8 init as such, not module loading, and not our 127 KB bundle - it is
+**first-touch I/O against a cold image on a freshly booted Firecracker VM**, paging in a
+120 MB Node binary (nearly four times the size of the entire `/app` directory) that has
+never been read on that host. `drop_caches` inside a running VM does not reproduce it
+because the backing image is still hot at the host level.
+
+That reframes the optimisation target. **A smaller image is the lever, and specifically a
+smaller Node**, not a smaller bundle - the application code is already noise next to the
+runtime. Untested here, and the obvious next steps: a single-file Node SEA, a `node:slim`
+variant with fewer ICU/intl data files, or Bun (much smaller binary) if PGlite's native
+build tolerates it.
+
+**The suspend snapshot decays in about two minutes with no traffic at all.** This is the
+finding that most limits the practical value of Result 2, and it was only visible because
+`suspend-cycle.sh` records the machine state *after* the idle gap rather than assuming it:
+
+```
+gap     state after gap   what the client got            verdict
+  60s   suspended         1072-1165ms                    RESUME  (3/3)
+ 300s   started           526ms                          RESUME, but Fly had ALREADY
+                                                         resumed it unprompted
+ 600s   stopped           CLOSED-BEFORE-FIRST-ROW        COLD BOOT - snapshot gone
+```
+
+Polled directly, with **zero client traffic**, a `suspended` Machine left that state on its
+own:
+
+```
+suspended at 14:58:54Z, polling every 20s with NO client traffic at all
+  +60s   suspended
+  +120s  15:00:39Z  -> started   LEFT SUSPENDED UNPROMPTED
+```
+
+and a separate 30s-cadence poll saw the same decay at the 600s mark
+(`+570s suspended`, `+600s started`).
+
+So the operating envelope is narrow, and it cuts both ways:
+
+- **Under ~2 minutes idle**: a real resume, ~685ms in-region. Excellent.
+- **Past that**: Fly moves the Machine out of `suspended` by itself. Sometimes to
+  `started`, which **is billing CPU and RAM for an idle database** - the opposite of what
+  scale-to-zero is for. Sometimes to `stopped`, in which case the next client takes the
+  full ~11s cold path.
+
+**A workload idle for two minutes is not the workload scale-to-zero exists for.** The
+whole premise is a database nobody has touched for hours. Suspend does not survive that,
+and Fly documents no way to make it: the idle-before-suspend delay is "several minutes"
+and not configurable, and snapshot persistence is explicitly not guaranteed.
+
+### Revised conclusion
+
+**Answer to "can the cold path get well under 10.3-10.6s": yes, but not by tuning it.**
+The phase table says the ~10.9s is ~6.2s of runtime and container startup against ~1.4s of
+actual data transfer, and Result 4 says neither more CPU nor a closer client moves it.
+Tuning the restore path is close to exhausted.
+
+**`suspend` is the only measured path to a ~1s cold start, and it is not shippable on this
+stack.** Two independent blockers, either of which is disqualifying on its own:
+
+1. **Correctness** (Result 3): a resumed Machine serves stale reads, accepts writes into a
+   lease it lost, and can leave the bucket unreadable. Fixable in `@zeropg/server` and
+   `@zeropg/lease`, and worth fixing.
+2. **Durability of the snapshot** (Result 4): it decays in ~2 minutes unprompted, which is
+   far shorter than the idle periods scale-to-zero targets. **Not fixable by us** - it is
+   Fly's policy, undocumented as to timing, and explicitly not guaranteed.
+
+Blocker 2 is the one that matters strategically. Even with the lease bugs fixed, suspend
+would deliver its ~685ms on the traffic pattern that needs it least (a database touched
+every minute, which barely goes idle) and fall back to the full ~11s on the one that needs
+it most. **The realistic recommendation stays `auto_stop_machines = "stop"`**, with the
+cold path understood as ~11s and dominated by image paging.
+
+**The unexplored lever with the best evidence behind it is image size**, specifically the
+120 MB Node binary. That is where the ~2.9s lives, and it is the only phase in the table
+that is both large and plausibly ours to shrink.
