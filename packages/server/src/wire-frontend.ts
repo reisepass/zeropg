@@ -43,8 +43,27 @@ export interface WireFrontendOptions {
   port?: number
   /** Build the inner PGLiteSocketServer, already targeted at a private loopback
    *  port this front-end chose. Kept as a factory so this module never needs to
-   *  import the optional @electric-sql/pglite-socket dependency itself. */
-  createInner: (cfg: { host: string; port: number }) => InnerSocketServer
+   *  import the optional @electric-sql/pglite-socket dependency itself.
+   *
+   *  Mutually exclusive with `onConnection`: either the front-end proxies to an
+   *  inner server, or the caller terminates the protocol itself. */
+  createInner?: (cfg: { host: string; port: number }) => InnerSocketServer
+  /**
+   * Terminate the protocol in-process instead of proxying to an inner server.
+   * Called once per connection, after SSL/GSSENC negotiation and after the
+   * connection cap has been checked and its slot taken, with the bytes already
+   * read from the socket (the StartupMessage, possibly partial, possibly with
+   * more behind it).
+   *
+   * The socket arrives PAUSED so no bytes can be lost in the gap: the callee
+   * must attach its own 'data' listener and resume it. The slot is released on
+   * socket close, so the callee does not have to.
+   *
+   * This is what the wire router uses. Routing by database name requires
+   * reading the StartupMessage, and a proxy to a single inner server has
+   * already chosen the database before it can read one.
+   */
+  onConnection?: (client: Socket, pending: Buffer) => void
   /** Max concurrent client connections. Over-cap connections are refused with a
    *  real ErrorResponse (SQLSTATE 53300). Must match the inner server's own
    *  maxConnections so the cap is enforced HERE, where we can speak protocol,
@@ -114,6 +133,7 @@ export class WireFrontend {
   private readonly host: string
   private readonly requestedPort: number
   private readonly createInner: WireFrontendOptions['createInner']
+  private readonly onConnection: WireFrontendOptions['onConnection']
 
   private readonly maxConnections: number
   private readonly limitOptionName: string
@@ -134,6 +154,13 @@ export class WireFrontend {
     this.host = opts.host ?? '127.0.0.1'
     this.requestedPort = opts.port && opts.port > 0 ? opts.port : 0
     this.createInner = opts.createInner
+    this.onConnection = opts.onConnection
+    if (!this.createInner === !this.onConnection) {
+      throw new Error(
+        'WireFrontend needs exactly one of createInner (proxy to an inner socket server) or ' +
+          'onConnection (terminate the protocol in-process)',
+      )
+    }
     this.maxConnections = opts.maxConnections ?? 100
     this.limitOptionName = opts.limitOptionName ?? 'maxConnections'
     this.reportedLimit = opts.reportedLimit ?? this.maxConnections
@@ -152,10 +179,13 @@ export class WireFrontend {
   async start(): Promise<void> {
     // Inner PGLiteSocketServer on a private loopback port. Its own maxConnections
     // still governs concurrency since every front-end connection maps to exactly
-    // one inner connection.
-    this.innerPort = await freePort('127.0.0.1')
-    this.inner = this.createInner({ host: '127.0.0.1', port: this.innerPort })
-    await this.inner.start()
+    // one inner connection. Skipped entirely in onConnection mode, where nothing
+    // is proxied and no private port is needed.
+    if (this.createInner) {
+      this.innerPort = await freePort('127.0.0.1')
+      this.inner = this.createInner({ host: '127.0.0.1', port: this.innerPort })
+      await this.inner.start()
+    }
 
     // Public front-end listener.
     const front = createServer((client) => this.handleConnection(client))
@@ -170,7 +200,7 @@ export class WireFrontend {
       })
     } catch (e) {
       // Inner came up but the public bind failed: don't leak the inner listener.
-      await this.inner.stop().catch(() => {})
+      await this.inner?.stop().catch(() => {})
       this.inner = null
       throw e
     }
@@ -245,6 +275,13 @@ export class WireFrontend {
       this.live--
     }
     client.once('close', release)
+
+    // In-process termination (the wire router): hand over the paused socket and
+    // the bytes already read. The callee resumes it.
+    if (this.onConnection) {
+      this.onConnection(client, pending)
+      return
+    }
 
     const inner = connect({ host: '127.0.0.1', port: this.innerPort })
 

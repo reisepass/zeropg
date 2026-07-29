@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepack": "tsc -p tsconfig.build.json",
-    "test": "tsx test/startup-packet.test.ts"
+    "test": "tsx test/startup-packet.test.ts && tsx test/wire-router.test.ts && tsx test/wire-eviction.test.ts && tsx test/wire-coldstart.test.ts"
   },
   "publishConfig": {
     "access": "public"
