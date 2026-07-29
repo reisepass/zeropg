@@ -420,9 +420,15 @@ Small and deliberate, recorded so nobody rediscovers them as surprises.
   WebSocket carrying zero bytes, with full CPU throughout, and billing dropping to 0.0 the
   moment the socket closed.** The request timeout is also a hard cap on connection lifetime: a
   300s-timeout service tore the connection down at 300991ms with close code 1006, and 3600s is
-  an API-enforced maximum. So option (1) in section 2 pins every backend awake for as long as a
-  client is connected, at roughly $52/month per connected database, and the scale-to-zero
-  premise collapses. **Step 4 of the build order does not achieve what it was for.** Full
-  numbers and the reproduction recipe in [EXPERIMENTS-QUEUE.md](EXPERIMENTS-QUEUE.md) E9.
+  an API-enforced maximum. So a tunnel **held** for the client's whole session pins every
+  backend awake, at roughly $52/month per connected database.
+- ~~**Does that kill step 4?**~~ **No. SETTLED 2026-07-28 by E10: the per-BURST tunnel works.**
+  Open the tunnel when a query arrives, close it when the burst ends. Measured across gaps of
+  5s, 30s, 60s, 300s and 900s: reopen time-to-first-byte **93-117ms**, the **same instance**
+  every time, and **no billing during any gap**. CPU is throttled between bursts (79 ticks
+  elapsed across a 900s gap against 900s of wall clock) but the instance stays resident, so
+  there is no cold start to pay. **Step 4 is unblocked and is the correct design.** The
+  constraint E9 imposes is narrow: never hold the tunnel idle, and never close it mid
+  transaction - only on `ReadyForQuery` status `I`.
 - **Whether a real Postgres could be the router**, giving a TCP endpoint plus federation in
   one box. Blocked on the same FDW connection-holding problem in section 7.
