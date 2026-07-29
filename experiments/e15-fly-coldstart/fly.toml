@@ -1,0 +1,79 @@
+# E15: where does the cold path actually go, and does `suspend` remove it?
+#
+# Same shape as experiments/e11-fly-baseline/fly.toml (raw public TCP on 5432,
+# scale to zero) so the numbers are comparable to E11's baseline. Two changes:
+#
+#   auto_stop_machines is flipped between "stop" and "suspend" across the run.
+#   This file carries "stop", which reproduces the E11 baseline; experiment 2
+#   changes it via the Machines API rather than a redeploy, because a DEPLOY
+#   DISCARDS THE SUSPEND SNAPSHOT (Fly documents this: the image changes, so
+#   restoring a memory dump of the old process would be unsafe). Redeploying to
+#   flip the flag would guarantee the first measurement after every flip is a
+#   cold boot mislabelled as a resume.
+#
+#   Port 8081 is added for the observation face (/trace, /lease-state, /read).
+#   It is a plain HTTP service and is not in the measured path.
+#
+# The VM stays 1GB. Fly's documented suspend requirement is <= 2GB of memory,
+# and going larger to chase a faster boot (experiment 3) would silently make the
+# Machine ineligible for suspend, which would turn experiment 2's result into an
+# artifact of the VM size rather than a property of suspend.
+
+app = "zeropg-e15-fly"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  ZEROPG_OBS_PORT = "8081"
+  ZEROPG_WIRE_HOST = "0.0.0.0"
+  ZEROPG_WIRE_PORT = "5432"
+  ZEROPG_PREFIX = "e15/run2"
+  ZEROPG_DURABILITY = "sleep"
+  ZEROPG_POSTGREST = "off"
+  APP_LABEL = "zeropg E15 Fly cold-start decomposition"
+
+# The measured path: real Postgres wire protocol on public TCP 5432.
+# handlers = [] is load-bearing - any handler puts a Fly proxy layer in the path.
+[[services]]
+  protocol = "tcp"
+  internal_port = 5432
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [[services.ports]]
+    port = 5432
+    handlers = []
+
+# ZeroPGServer's own control face. Not measured.
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+# Observation face: /trace, /lease-state, /read. Read out of band so the phase
+# table does not depend on `flyctl logs`, whose delivery is asynchronous and
+# which Fly documents as dropping lines around a resume.
+[[services]]
+  protocol = "tcp"
+  internal_port = 8081
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [[services.ports]]
+    port = 8081
+    handlers = ["http"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

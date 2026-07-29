@@ -992,3 +992,308 @@ only because the TLS path already exists.
 **Decides.** ALPN stays on the patch list and is now measured rather than predicted. The
 first-byte sniff belongs in our framer, not in a pg-gateway option, because the framer
 has to make the decision before pg-gateway's state machine starts.
+
+---
+
+## E15. Where does the Fly cold path actually go, and does `suspend` remove it? **DONE - accounted for, and suspend is 9.6x faster but serves stale data**
+
+**Why.** [E11](#e11-flyio-baseline-does-a-public-postgres-with-scale-to-zero-actually-work-done---yes-after-fixing-a-race-that-is-ours)
+measured the client-visible cold path at 10.3-10.6s and could name only ~5.6s of it:
+"machine started in 1.37s" plus a ~4.2s PGlite restore. The other ~5s had no owner, and
+picking a knob to turn before the gap has a name is guessing. Two questions, in order:
+
+1. **Decompose it.** Instrument the boot path end to end and produce a phase table that
+   accounts for the whole number.
+2. **`auto_stop_machines = "suspend"`.** Suspend snapshots the Machine's RAM instead of
+   cold-booting it. If it works as advertised the PGlite instance is *already in memory*
+   on resume - no bucket restore, no Node start, no container start. Plausibly ~1s.
+
+**And the correctness question that comes with suspend, which is not optional.** A
+suspended instance's lease keeps expiring in real time while it is frozen. On resume the
+lease may have lapsed or been taken over, and the in-memory PGlite would then be holding
+stale state while believing it is the writer. That is the same class as the false-success
+bug E11 found in step 4. If a resumed server serves stale reads or accepts writes, that
+outranks the latency result.
+
+### Setup
+
+`experiments/e15-fly-coldstart/`, app `zeropg-e15-fly`, one `shared-cpu-1x` / 1GB Machine
+in `iad`, dedicated IPv4 `137.66.3.126`, storage a **freshly provisioned** Tigris bucket
+(`zeropg-e15-bucket`). The credentials in `.tigrisfly.env` were again not used: they were
+exposed in a session transcript on 2026-07-28 and are treated as compromised.
+
+The image is E11's, plus instrumentation only. `boot-trace.mjs` is E11's proven
+`prebind.mjs` with timestamps added - the parking behaviour is unchanged, because the
+experiment must not perturb the thing it measures. What is new is that every phase
+boundary is stamped against **three clocks**, since no single one spans the path:
+
+- `/proc/uptime` - seconds since the **guest kernel** booted. The only clock that can see
+  time spent before Node exists. This is the axis the table is laid out on.
+- `performance.nodeTiming` + `process.uptime()` - how much of the process's life went to
+  becoming a Node runtime before user code ran.
+- `Date.now()` - wall clock on every line, so guest events can be joined to the Fly
+  proxy's own log timestamps.
+
+### Result 1, 2026-07-29: the ~5s is Node and PGlite, not Fly
+
+Three cold reps from `stopped`, each joined across proxy + guest + client:
+
+```
+                    total  k->exec nodeStart  bound@   manif  lease restore pglite   wire@ startup query
+  stop-rep5         10884     1131      2919    4292     196    363    1460   2002    9910     152   134
+  stop-rep6         11166     1160      2910    4317     192    482    1402   2218   10205     155   136
+  stop-rep8         10667     1205      2835    4389     101    337    1310   2057    9744     147   133
+  mean              10905     1165      2888    4333     163    394    1391   2092    9953     151   134
+```
+
+**The full phase table, on the guest-kernel axis** (mean of the three):
+
+```
+   phase                                    ms     cumulative   owner
+   dial -> guest kernel boot               ~660          660    Fly proxy + hypervisor
+   kernel -> node exec                     1165         1825    init, containerd, image mount
+   node exec -> first user code            2888         4713    Node startup (v8 ~990, bootstrap ~2270)
+     .. public 5432 bound here                          4333    (prebind, first tick)
+   fork/exec child + ESM graph              ~590         5303    second Node bootstrap + PGlite WASM load
+   ZeroPG manifest GET                       163         5466    first Tigris round trip
+   ZeroPG lease acquire                      394         5860    lease.json CAS
+   ZeroPG snapshot restore                  1391         7251    5.16 MB from Tigris
+   PGlite create (WASM boot + postgres)     2092         9343    
+     .. wire listening here                             9953    
+   startup handshake                         151        10104    
+   first row                                 134        10238    
+   TOTAL (client-visible)                              ~10905
+```
+
+**The unaccounted ~5s was never one thing.** It is, in order of size:
+
+- **~2.9s of Node startup** - `node exec` to the first line of user code, on
+  `shared-cpu-1x`. v8 init alone is ~990ms and bootstrap ~2270ms. This is the single
+  largest phase in the entire cold path and it is not Fly, not PGlite, and not us.
+- **~2.1s of PGlite create** - WASM compile plus starting Postgres on the restored
+  datadir. E11 folded this into "the restore"; it is in fact larger than the download.
+- **~1.2s of kernel-to-exec** - init, containerd, image mount, entrypoint.
+- **~0.6s of second Node bootstrap** - the price of the prebind two-process shape.
+
+E11's "~4.2s PGlite restore" was really ~1.4s of download plus ~2.1s of WASM/Postgres
+start. And **the download is not the bottleneck**: 5.16 MB from Tigris in ~1.4s is the
+fourth-largest phase, behind two different startup costs.
+
+Two things this rules out. **The proxy is not the problem** - `prebind` binds 5432 at
+~4.3s and the proxy reports "became reachable in 3.1-3.6s", comfortably inside its ~8.4s
+budget, in every rep. And **the network is not the problem** - only ~660ms separates the
+client's dial from guest kernel boot, and ~285ms of the tail is this box's RTT to `iad`.
+
+> **One cold rep in eight dropped the client anyway** (`stop-rep7`,
+> `CLOSED-BEFORE-FIRST-ROW` at 269ms). The proxy logged
+> `waiting for machine to be reachable on 0.0.0.0:8081` and
+> `machine became reachable in 5.334s` - it was probing the **observation face**, added by
+> this experiment, not the wire port. Adding a third service gave the proxy another port
+> to gate on. This is an artifact of E15's own instrumentation, not an E11 regression, but
+> it is a real caution: **every extra `[[services]]` block is another port the proxy must
+> find before it will route.**
+
+### Result 2, the big one: suspend is 9.6x faster, and it genuinely resumes
+
+`auto_stop_machines = "suspend"` / `flyctl machines suspend`. Same Machine, same image,
+same bucket - only the parked state differs:
+
+```
+                         TCP    SSL-neg   startup   query    TOTAL
+  cold (stopped)        30ms    ~10.5s     151ms    134ms    10.7-11.2s   (n=3)
+  RESUMED (suspended)   30ms     756-865ms 135-149ms 134-139ms 1.07-1.17s (n=3, mean 1130ms)
+  warm                  31ms     256ms     148ms    135ms    0.57s
+```
+
+**10.9s -> 1.13s, a 9.6x improvement**, and only ~2x off the fully warm path. Of the
+1.13s, ~285ms is round-trip latency from this box to `iad`.
+
+**It is a real resume, not a fast cold boot.** This distinction is measured, not inferred
+from the number being small. `/trace` reports the process's own stamps and a wall-clock
+jump detector:
+
+```
+kernelUptimeNow 75720 ms
+resumes seen by guest: [{"frozenMs": 11119, "frozenS": 11}]
+boot stamps still from the ORIGINAL boot:
+   proc-start        2026-07-29T13:51:34.954Z
+   spawning-server   2026-07-29T13:51:35.179Z
+   public-port-bound 2026-07-29T13:51:35.200Z
+```
+
+Same process, original boot stamps, and the guest observed an 11s freeze. There is no new
+`Starting machine` / `machine started in` pair in the proxy log. The PGlite instance was
+in RAM the whole time, which is exactly why there is no restore in the resumed path.
+Three consecutive 60s-gap runs all reported `RESUME`, none fell back.
+
+**Suspend requirements and billing**, from Fly's docs (`fly.io/docs/reference/suspend-resume/`):
+memory <= 2GB, no swap, no schedule, no GPU, machine updated since 2024-06-20. A
+suspended Machine is billed like a stopped one - storage only, no CPU/RAM - but it **does
+not free regional capacity**. Fly is explicit that a snapshot **is not guaranteed to
+persist**: deploys invalidate it, and host migration, maintenance or space reclamation can
+turn a resume into a cold boot. `auto_stop_machines = "suspend"` is documented as
+suspending "if possible" and **falling back to autostop** when a Machine is ineligible.
+This is why `fly.toml` here still carries `"stop"` and the suspend is driven through the
+API: **a deploy discards the snapshot**, so flipping the flag by redeploying would
+guarantee that the first measurement after every flip is a cold boot mislabelled a resume.
+
+### Result 3: a resumed Machine serves STALE DATA and accepts writes into a lost lease
+
+**This is the finding that outranks the latency result.** The lease TTL is 60s and lives
+in the bucket with a wall-clock `expiresAt`. A frozen guest renews nothing, so **any
+suspend longer than a minute leaves the lease expired and takeable by anyone.**
+
+The sequence, run against `e15/run2` with `steal-lease.ts` as the outside writer:
+
+```
+1. row written through the wire, machine serving normally
+     1|row-before-suspend
+2. flyctl machines suspend      -> state: suspended at 14:16:16Z
+3. lease inspected while frozen -> expired: true   (holder cannot renew; it is frozen)
+4. lease STOLEN from this box, and a row committed at durability:strict
+     {"event":"lease-taken", ...}
+     {"event":"committed-as-new-holder",
+      "rows":[{"id":1,"body":"row-before-suspend"},{"id":34,"body":"written-by-thief"}]}
+   machine still `suspended` throughout
+5. RESUME the machine and ask it over the real wire:
+```
+
+```
+$ psql "postgres://postgres@137.66.3.126:5432/postgres" -tAc "SELECT id,body FROM notes ORDER BY id;"
+1|row-before-suspend                 <- STALE. The bucket holds 2 rows.
+```
+
+**It serves a stale read, silently, to a normal libpq client.** And it does not stop
+there:
+
+```
+$ psql ... -tAc "INSERT INTO notes(body) VALUES ('write-to-stale-resumed') RETURNING id;"
+2
+INSERT 0 1                            <- ACCEPTED, into a database it no longer owns
+```
+
+It allocated `id 2` - a primary key the real holder had already advanced past to `id 34`.
+
+**Worse, it does not even know it is fenced when explicitly asked.** `/lease-state` forces
+a `validateLease()` round trip to the bucket:
+
+```
+{"validated": true, "ok": true, "ms": 1191,
+ "resumes": [{"frozenS": 40}, {"frozenS": 20}]}
+```
+
+`ok: true` on a machine that had already lost the lease. The mechanism: the thief did a
+**clean release**, which deletes `lease.json`, and `Lease.validate()` treats an absent
+lease as re-acquirable - so the zombie re-created it **with its original fencing token 1**,
+behind the manifest. The fencing token went *backwards* from the bucket's point of view.
+
+Two aggravating factors specific to suspend, both worse than E11's two-Machine case:
+
+- **E11 needed an operator mistake** (a second Machine cloned deliberately). **Suspend
+  produces this with one Machine and no mistake at all** - it is a property of the
+  configuration. Any suspend > 60s is enough.
+- **E11's stale writer was fenced at flush** and at least failed loudly in its own logs.
+  Here the resumed instance re-took a lease it should never have got, so the fence that
+  protected the bucket in E11 did not engage the same way.
+
+**The bucket did not survive this cleanly either.** After the zombie rejoined and
+committed, the manifest referenced a WAL segment that does not exist:
+
+```
+Error: manifest references missing WAL segment generations/49fd6d4db30d3f77/wal/00000001-t1.seg
+
+objects actually present:
+   generations/49fd6d4db30d3f77/snapshot-0-t1.tar.gz   5158766
+   generations/49fd6d4db30d3f77/wal/00000002-t1.seg        200
+   generations/49fd6d4db30d3f77/wal/00000002-t2.seg     230448
+   manifest.json  (token 1, commitSeq 2)
+```
+
+Two writers, both believing they held token 1, interleaved their WAL numbering. **The
+database at that prefix is unreadable** - `ZeroPGReplica.open()` refuses it, correctly,
+rather than booting half-restored state. So the E11 conclusion "the bucket cannot be
+corrupted by a second Machine" **does not extend to the suspend/resume path**: there the
+loser can re-acquire the lease at a stale token and write.
+
+**Verdict: `suspend` must not be enabled on this stack as it stands.** The latency win is
+real and large, but it converts a correctness property that held under `stop` into one
+that does not.
+
+**What would make it safe**, in order of how load-bearing it is:
+
+1. **Revalidate the lease on resume, before serving anything.** The wall-clock jump
+   detector in `server.ts` (a `setInterval` that sees the clock leap) already detects a
+   resume in-process, and Fly documents no resume signal or webhook, so that is the
+   available hook. On a detected resume the server must re-read the lease *and the
+   manifest* before answering a single query.
+2. **`Lease.validate()` must not treat an absent `lease.json` as ours.** Re-creating a
+   lease with a token at or below `manifest.fencingToken` is what let the zombie back in.
+   The token floor from the manifest must be re-read on any re-acquisition, not just on
+   first boot.
+3. **A fenced instance must close its wire listener and exit**, which was already E11's
+   recommendation and is unchanged by this.
+4. **Keep the lease TTL above the expected suspend duration**, which is not a real fix -
+   Fly suspends after "several minutes" of idle and there is no documented cap on how
+   long a Machine stays suspended - but it narrows the window.
+
+### An unrelated Tigris anomaly, found while building the steal harness
+
+Worth recording because it cost real time and would be indistinguishable from a lease bug
+in production. On the `e15/coldstart` prefix, `manifest.json` reached a state where:
+
+```
+GET   manifest.json         -> 200, 473 bytes, etag 70a2f58b...
+HEAD  manifest.json         -> 200, same etag
+md5(bytes) == etag          -> true   (self-consistent read)
+LIST  prefix=e15/coldstart/ -> the key is NOT LISTED
+PUT   If-Match: <that etag> -> 412, every time, indefinitely
+PUT   If-None-Match: *      -> 200   (the conditional layer thinks it does NOT exist)
+```
+
+The object was readable and internally consistent, invisible to LIST, and permanently
+un-CAS-able. Ruled out by direct test: it is **not** a general Tigris CAS failure
+(raw-HTTP `If-Match` works, and a full `ZeroPG.open` -> commit -> `If-Match` cycle on a
+fresh prefix succeeds), **not** weak-vs-strong etags, **not** stale reads (8/8 fresh in a
+read-after-write loop), and **not** a delete marker (deletes are consistent). It presents
+as one key desynchronised between Tigris's data path and its conditional-write path.
+
+This is what `fenceStamp` was failing against - `fence-stamp failed after repeated
+manifest races` - which reads exactly like lease contention and is not. **A retry loop
+that treats 412 as contention will spin forever against this.**
+
+> **Cost of finding it, recorded plainly:** the `If-None-Match: *` probe that identified
+> the split view also **succeeded**, overwriting the live manifest with `{}` and
+> destroying the `e15/coldstart` database pointer. The snapshot and WAL objects survived;
+> only the manifest was clobbered. That prefix was abandoned and the experiment moved to
+> `e15/run2`. The loss was one test row in a throwaway experiment bucket, but the probe
+> should have been run against a copy of the key, not the live one.
+
+### What it means for the design
+
+**Answer to the decomposition: the cold path is fully accounted for, and it is dominated
+by runtime startup rather than by anything zeropg does.** ~2.9s Node + ~2.1s PGlite WASM
+boot + ~1.2s container init = ~6.2s of the ~10.9s, against ~1.4s of actual data transfer.
+Optimising the restore path further has very little left to win; the leverage is in not
+paying the startup at all.
+
+**Answer to suspend: it wins the latency argument decisively and loses the correctness
+one.** 10.9s -> 1.13s is the largest single improvement measured anywhere in this project,
+and it arrives precisely because it skips the startup costs the phase table just named.
+But it is unsafe on this stack today, and the fix is in `@zeropg/server` and
+`@zeropg/lease` (revalidate on resume; never re-acquire below the manifest's token floor),
+not in `fly.toml`.
+
+Against [E11](#e11-flyio-baseline-does-a-public-postgres-with-scale-to-zero-actually-work-done---yes-after-fixing-a-race-that-is-ours):
+E11 concluded the bucket is safe and the client is not. **E15 narrows that: under
+`suspend`, the bucket is not safe either.** E11's step-4 recommendation (a fenced writer
+must refuse new connections and exit, not merely fail its flush) was already necessary;
+this makes it a blocker on the resume path specifically.
+
+**Reproduce.** `experiments/e15-fly-coldstart/`.
+Cold baseline: `./cold-cycle.sh <app> <machine> <ip> <label> stop` then
+`node phase-table.mjs <label>`.
+Suspend: `./suspend-cycle.sh <app> <machine> <ip> <label> <idle-seconds> suspend`, which
+prints a RESUME-versus-COLD-BOOT verdict from the guest's own evidence rather than from
+how fast the number looked.
+Correctness: `npx tsx steal-lease.ts <prefix> write` while the Machine is `suspended`,
+then resume it and `psql` for the row count.
