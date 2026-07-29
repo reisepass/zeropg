@@ -246,10 +246,47 @@ in [STATUS.md](STATUS.md).
   `ls/status/wake/url/export/migrate`, all `--json` so an AI agent can run your fleet;
   `zeropg console` is the same view on localhost.
 
+## Where it runs, and the one platform that gives you a real `postgres://`
+
+Full per-cloud detail in **[docs/PLATFORMS.md](docs/PLATFORMS.md)** - measured, not extrapolated.
+
+The property that varies most, and that most people do not expect: **can the platform accept a
+raw inbound TCP connection, and will it HOLD that connection while a stopped instance boots?**
+That decides whether you can hand someone a `postgres://` URL at all.
+
+| | inbound raw TCP | holds while cold-starting | scale to zero | public `postgres://` |
+|---|---|---|---|---|
+| **Fly.io** | **yes** | **yes, measured** | yes | **yes** |
+| Google Cloud Run | no | n/a | yes | no, needs a shim |
+| Azure Container Apps | yes (VNet) | untested | yes | probably |
+| AWS Lambda | no | n/a | yes | no |
+| Always-on VM | yes | never cold | no | **yes** |
+
+**Fly.io is the standout, and the reason is wake-on-TCP.** Point `psql` at a *stopped* Machine
+and the connection is held, not refused: the proxy accepts the TCP handshake in ~30ms, boots the
+VM behind the open socket, and splices you through. Measured cold path 10.3-10.6s, warm
+0.52-0.56s, and **libpq's default `sslmode` works with no `?sslmode=disable`** - the first
+zeropg shape where that is true. A stopped Machine bills only its root volume.
+
+Two caveats before you reach for it, both measured and both written up in full:
+
+- **The bind-early fix is not in `@zeropg/server` yet.** Fly's proxy waits ~8.4s for your port;
+  the server binds only after the restore, so cold starts race and lose about half the time.
+  Proven fix in `experiments/e11-fly-baseline/prebind.mjs`, not yet upstreamed.
+- **`min_machines_running` is a floor, not a ceiling.** With two Machines, the lease protects the
+  bucket but *not the client*: a write sent to the fenced loser returns success and is then
+  silently lost.
+
+**Google Cloud Run accepts no inbound raw TCP** - HTTP, gRPC and WebSockets only. Nearly every
+other constraint in this design descends from that. The shape that works there is co-location:
+zeropg in the same container or a sidecar on loopback, which is also the best-tested topology in
+the repo.
+
 ## Docs index
 
 - [DESIGN.md](DESIGN.md): full architecture (lease/fencing protocol, manifest-swap commits, generations, platform notes)
 - [V1-WAL-SHIPPING.md](V1-WAL-SHIPPING.md): incremental commits + the three design corrections live testing forced
+- [docs/PLATFORMS.md](docs/PLATFORMS.md): per-cloud - what each platform can do, what it costs idle, and the wake-on-TCP property that decides whether you get a real `postgres://`
 - [docs/COLDSTART-MODEL.md](docs/COLDSTART-MODEL.md): cold ≈ restore + app boot, measured across 13 services
 - [docs/POSTGRES-APP-COMPAT.md](docs/POSTGRES-APP-COMPAT.md): compatibility evidence, 8+ real apps
 - [docs/STORAGE-BACKENDS.md](docs/STORAGE-BACKENDS.md): per-provider atomic-primitive survey (GCS / R2 / S3 / IBM COS / ...)
