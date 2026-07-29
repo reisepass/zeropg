@@ -58,17 +58,38 @@ proxy: machine became reachable in 3.299s
 
 Cloud Run cannot do this at any price. It is the whole difference.
 
-**Connect-to-first-row, phase split** (measured from outside the region, so round-trip latency
-is included):
+**Connect-to-first-row, phase split.** Measured two ways, because client placement turns out
+to dominate the warm number and not to touch the cold one ([E15](EXPERIMENTS-QUEUE.md#e15)):
 
 ```
-                 TCP     SSL-neg    startup    query     TOTAL
-  cold (stopped) 30ms    ~10.0s     ~140ms     ~135ms    10.3-10.6s
-  warm           29ms     236ms      130ms      129ms    0.52-0.56s
+                        TCP     SSL-neg    startup    query     TOTAL
+  cold, from outside   30ms     ~10.5s      151ms     134ms    10.7-11.2s
+  cold, in-region     6.3ms      12.2s       26ms      18ms    12.2s
+  warm, from outside   29ms      249ms      134ms     134ms    0.55s
+  warm, IN-REGION     8.1ms       17ms       11ms       3ms    0.038s
 ```
 
-Of the ~10.5s cold path, about 4.2s is the PGlite restore and the rest is VM start plus the
-proxy's retry cadence. About 265ms of the warm path is network round trip, not server time.
+**The warm path is 38ms in-region.** Roughly 93% of the 0.55s figure is round-trip latency
+from a transatlantic client, not server time. The cold path does not improve in-region at all,
+which is the proof that it is server-side work.
+
+**Where the ~11s cold path actually goes** (E15 phase table, on the guest-kernel axis):
+
+```
+   node exec -> first user code        2888ms    <- largest single phase
+   PGlite create (WASM + postgres)     2092ms
+   kernel -> node exec                 1165ms
+   snapshot restore from Tigris        1391ms    <- the only phase that is data transfer
+   lease + manifest                     557ms
+   fork/exec child + ESM graph          590ms
+   dial -> guest kernel boot            660ms
+```
+
+About 6.2s is runtime and container startup against ~1.4s of actual data transfer. The ~2.9s
+of "Node startup" is **not** the interpreter, module loading or the app bundle - all three
+measure 32-46ms on the same VM. It is first-touch paging of a 120 MB Node binary on a cold
+Firecracker image. **A bigger Machine does not help** (`shared-cpu-4x` moved it by ~3%);
+a smaller runtime image is the lever.
 
 **libpq's default `sslmode` works with no query-string workaround:**
 
@@ -127,6 +148,47 @@ that gets fenced.
 `clone`, a rolling deploy, or an autoscale from creating a second. The correct fix is for a
 fenced instance to close its wire listener and exit so the proxy stops routing to it. **Do not
 run this shape in production until that lands.**
+
+### 3. Do not reach for `auto_stop_machines = "suspend"`. It is fast, wrong, and short-lived
+
+Suspend snapshots the Machine's RAM instead of cold-booting, so the PGlite instance is already
+in memory on resume. It is by far the fastest thing measured anywhere in this project:
+
+```
+  cold  (stopped)   10.9s from outside     12.2s in-region
+  RESUME            1.13s from outside     0.685s in-region     <- 16x
+  warm              0.55s from outside     0.038s in-region
+```
+
+Verified as a genuine resume rather than a quick cold boot: the original process survives with
+its boot stamps intact, and the guest observes a wall-clock freeze.
+
+**Two independent reasons not to use it** ([E15](EXPERIMENTS-QUEUE.md#e15)):
+
+**It serves stale data.** The lease TTL is 60s and lives in the bucket with a wall-clock
+expiry. A frozen guest renews nothing, so **any suspend longer than a minute leaves the lease
+takeable**. Take it from elsewhere, commit a row, then resume the Machine, and a normal `psql`
+gets:
+
+```
+1|row-before-suspend            <- STALE. The bucket holds two rows.
+```
+
+It also **accepts writes** into the database it no longer owns, and `validateLease()` reports
+`ok: true` on the fenced instance, because the real holder's clean release deleted
+`lease.json` and the zombie re-created it at its original fencing token. Two writers at the
+same token left the bucket **unreadable** - the manifest referenced a WAL segment that does
+not exist. E11's "the bucket cannot be corrupted by a second Machine" does not extend here.
+
+**And the snapshot decays in about two minutes anyway.** Polled with zero client traffic, a
+`suspended` Machine leaves that state on its own - sometimes to `started`, which bills CPU and
+RAM for a database nobody is using, and sometimes to `stopped`, which costs the next client the
+full ~11s. Fly documents the snapshot as explicitly not guaranteed to persist and gives no way
+to configure the timing.
+
+**A workload idle for two minutes is not what scale-to-zero is for.** Even with the lease bugs
+fixed, suspend would deliver its 685ms only on traffic that barely goes idle. **Stay on
+`auto_stop_machines = "stop"`.**
 
 ---
 
