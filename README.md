@@ -286,6 +286,7 @@ the repo.
 
 - [DESIGN.md](DESIGN.md): full architecture (lease/fencing protocol, manifest-swap commits, generations, platform notes)
 - [V1-WAL-SHIPPING.md](V1-WAL-SHIPPING.md): incremental commits + the three design corrections live testing forced
+- [docs/COMPETITIVE-LANDSCAPE.md](docs/COMPETITIVE-LANDSCAPE.md): who else sells idle-cheap Postgres - Fly's three Postgres products, Supabase Pico + branching, and what is actually left differentiated
 - [docs/PLATFORMS.md](docs/PLATFORMS.md): per-cloud - what each platform can do, what it costs idle, and the wake-on-TCP property that decides whether you get a real `postgres://`
 - [docs/COLDSTART-MODEL.md](docs/COLDSTART-MODEL.md): cold ≈ restore + app boot, measured across 13 services
 - [docs/POSTGRES-APP-COMPAT.md](docs/POSTGRES-APP-COMPAT.md): compatibility evidence, 8+ real apps

@@ -21,9 +21,18 @@ someone a `postgres://` URL at all.
 
 ---
 
-## Fly.io - the one that gives you a real `postgres://`
+## Fly.io - where zeropg *can* offer a real `postgres://`
 
-**This is the standout, and the reason is wake-on-TCP.**
+**Wake-on-TCP is the enabling property.** But read
+[COMPETITIVE-LANDSCAPE.md](COMPETITIVE-LANDSCAPE.md) first: raw TCP ingress is a *Fly* feature,
+not a zeropg one, and Fly's own **Legacy (unmanaged) Postgres on a volume** gets it too, scales
+to zero via `auto_stop_machines`, and has a real Postgres behind it - no 0.5GB ceiling, working
+advisory locks, working `LISTEN`/`NOTIFY`, `sqlx` and Diesel fine. **For a single database on
+Fly, use that instead of zeropg.**
+
+What Fly's own numbers do establish is that the *managed* path is not competing for idle
+workloads: **`fly mpg` starts at $38/month with no scale-to-zero and no public connection
+string**. zeropg's case on Fly is fleet scale and disposability, not any one database.
 
 Fly forwards a genuine public TCP port with no proxy layer in the path:
 
