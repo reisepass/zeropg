@@ -8,9 +8,18 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "declaration": true,
-    "outDir": "dist",
-    "types": ["node"]
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "paths": {
+      "@zeropg/blobstore": ["./packages/blobstore/src/index.ts"],
+      "@zeropg/lease": ["./packages/lease/src/index.ts"],
+      "@zeropg/objectstore-fs": ["./packages/objectstore-fs/src/index.ts"],
+      "@zeropg/server": ["./packages/server/src/index.ts"],
+      "@zeropg/server/wire-frontend": ["./packages/server/src/wire-frontend.ts"],
+      "@zeropg/client": ["./packages/client/src/index.ts"]
+    }
   },
-  "include": ["packages/*/src/**/*.ts", "experiments/**/*.ts"]
+  "include": ["packages/*/src/**/*.ts", "experiments/**/*.ts"],
+  "exclude": ["experiments/pg-gateway/vendor"]
 }

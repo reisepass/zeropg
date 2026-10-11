@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 // PATCH 3 of 3: replaces the four @std/* imports with node: builtins.
 //
 // Motivation, from the vendoring plan: the shipped dist inlines

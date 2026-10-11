@@ -15,14 +15,18 @@ import { createServer, type Server } from 'node:net'
 import { PGlite } from '@electric-sql/pglite'
 import { fromNodeSocket } from './vendor/patched/src/platforms/node/index.ts'
 
+// pg-gateway types TLS material as ArrayBuffer; a Buffer is a view, so copy out its bytes.
+const toArrayBuffer = (b: Buffer): ArrayBuffer =>
+  b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer
+
 const SELF = fileURLToPath(import.meta.url)
 const CERTS = '/tmp/pggw-certs'
 
 async function child(): Promise<void> {
   const db = await PGlite.create()
   const tls = {
-    key: readFileSync(`${CERTS}/server.key`),
-    cert: readFileSync(`${CERTS}/server.crt`),
+    key: toArrayBuffer(readFileSync(`${CERTS}/server.key`)),
+    cert: toArrayBuffer(readFileSync(`${CERTS}/server.crt`)),
   }
 
   // DELIBERATELY NO process.on('uncaughtException') / ('unhandledRejection').

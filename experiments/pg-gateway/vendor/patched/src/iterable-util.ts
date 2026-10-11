@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 /**
  * An `AsyncIterable` that captures the following metadata during iteration:
  * - `iterations`: the number of times the iterable has been iterated over

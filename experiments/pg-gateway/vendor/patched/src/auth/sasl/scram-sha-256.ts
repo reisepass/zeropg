@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 import { decodeBase64, encodeBase64 } from '../../std-shim.js';
 import { BackendError } from '../../backend-error.js';
 import type { BufferReader } from '../../buffer-reader.js';

@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 import type { AuthFlow } from './auth/base-auth-flow.js';
 import { type AuthOptions, createAuthFlow } from './auth/index.js';
 import { BackendError } from './backend-error.js';

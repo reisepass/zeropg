@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 import PostgresConnection, { type PostgresConnectionOptions } from '../../connection.js';
 
 /**

@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 export interface DuplexStream<T = unknown> {
   readable: ReadableStream<T>;
   writable: WritableStream<T>;

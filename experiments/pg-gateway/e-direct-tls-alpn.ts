@@ -27,6 +27,10 @@ import { PGlite } from '@electric-sql/pglite'
 import { fromNodeSocket } from 'pg-gateway/node'
 import { freePort } from './lib/gateway.ts'
 
+// pg-gateway types TLS material as ArrayBuffer; a Buffer is a view, so copy out its bytes.
+const toArrayBuffer = (b: Buffer): ArrayBuffer =>
+  b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer
+
 const CERTS = '/tmp/pggw-certs'
 let failures = 0
 const ok = (m: string): void => console.log(`  ok   ${m}`)
@@ -50,8 +54,8 @@ async function serveTls(db: PGlite): Promise<Srv> {
     socket.on('error', () => {})
     fromNodeSocket(socket, {
       tls: {
-        key: readFileSync(`${CERTS}/server.key`),
-        cert: readFileSync(`${CERTS}/server.crt`),
+        key: toArrayBuffer(readFileSync(`${CERTS}/server.key`)),
+        cert: toArrayBuffer(readFileSync(`${CERTS}/server.crt`)),
       },
       auth: { method: 'trust' },
       async onMessage(data: Uint8Array, { isAuthenticated }: { isAuthenticated: boolean }) {

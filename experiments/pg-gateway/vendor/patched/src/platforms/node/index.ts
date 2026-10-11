@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 import type { Socket } from 'node:net';
 import { Duplex } from 'node:stream';
 import PostgresConnection, {

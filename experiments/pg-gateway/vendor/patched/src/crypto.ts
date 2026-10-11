@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 /**
  * Derives a cryptographic key from a password using the PBKDF2 algorithm.
  *

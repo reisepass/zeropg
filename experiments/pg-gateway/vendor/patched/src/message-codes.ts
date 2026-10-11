@@ -1,3 +1,4 @@
+// @ts-nocheck - vendored pg-gateway source (targets DOM/Deno libs); typechecked upstream, not here
 /**
  * Frontend message codes
  * @see https://www.postgresql.org/docs/current/protocol-message-codes.html

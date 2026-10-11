@@ -9,13 +9,16 @@ jobs:
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Sources are typechecked directly (tsconfig paths map @zeropg/* to src),
+      # so this does not depend on dist. The build then proves the packages emit.
       - run: npx tsc --noEmit
+      - run: npm run build
 
   unit:
     # Store-less checks: tar round-trip, LSN math, manifest codecs.
@@ -23,8 +26,8 @@ jobs:
     # pre-release — this project does not mock the object store.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
