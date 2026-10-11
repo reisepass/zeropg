@@ -56,8 +56,8 @@ about 200ms end to end. Think "Litestream, but for Postgres."
 Yes, unmodified. PrivateBin, NocoDB, Rallly, Documenso, and a Bluesky-compatible AT
 Protocol PDS all run against zeropg with only a Docker/config change: swap the
 `postgres:` service for a sidecar, point `DATABASE_URL` at localhost. 880 real
-migrations applied. All live, all scaling to zero, all with the database in a bucket:
-the [PDS](https://pds-scale-to-zero.0rs.org) cold-starts in ~5 seconds,
+migrations applied. All verified live, all scaling to zero, all with the database in a bucket:
+the [PDS](https://github.com/reisepass/zeropg/tree/main/examples/cloudrun/pds) (demo since taken down) cold-started in ~5 seconds,
 [PrivateBin](https://privatebin-scale-to-zero.0rs.org) in ~5, and a small Go backend we
 wrote as a stress test measured ~3.5s, the same as the bare database demo.
 

@@ -74,6 +74,7 @@ https://privatebin-scale-to-zero.0rs.org
 https://nocodb-scale-to-zero.0rs.org
 https://rallly-scale-to-zero.0rs.org
 https://documenso-scale-to-zero.0rs.org
-https://pds-scale-to-zero.0rs.org
+
+The PDS demo is taken down (a subscribed relay never lets it sleep); deploy your own: https://github.com/reisepass/zeropg/tree/main/examples/cloudrun/pds
 
 Per-app evidence tables: https://github.com/reisepass/zeropg/blob/main/docs/POSTGRES-APP-COMPAT.md

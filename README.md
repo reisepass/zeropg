@@ -92,7 +92,7 @@ frameworks pay their own 20-35s on top. The fast tier:
 |---|---|---|---|---|
 | **webhookx** | webhook gateway (Go), first needs-Redis app: valkey sidecar scales to zero with it | ~4-5s | (not public) | [examples/cloudrun/webhookx](examples/cloudrun/webhookx) |
 | **httpbin + requestbin** | our own request-echo + capture bins (Go), TTL retention built in | ~4-5s | [httpbin-ui-scale-to-zero.0rs.org](https://httpbin-ui-scale-to-zero.0rs.org) | [examples/cloudrun/httpbin](examples/cloudrun/httpbin) |
-| **cocoon** | a Bluesky-compatible AT Protocol PDS (Go, GORM+pgx). Your own PDS, DB in a bucket; rarely cold in practice (live AT-Proto traffic keeps it warm) | ~5s | [pds-scale-to-zero.0rs.org](https://pds-scale-to-zero.0rs.org) | [examples/cloudrun/pds](examples/cloudrun/pds) |
+| **cocoon** | a Bluesky-compatible AT Protocol PDS (Go, GORM+pgx). Your own PDS, DB in a bucket; verified live, then taken down: a subscribed AT-Proto relay holds the connection open, so it never scales to zero | ~5s | (taken down, deploy from source) | [examples/cloudrun/pds](examples/cloudrun/pds) |
 | **PrivateBin** | encrypted pastebin (PHP) | ~5s | [privatebin-scale-to-zero.0rs.org](https://privatebin-scale-to-zero.0rs.org) | [examples/cloudrun/privatebin](examples/cloudrun/privatebin) |
 | **supabase (simple demo)** | self-hosted PostgREST + GoTrue + RLS on the zeropg wire, driven by supabase-js | ~5-8s | [supabase-scale-to-zero.0rs.org](https://supabase-scale-to-zero.0rs.org) | [examples/cloudrun/supabase](examples/cloudrun/supabase) |
 | **airtable-style** | rows-as-JSONB grid app (Go + tiny SPA) | ~8s | [airtable-scale-to-zero.0rs.org](https://airtable-scale-to-zero.0rs.org) | [examples/cloudrun/airtable](examples/cloudrun/airtable) |

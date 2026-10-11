@@ -3,6 +3,12 @@
 A scale-to-zero AT Protocol Personal Data Server: [cocoon](https://github.com/haileyok/cocoon)
 (Go) backed by zeropg (PGlite + Postgres wire, datadir shipped to GCS).
 
+**Status: taken down 2026-10-11.** The demo at `pds-scale-to-zero.0rs.org` no longer
+resolves. It worked, but a Bluesky relay keeps `com.atproto.sync.subscribeRepos` open
+indefinitely, so the instance stayed awake 24 h/day and never scaled to zero. The
+steps below still deploy it; the hostname in them is the one the demo used, so
+substitute your own.
+
 ## Why cocoon (and why not rsky)
 
 Both candidates use Postgres, but the zeropg wire multiplexes every TCP
@@ -74,7 +80,7 @@ testing - it is never committed. To verify the gate yourself, hit
 
 ## Custom domain (single-hostname, free) + the handle-resolution tradeoff
 
-The PDS is served at **https://pds-scale-to-zero.0rs.org** via a free Cloud Run
+The PDS was served at `pds-scale-to-zero.0rs.org` via a free Cloud Run
 domain mapping (Google-managed cert, no load balancer). `COCOON_HOSTNAME` /
 `COCOON_DID` are set to that host, so `describeServer` advertises
 `did:web:pds-scale-to-zero.0rs.org` and `/.well-known/did.json` serves it.
@@ -128,4 +134,4 @@ gcloud run services add-iam-policy-binding cocoon-pds-zeropg \
   --project blob-pglite --region europe-west1 --member=allUsers --role=roles/run.invoker
 ```
 
-Live URL: https://pds-scale-to-zero.0rs.org
+The demo used `pds-scale-to-zero.0rs.org` (no longer live).

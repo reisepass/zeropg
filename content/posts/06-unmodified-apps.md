@@ -91,5 +91,7 @@ The live demos (cold-starting from the bucket as you click):
 [privatebin](https://privatebin-scale-to-zero.0rs.org) ·
 [nocodb](https://nocodb-scale-to-zero.0rs.org) ·
 [rallly](https://rallly-scale-to-zero.0rs.org) ·
-[documenso](https://documenso-scale-to-zero.0rs.org) ·
-[a real AT Protocol PDS](https://pds-scale-to-zero.0rs.org).
+[documenso](https://documenso-scale-to-zero.0rs.org).
+The AT Protocol PDS ran live too and is now taken down (a subscribed relay never
+lets it sleep); deploy your own from
+[examples/cloudrun/pds](https://github.com/reisepass/zeropg/tree/main/examples/cloudrun/pds).

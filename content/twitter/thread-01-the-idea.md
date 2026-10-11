@@ -37,9 +37,9 @@ We deployed a rival service against the same bucket and watched it fence the ori
 6/
 Does anything real run on it? Unmodified?
 
-PrivateBin, NocoDB, Rallly, Documenso, and a Bluesky-compatible AT Protocol PDS. Official images, zero source patches, 880 real migrations. All live, all scale-to-zero, DB in a bucket.
+PrivateBin, NocoDB, Rallly, Documenso, and a Bluesky-compatible AT Protocol PDS. Official images, zero source patches, 880 real migrations. All verified, all scale-to-zero, DB in a bucket.
 
-The PDS cold starts in ~5s: https://pds-scale-to-zero.0rs.org
+The PDS cold starts in ~5s (demo since taken down, deploy it yourself): https://github.com/reisepass/zeropg/tree/main/examples/cloudrun/pds
 
 7/
 The economics: compute-while-awake is the only real cost. Break-even vs the cheapest managed Postgres is ~4-5 awake hours/day.
