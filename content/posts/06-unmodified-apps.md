@@ -87,12 +87,12 @@ migration files.
 
 Full evidence tables, per-app:
 [docs/POSTGRES-APP-COMPAT.md](https://github.com/reisepass/zeropg/blob/main/docs/POSTGRES-APP-COMPAT.md).
-The live demos (cold-starting from the bucket as you click):
-[privatebin](https://privatebin-scale-to-zero.0rs.org) ·
-[nocodb](https://nocodb-scale-to-zero.0rs.org) ·
-[rallly](https://rallly-scale-to-zero.0rs.org).
-Documenso and the AT Protocol PDS ran live too and are now taken down; deploy your
-own from
-[examples/documenso-on-zeropg](https://github.com/reisepass/zeropg/tree/main/examples/documenso-on-zeropg)
+Still live, cold-starting from the bucket as you click:
+[privatebin](https://privatebin-scale-to-zero.0rs.org).
+NocoDB, Rallly, Documenso and the AT Protocol PDS all ran live too and are now taken
+down; deploy your own from
+[nocodb-on-zeropg](https://github.com/reisepass/zeropg/tree/main/examples/nocodb-on-zeropg),
+[rallly-on-zeropg](https://github.com/reisepass/zeropg/tree/main/examples/rallly-on-zeropg),
+[documenso-on-zeropg](https://github.com/reisepass/zeropg/tree/main/examples/documenso-on-zeropg)
 and
-[examples/cloudrun/pds](https://github.com/reisepass/zeropg/tree/main/examples/cloudrun/pds).
+[cloudrun/pds](https://github.com/reisepass/zeropg/tree/main/examples/cloudrun/pds).

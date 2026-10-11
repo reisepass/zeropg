@@ -99,11 +99,12 @@ frameworks pay their own 20-35s on top. The fast tier:
 | **znostr-relay** | our ~330-line NIP-01 nostr relay, no Redis, DB is the only state | ~4-5s | wss://znostr-zeropg-71428757273.europe-west1.run.app | [examples/cloudrun/nostr](examples/cloudrun/nostr) |
 
 And the "it also runs" tier: heavyweight Node/Next.js apps that work unmodified but pay
-their own boot on every wake. They are compatibility proof, not showcases:
-**NocoDB** (~34s cold, 124 self-bootstrapped tables,
-[live](https://nocodb-scale-to-zero.0rs.org)), **Rallly** (21-36s, 130 Prisma
-migrations, [live](https://rallly-scale-to-zero.0rs.org)), **Documenso** (~30s, 162
-migrations, Prisma native query engine; verified live, demo since taken down, code in
+their own boot on every wake. They are compatibility proof, not showcases. All three
+were verified live on Cloud Run and have since been taken down; the code to run them
+stays: **NocoDB** (~34s cold, 124 self-bootstrapped tables,
+[examples/nocodb-on-zeropg](examples/nocodb-on-zeropg)), **Rallly** (21-36s, 130 Prisma
+migrations, [examples/rallly-on-zeropg](examples/rallly-on-zeropg)), **Documenso**
+(~30s, 162 migrations, Prisma native query engine,
 [examples/documenso-on-zeropg](examples/documenso-on-zeropg)),
 **nostream** (~14.5s, with a scale-to-zero Redis sidecar). Cal.com ran too but was
 dropped from the live set (>120s cold start; code stays in

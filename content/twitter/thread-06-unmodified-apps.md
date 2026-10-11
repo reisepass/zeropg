@@ -68,14 +68,11 @@ The screen, if you want to reuse it:
 4. Everything else very probably just runs. The remaining limits are throughput-shaped, not correctness-shaped
 
 11/
-All of them live, cold-starting out of the bucket as you click:
+All of them ran live. PrivateBin still does, cold-starting out of the bucket as you click:
 
 https://privatebin-scale-to-zero.0rs.org
-https://nocodb-scale-to-zero.0rs.org
-https://rallly-scale-to-zero.0rs.org
 
-Documenso and the PDS ran live too and are now taken down; deploy your own:
-https://github.com/reisepass/zeropg/tree/main/examples/documenso-on-zeropg
-https://github.com/reisepass/zeropg/tree/main/examples/cloudrun/pds
+NocoDB, Rallly, Documenso and the PDS are taken down now; deploy your own:
+https://github.com/reisepass/zeropg/tree/main/examples
 
 Per-app evidence tables: https://github.com/reisepass/zeropg/blob/main/docs/POSTGRES-APP-COMPAT.md

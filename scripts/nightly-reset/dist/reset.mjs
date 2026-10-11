@@ -2554,8 +2554,6 @@ var DEMOS = [
   { name: "demo-500mb", service: "zeropg-demo-500mb", prefix: "demo/app-500mb", mode: "truncate", truncateTables: ["notes"], smokeUrl: "https://zeropg-demo-500mb-71428757273.europe-west1.run.app/up" },
   { name: "supabase", service: "supabase-zeropg", prefix: "cloudrun-supabase-v5", mode: "drop-schemas", smokeUrl: "https://supabase-scale-to-zero.0rs.org/" },
   { name: "privatebin", service: "privatebin-zeropg", prefix: "cloudrun-privatebin", mode: "drop-schemas", smokeUrl: "https://privatebin-scale-to-zero.0rs.org/" },
-  { name: "nocodb", service: "nocodb-zeropg", prefix: "cloudrun-nocodb", mode: "drop-schemas", smokeUrl: "https://nocodb-scale-to-zero.0rs.org/", smokeTimeoutMs: 12 * 6e4 },
-  { name: "rallly", service: "rallly-zeropg", prefix: "cloudrun-rallly", mode: "drop-schemas", extensions: ["citext", "pgcrypto"], smokeUrl: "https://rallly-scale-to-zero.0rs.org/", smokeTimeoutMs: 12 * 6e4 },
   { name: "airtable", service: "airtable-zeropg", prefix: "cloudrun-airtable", mode: "drop-schemas", smokeUrl: "https://airtable-scale-to-zero.0rs.org/" },
   { name: "httpbin", service: "httpbin-zeropg", prefix: "cloudrun-httpbin", mode: "drop-schemas", smokeUrl: "https://httpbin-ui-scale-to-zero.0rs.org/" },
   { name: "znostr", service: "znostr-zeropg", prefix: "cloudrun-znostr", mode: "drop-schemas", smokeUrl: "https://znostr-zeropg-71428757273.europe-west1.run.app/" }
