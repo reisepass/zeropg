@@ -14,7 +14,7 @@
 //        - drop-schemas: drop every non-system schema and recreate an empty
 //          `public`. Apps rebuild themselves: self-migrating apps (NocoDB,
 //          PrivateBin, GoTrue, ...) re-run their migrations on next boot, and
-//          the migrate-sidecar apps (Rallly, Documenso) re-apply their full
+//          the migrate-sidecar apps (Rallly) re-apply their full
 //          migration set because the marker table is gone.
 //        - truncate: TRUNCATE the listed tables only (the benchmark demos keep
 //          their size-calibrated `filler` table).
@@ -26,8 +26,8 @@
 //      restart against the fresh DB instead of serving a stale cache.
 //   5. Smoke-poll the public URL until it answers again.
 //
-// Excluded on purpose: cocoon PDS (holds real AT-Proto identities and has real
-// federation traffic), Cal.com (not in the live set), nostream + webhookx (not
+// Excluded on purpose: cocoon PDS and Documenso (taken down, no live service),
+// Cal.com (not in the live set), nostream + webhookx (not
 // publicly promoted), and the Tigris/R2/IBM demos (different clouds/creds).
 //
 // Env:
@@ -64,7 +64,6 @@ const DEMOS: Demo[] = [
   { name: 'privatebin', service: 'privatebin-zeropg', prefix: 'cloudrun-privatebin', mode: 'drop-schemas', smokeUrl: 'https://privatebin-scale-to-zero.0rs.org/' },
   { name: 'nocodb', service: 'nocodb-zeropg', prefix: 'cloudrun-nocodb', mode: 'drop-schemas', smokeUrl: 'https://nocodb-scale-to-zero.0rs.org/', smokeTimeoutMs: 12 * 60_000 },
   { name: 'rallly', service: 'rallly-zeropg', prefix: 'cloudrun-rallly', mode: 'drop-schemas', extensions: ['citext', 'pgcrypto'], smokeUrl: 'https://rallly-scale-to-zero.0rs.org/', smokeTimeoutMs: 12 * 60_000 },
-  { name: 'documenso', service: 'documenso-zeropg', prefix: 'cloudrun-documenso', mode: 'drop-schemas', extensions: ['pgcrypto', 'pg_trgm'], smokeUrl: 'https://documenso-scale-to-zero.0rs.org/', smokeTimeoutMs: 12 * 60_000 },
   { name: 'airtable', service: 'airtable-zeropg', prefix: 'cloudrun-airtable', mode: 'drop-schemas', smokeUrl: 'https://airtable-scale-to-zero.0rs.org/' },
   { name: 'httpbin', service: 'httpbin-zeropg', prefix: 'cloudrun-httpbin', mode: 'drop-schemas', smokeUrl: 'https://httpbin-ui-scale-to-zero.0rs.org/' },
   { name: 'znostr', service: 'znostr-zeropg', prefix: 'cloudrun-znostr', mode: 'drop-schemas', smokeUrl: 'https://znostr-zeropg-71428757273.europe-west1.run.app/' },

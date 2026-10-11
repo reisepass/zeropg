@@ -90,8 +90,9 @@ Full evidence tables, per-app:
 The live demos (cold-starting from the bucket as you click):
 [privatebin](https://privatebin-scale-to-zero.0rs.org) ·
 [nocodb](https://nocodb-scale-to-zero.0rs.org) ·
-[rallly](https://rallly-scale-to-zero.0rs.org) ·
-[documenso](https://documenso-scale-to-zero.0rs.org).
-The AT Protocol PDS ran live too and is now taken down (a subscribed relay never
-lets it sleep); deploy your own from
+[rallly](https://rallly-scale-to-zero.0rs.org).
+Documenso and the AT Protocol PDS ran live too and are now taken down; deploy your
+own from
+[examples/documenso-on-zeropg](https://github.com/reisepass/zeropg/tree/main/examples/documenso-on-zeropg)
+and
 [examples/cloudrun/pds](https://github.com/reisepass/zeropg/tree/main/examples/cloudrun/pds).

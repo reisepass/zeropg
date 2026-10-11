@@ -8,7 +8,6 @@ declare -a APPS=(
   "privatebin|https://privatebin-scale-to-zero.0rs.org|120"
   "nocodb|https://nocodb-scale-to-zero.0rs.org|120"
   "rallly|https://rallly-scale-to-zero.0rs.org|120"
-  "documenso|https://documenso-scale-to-zero.0rs.org|120"
 )
 hit(){ local app=$1 url=$2 mt=$3 rnd=$4 out code t ts
   out=$(curl -o /dev/null -s -w "%{http_code} %{time_total}" --max-time "$mt" "$url" 2>/dev/null || echo "000 timeout")

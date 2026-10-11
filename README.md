@@ -103,7 +103,8 @@ their own boot on every wake. They are compatibility proof, not showcases:
 **NocoDB** (~34s cold, 124 self-bootstrapped tables,
 [live](https://nocodb-scale-to-zero.0rs.org)), **Rallly** (21-36s, 130 Prisma
 migrations, [live](https://rallly-scale-to-zero.0rs.org)), **Documenso** (~30s, 162
-migrations, Prisma native query engine, [live](https://documenso-scale-to-zero.0rs.org)),
+migrations, Prisma native query engine; verified live, demo since taken down, code in
+[examples/documenso-on-zeropg](examples/documenso-on-zeropg)),
 **nostream** (~14.5s, with a scale-to-zero Redis sidecar). Cal.com ran too but was
 dropped from the live set (>120s cold start; code stays in
 [examples/cloudrun/calcom](examples/cloudrun/calcom)).

@@ -1,6 +1,6 @@
 import { createRequire } from 'module'; const require = createRequire(import.meta.url);
 
-// packages/blobstore/dist/types.js
+// packages/blobstore/src/types.ts
 var PreconditionFailedError = class extends Error {
   key;
   constructor(key, detail) {
@@ -10,10 +10,10 @@ var PreconditionFailedError = class extends Error {
   }
 };
 
-// packages/blobstore/dist/gcs.js
+// packages/blobstore/src/gcs.ts
 import { Readable } from "node:stream";
 
-// packages/blobstore/dist/token.js
+// packages/blobstore/src/token.ts
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
@@ -26,8 +26,7 @@ async function fetchFromMetadata() {
       headers: { "Metadata-Flavor": "Google" },
       signal: AbortSignal.timeout(2e3)
     });
-    if (!res.ok)
-      return null;
+    if (!res.ok) return null;
     const body = await res.json();
     return {
       token: body.access_token,
@@ -62,10 +61,12 @@ async function getAccessToken() {
       return t.token;
     }
   }
-  throw new Error("could not obtain a GCP access token from the metadata server or gcloud");
+  throw new Error(
+    "could not obtain a GCP access token from the metadata server or gcloud"
+  );
 }
 
-// packages/blobstore/dist/gcs.js
+// packages/blobstore/src/gcs.ts
 var GCS_COST = {
   asOf: "2026-06",
   writeOpUsd: 5e-3 / 1e3,
@@ -81,8 +82,7 @@ var GCS_COST = {
 };
 var BASE = "https://storage.googleapis.com";
 function joinPrefix(prefix, key) {
-  if (!prefix)
-    return key;
+  if (!prefix) return key;
   const p = prefix.replace(/\/+$/, "");
   return `${p}/${key}`;
 }
@@ -111,10 +111,8 @@ var GcsBlobStore = class _GcsBlobStore {
       headers.Range = `bytes=${start}-${end ?? ""}`;
     }
     const res = await fetch(url, { headers });
-    if (res.status === 404)
-      return null;
-    if (!res.ok)
-      throw await gcsError(res, "get", key);
+    if (res.status === 404) return null;
+    if (!res.ok) throw await gcsError(res, "get", key);
     const buf = new Uint8Array(await res.arrayBuffer());
     const etag = res.headers.get("x-goog-generation") ?? "";
     return { bytes: buf, etag, size: buf.byteLength };
@@ -124,8 +122,7 @@ var GcsBlobStore = class _GcsBlobStore {
   static STREAM_CONCURRENCY = 4;
   async getStream(key) {
     const meta = await this.head(key);
-    if (!meta)
-      return null;
+    if (!meta) return null;
     const name = encodeURIComponent(this.fullKey(key));
     const base = `${BASE}/storage/v1/b/${this.bucket}/o/${name}?alt=media&generation=${meta.etag}`;
     const auth = await this.authHeaders();
@@ -142,11 +139,9 @@ var GcsBlobStore = class _GcsBlobStore {
     }
     const size = meta.size;
     async function* ordered() {
-      if (size === 0)
-        return;
+      if (size === 0) return;
       const starts = [];
-      for (let s = 0; s < size; s += CHUNK)
-        starts.push(s);
+      for (let s = 0; s < size; s += CHUNK) starts.push(s);
       const inflight = [];
       let next = 0;
       const fill = () => {
@@ -160,8 +155,7 @@ var GcsBlobStore = class _GcsBlobStore {
         const res = inflight.shift();
         const r = await res;
         fill();
-        if (!r.body)
-          throw new Error(`GCS getStream "${key}": empty response body`);
+        if (!r.body) throw new Error(`GCS getStream "${key}": empty response body`);
         for await (const part of r.body) {
           yield part;
         }
@@ -183,15 +177,12 @@ var GcsBlobStore = class _GcsBlobStore {
           n = 0;
         }
       }
-      if (n > 0)
-        yield Buffer.concat(buf, n);
+      if (n > 0) yield Buffer.concat(buf, n);
     }
     const name = this.fullKey(key);
     const params = new URLSearchParams({ uploadType: "media", name });
-    if (opts?.ifNoneMatch)
-      params.set("ifGenerationMatch", "0");
-    else if (opts?.ifMatch !== void 0)
-      params.set("ifGenerationMatch", opts.ifMatch);
+    if (opts?.ifNoneMatch) params.set("ifGenerationMatch", "0");
+    else if (opts?.ifMatch !== void 0) params.set("ifGenerationMatch", opts.ifMatch);
     const url = `${BASE}/upload/storage/v1/b/${this.bucket}/o?${params}`;
     const res = await fetch(url, {
       method: "POST",
@@ -207,18 +198,15 @@ var GcsBlobStore = class _GcsBlobStore {
     if (res.status === 412) {
       throw new PreconditionFailedError(key, opts?.ifNoneMatch ? "object exists" : "generation mismatch");
     }
-    if (!res.ok)
-      throw await gcsError(res, "putStream", key);
+    if (!res.ok) throw await gcsError(res, "putStream", key);
     const meta = await res.json();
     return { etag: meta.generation };
   }
   async put(key, bytes, opts) {
     const name = this.fullKey(key);
     const params = new URLSearchParams({ uploadType: "media", name });
-    if (opts?.ifNoneMatch)
-      params.set("ifGenerationMatch", "0");
-    else if (opts?.ifMatch !== void 0)
-      params.set("ifGenerationMatch", opts.ifMatch);
+    if (opts?.ifNoneMatch) params.set("ifGenerationMatch", "0");
+    else if (opts?.ifMatch !== void 0) params.set("ifGenerationMatch", opts.ifMatch);
     const url = `${BASE}/upload/storage/v1/b/${this.bucket}/o?${params}`;
     for (let attempt = 0; ; attempt++) {
       const res = await fetch(url, {
@@ -239,8 +227,7 @@ var GcsBlobStore = class _GcsBlobStore {
         await new Promise((r) => setTimeout(r, backoff));
         continue;
       }
-      if (!res.ok)
-        throw await gcsError(res, "put", key);
+      if (!res.ok) throw await gcsError(res, "put", key);
       const meta = await res.json();
       return { etag: meta.generation };
     }
@@ -250,12 +237,10 @@ var GcsBlobStore = class _GcsBlobStore {
     let pageToken;
     do {
       const params = new URLSearchParams({ prefix: fullPrefix });
-      if (pageToken)
-        params.set("pageToken", pageToken);
+      if (pageToken) params.set("pageToken", pageToken);
       const url = `${BASE}/storage/v1/b/${this.bucket}/o?${params}`;
       const res = await fetch(url, { headers: await this.authHeaders() });
-      if (!res.ok)
-        throw await gcsError(res, "list", prefix);
+      if (!res.ok) throw await gcsError(res, "list", prefix);
       const body = await res.json();
       for (const item of body.items ?? []) {
         const logical = this.prefix ? item.name.slice(this.prefix.replace(/\/+$/, "").length + 1) : item.name;
@@ -280,11 +265,9 @@ var GcsBlobStore = class _GcsBlobStore {
         headers: { ...await this.authHeaders(), "Content-Type": "application/json" },
         body: "{}"
       });
-      if (!res.ok)
-        throw await gcsError(res, "copy", srcKey);
+      if (!res.ok) throw await gcsError(res, "copy", srcKey);
       const body = await res.json();
-      if (body.done)
-        return { etag: body.resource?.generation ?? "" };
+      if (body.done) return { etag: body.resource?.generation ?? "" };
       token = body.rewriteToken;
     }
   }
@@ -292,19 +275,15 @@ var GcsBlobStore = class _GcsBlobStore {
     const name = encodeURIComponent(this.fullKey(key));
     const url = `${BASE}/storage/v1/b/${this.bucket}/o/${name}`;
     const res = await fetch(url, { method: "DELETE", headers: await this.authHeaders() });
-    if (res.status === 404)
-      return;
-    if (!res.ok)
-      throw await gcsError(res, "delete", key);
+    if (res.status === 404) return;
+    if (!res.ok) throw await gcsError(res, "delete", key);
   }
   async head(key) {
     const name = encodeURIComponent(this.fullKey(key));
     const url = `${BASE}/storage/v1/b/${this.bucket}/o/${name}`;
     const res = await fetch(url, { headers: await this.authHeaders() });
-    if (res.status === 404)
-      return null;
-    if (!res.ok)
-      throw await gcsError(res, "head", key);
+    if (res.status === 404) return null;
+    if (!res.ok) throw await gcsError(res, "head", key);
     const meta = await res.json();
     return { etag: meta.generation, size: Number(meta.size) };
   }
@@ -318,7 +297,7 @@ async function gcsError(res, op, key) {
   return new Error(`GCS ${op} "${key}" failed: ${res.status} ${res.statusText} ${detail.slice(0, 400)}`);
 }
 
-// packages/blobstore/dist/r2.js
+// packages/blobstore/src/r2.ts
 import { createHash, createHmac } from "node:crypto";
 var R2_COST = {
   asOf: "2026-06",
@@ -341,10 +320,8 @@ function r2OptionsFromEnv(prefix) {
   const bucket = e.R2_BUCKET ?? e.AWS_BUCKET ?? e.S3_BUCKET;
   const accountId = e.R2_ACCOUNT_ID ?? e.CF_ACCOUNT_ID;
   const endpoint = e.R2_ENDPOINT ?? e.AWS_ENDPOINT_URL_S3 ?? e.AWS_ENDPOINT_URL;
-  if (!accessKeyId || !secretAccessKey || !bucket)
-    return null;
-  if (!accountId && !endpoint)
-    return null;
+  if (!accessKeyId || !secretAccessKey || !bucket) return null;
+  if (!accountId && !endpoint) return null;
   return {
     accessKeyId,
     secretAccessKey,
@@ -356,20 +333,16 @@ function r2OptionsFromEnv(prefix) {
   };
 }
 function joinPrefix2(prefix, key) {
-  if (!prefix)
-    return key;
+  if (!prefix) return key;
   const p = prefix.replace(/\/+$/, "");
   return `${p}/${key}`;
 }
 function uriEncode(s, encodeSlash = true) {
   let out = "";
   for (const ch of Buffer.from(s, "utf8").toString("latin1")) {
-    if (/[A-Za-z0-9\-._~]/.test(ch))
-      out += ch;
-    else if (ch === "/")
-      out += encodeSlash ? "%2F" : "/";
-    else
-      out += "%" + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0");
+    if (/[A-Za-z0-9\-._~]/.test(ch)) out += ch;
+    else if (ch === "/") out += encodeSlash ? "%2F" : "/";
+    else out += "%" + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0");
   }
   return out;
 }
@@ -394,8 +367,7 @@ var R2BlobStore = class _R2BlobStore {
     this.prefix = opts.prefix;
     this.region = opts.region ?? "auto";
     const endpoint = opts.endpoint ?? (opts.accountId ? `https://${opts.accountId}.r2.cloudflarestorage.com` : void 0);
-    if (!endpoint)
-      throw new Error("R2BlobStore: provide either `endpoint` or `accountId`");
+    if (!endpoint) throw new Error("R2BlobStore: provide either `endpoint` or `accountId`");
     this.origin = endpoint.replace(/\/+$/, "");
   }
   static fromEnv(prefix) {
@@ -428,8 +400,7 @@ var R2BlobStore = class _R2BlobStore {
     };
     const headerNames = Object.keys(allHeaders).map((h) => h.toLowerCase()).sort();
     const lower = {};
-    for (const [k, v] of Object.entries(allHeaders))
-      lower[k.toLowerCase()] = String(v).trim();
+    for (const [k, v] of Object.entries(allHeaders)) lower[k.toLowerCase()] = String(v).trim();
     const canonicalHeaders = headerNames.map((h) => `${h}:${lower[h]}
 `).join("");
     const signedHeaders = headerNames.join(";");
@@ -467,12 +438,9 @@ var R2BlobStore = class _R2BlobStore {
   /** Map S3 conditional headers from our PutOptions. */
   condHeaders(opts) {
     const h = {};
-    if (opts?.ifNoneMatch)
-      h["If-None-Match"] = "*";
-    else if (opts?.ifMatch !== void 0)
-      h["If-Match"] = opts.ifMatch;
-    if (opts?.contentType)
-      h["Content-Type"] = opts.contentType;
+    if (opts?.ifNoneMatch) h["If-None-Match"] = "*";
+    else if (opts?.ifMatch !== void 0) h["If-Match"] = opts.ifMatch;
+    if (opts?.contentType) h["Content-Type"] = opts.contentType;
     return h;
   }
   // ---- core ops ----------------------------------------------------------
@@ -485,10 +453,8 @@ var R2BlobStore = class _R2BlobStore {
     }
     const signed = this.sign("GET", path, {}, headers, EMPTY_SHA256);
     const res = await fetch(this.buildUrl(path, {}), { headers: signed });
-    if (res.status === 404)
-      return null;
-    if (!(res.ok || res.status === 206))
-      throw await r2Error(res, "get", key);
+    if (res.status === 404) return null;
+    if (!(res.ok || res.status === 206)) throw await r2Error(res, "get", key);
     const buf = new Uint8Array(await res.arrayBuffer());
     return { bytes: buf, etag: stripQuotes(res.headers.get("etag") ?? ""), size: buf.byteLength };
   }
@@ -496,10 +462,8 @@ var R2BlobStore = class _R2BlobStore {
     const path = this.objectPath(key);
     const signed = this.sign("HEAD", path, {}, {}, EMPTY_SHA256);
     const res = await fetch(this.buildUrl(path, {}), { method: "HEAD", headers: signed });
-    if (res.status === 404)
-      return null;
-    if (!res.ok)
-      throw await r2Error(res, "head", key);
+    if (res.status === 404) return null;
+    if (!res.ok) throw await r2Error(res, "head", key);
     return {
       etag: stripQuotes(res.headers.get("etag") ?? ""),
       size: Number(res.headers.get("content-length") ?? "0")
@@ -519,7 +483,10 @@ var R2BlobStore = class _R2BlobStore {
       if (res.status === 412 || res.status === 409) {
         await res.body?.cancel().catch(() => {
         });
-        throw new PreconditionFailedError(key, opts?.ifNoneMatch ? "object exists" : "etag mismatch");
+        throw new PreconditionFailedError(
+          key,
+          opts?.ifNoneMatch ? "object exists" : "etag mismatch"
+        );
       }
       if ((res.status === 429 || res.status >= 500) && attempt < 5) {
         await res.text().catch(() => {
@@ -528,8 +495,7 @@ var R2BlobStore = class _R2BlobStore {
         await new Promise((r) => setTimeout(r, backoff));
         continue;
       }
-      if (!res.ok)
-        throw await r2Error(res, "put", key);
+      if (!res.ok) throw await r2Error(res, "put", key);
       const etag = stripQuotes(res.headers.get("etag") ?? "");
       await res.body?.cancel().catch(() => {
       });
@@ -553,13 +519,11 @@ var R2BlobStore = class _R2BlobStore {
     let token;
     do {
       const query = { "list-type": "2", prefix: fullPrefix };
-      if (token)
-        query["continuation-token"] = token;
+      if (token) query["continuation-token"] = token;
       const path = `/${this.bucket}`;
       const signed = this.sign("GET", path, query, {}, EMPTY_SHA256);
       const res = await fetch(this.buildUrl(path, query), { headers: signed });
-      if (!res.ok)
-        throw await r2Error(res, "list", prefix);
+      if (!res.ok) throw await r2Error(res, "list", prefix);
       const xml = await res.text();
       for (const block of xml.match(/<Contents>[\s\S]*?<\/Contents>/g) ?? []) {
         const name = decodeXml(matchTag(block, "Key") ?? "");
@@ -583,8 +547,7 @@ var R2BlobStore = class _R2BlobStore {
     };
     const signed = this.sign("PUT", path, {}, headers, EMPTY_SHA256);
     const res = await fetch(this.buildUrl(path, {}), { method: "PUT", headers: signed });
-    if (!res.ok)
-      throw await r2Error(res, "copy", srcKey);
+    if (!res.ok) throw await r2Error(res, "copy", srcKey);
     const xml = await res.text();
     return { etag: stripQuotes(decodeXml(matchTag(xml, "ETag") ?? "")) };
   }
@@ -596,8 +559,7 @@ var R2BlobStore = class _R2BlobStore {
   static PART_BYTES = 8 * 1024 * 1024;
   async getStream(key) {
     const meta = await this.head(key);
-    if (!meta)
-      return null;
+    if (!meta) return null;
     const path = this.objectPath(key);
     const self = this;
     const CHUNK = _R2BlobStore.STREAM_CHUNK_BYTES;
@@ -606,19 +568,15 @@ var R2BlobStore = class _R2BlobStore {
       const headers = { Range: `bytes=${start}-${endIncl}`, "If-Match": meta.etag };
       const signed = self.sign("GET", path, {}, headers, EMPTY_SHA256);
       const res = await fetch(self.buildUrl(path, {}), { headers: signed });
-      if (res.status === 412)
-        throw await r2Error(res, "getStream(version changed)", key);
-      if (!(res.status === 206 || res.status === 200))
-        throw await r2Error(res, "getStream", key);
+      if (res.status === 412) throw await r2Error(res, "getStream(version changed)", key);
+      if (!(res.status === 206 || res.status === 200)) throw await r2Error(res, "getStream", key);
       return res;
     }
     const size = meta.size;
     async function* ordered() {
-      if (size === 0)
-        return;
+      if (size === 0) return;
       const starts = [];
-      for (let s = 0; s < size; s += CHUNK)
-        starts.push(s);
+      for (let s = 0; s < size; s += CHUNK) starts.push(s);
       const inflight = [];
       let next = 0;
       const fill = () => {
@@ -631,10 +589,8 @@ var R2BlobStore = class _R2BlobStore {
       while (inflight.length > 0) {
         const r = await inflight.shift();
         fill();
-        if (!r.body)
-          throw new Error(`R2 getStream "${key}": empty response body`);
-        for await (const part of r.body)
-          yield part;
+        if (!r.body) throw new Error(`R2 getStream "${key}": empty response body`);
+        for await (const part of r.body) yield part;
       }
     }
     return { stream: ordered(), etag: meta.etag, size };
@@ -661,8 +617,7 @@ var R2BlobStore = class _R2BlobStore {
       buf.push(value);
       n += value.length;
     }
-    if (done)
-      return this.put(key, Buffer.concat(buf, n), opts);
+    if (done) return this.put(key, Buffer.concat(buf, n), opts);
     const path = this.objectPath(key);
     const uploadId = await this.createMultipart(path, key, opts?.contentType);
     const parts = [];
@@ -679,8 +634,7 @@ var R2BlobStore = class _R2BlobStore {
       n = 0;
       for (; ; ) {
         const { value, done: d } = await it.next();
-        if (d)
-          break;
+        if (d) break;
         buf.push(value);
         n += value.length;
         if (n >= PART) {
@@ -689,8 +643,7 @@ var R2BlobStore = class _R2BlobStore {
           n = 0;
         }
       }
-      if (n > 0)
-        await flush(buf, n);
+      if (n > 0) await flush(buf, n);
       return await this.completeMultipart(path, key, uploadId, parts, opts);
     } catch (e) {
       await this.abortMultipart(path, uploadId).catch(() => {
@@ -701,16 +654,13 @@ var R2BlobStore = class _R2BlobStore {
   async createMultipart(path, key, contentType) {
     const query = { uploads: "" };
     const headers = {};
-    if (contentType)
-      headers["Content-Type"] = contentType;
+    if (contentType) headers["Content-Type"] = contentType;
     const signed = this.sign("POST", path, query, headers, EMPTY_SHA256);
     const res = await fetch(this.buildUrl(path, query), { method: "POST", headers: signed });
-    if (!res.ok)
-      throw await r2Error(res, "createMultipart", key);
+    if (!res.ok) throw await r2Error(res, "createMultipart", key);
     const xml = await res.text();
     const id = matchTag(xml, "UploadId");
-    if (!id)
-      throw new Error(`R2 createMultipart "${key}": no UploadId in response`);
+    if (!id) throw new Error(`R2 createMultipart "${key}": no UploadId in response`);
     return id;
   }
   async uploadPart(path, key, uploadId, partNumber, body) {
@@ -729,13 +679,11 @@ var R2BlobStore = class _R2BlobStore {
         await new Promise((r) => setTimeout(r, Math.min(3e3, 200 * 2 ** attempt) * (0.5 + Math.random())));
         continue;
       }
-      if (!res.ok)
-        throw await r2Error(res, `uploadPart#${partNumber}`, key);
+      if (!res.ok) throw await r2Error(res, `uploadPart#${partNumber}`, key);
       const etag = res.headers.get("etag") ?? "";
       await res.body?.cancel().catch(() => {
       });
-      if (!etag)
-        throw new Error(`R2 uploadPart "${key}" #${partNumber}: no ETag header`);
+      if (!etag) throw new Error(`R2 uploadPart "${key}" #${partNumber}: no ETag header`);
       return etag;
     }
   }
@@ -756,11 +704,9 @@ var R2BlobStore = class _R2BlobStore {
       });
       throw new PreconditionFailedError(key, opts?.ifNoneMatch ? "object exists" : "etag mismatch");
     }
-    if (!res.ok)
-      throw await r2Error(res, "completeMultipart", key);
+    if (!res.ok) throw await r2Error(res, "completeMultipart", key);
     const xml = await res.text();
-    if (/<Error>/.test(xml))
-      throw new Error(`R2 completeMultipart "${key}" failed: ${xml.slice(0, 400)}`);
+    if (/<Error>/.test(xml)) throw new Error(`R2 completeMultipart "${key}" failed: ${xml.slice(0, 400)}`);
     return { etag: stripQuotes(decodeXml(matchTag(xml, "ETag") ?? "")) };
   }
   async abortMultipart(path, uploadId) {
@@ -787,10 +733,10 @@ async function r2Error(res, op, key) {
   return new Error(`R2 ${op} "${key}" failed: ${res.status} ${res.statusText} ${detail.slice(0, 400)}`);
 }
 
-// packages/objectstore-fs/dist/zeropg.js
+// packages/objectstore-fs/src/zeropg.ts
 import { PGlite as PGlite2 } from "@electric-sql/pglite";
 
-// packages/lease/dist/index.js
+// packages/lease/src/index.ts
 var LockedError = class extends Error {
   holder;
   expiresAt;
@@ -830,8 +776,7 @@ var Lease = class {
     this.maxRetries = opts.maxTakeoverRetries ?? 5;
   }
   get fencingToken() {
-    if (!this.body)
-      throw new Error("lease not held");
+    if (!this.body) throw new Error("lease not held");
     return this.body.fencingToken;
   }
   get currentEtag() {
@@ -842,8 +787,7 @@ var Lease = class {
   }
   /** Milliseconds until the held lease expires (negative if already past). */
   expiresInMs(now = this.now()) {
-    if (!this.body)
-      return -1;
+    if (!this.body) return -1;
     return Date.parse(this.body.expiresAt) - now;
   }
   /** True if acquire() took over an expired lease (a previous holder may
@@ -886,8 +830,7 @@ var Lease = class {
       this.acquiredByTakeover = false;
       return freshToken;
     } catch (e) {
-      if (!(e instanceof PreconditionFailedError))
-        throw e;
+      if (!(e instanceof PreconditionFailedError)) throw e;
     }
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
       const existing = await this.store.get(this.key);
@@ -903,8 +846,7 @@ var Lease = class {
           this.acquiredByTakeover = false;
           return body2.fencingToken;
         } catch (e) {
-          if (e instanceof PreconditionFailedError)
-            continue;
+          if (e instanceof PreconditionFailedError) continue;
           throw e;
         }
       }
@@ -924,8 +866,7 @@ var Lease = class {
         this.acquiredByTakeover = true;
         return takeoverToken;
       } catch (e) {
-        if (e instanceof PreconditionFailedError)
-          continue;
+        if (e instanceof PreconditionFailedError) continue;
         throw e;
       }
     }
@@ -942,10 +883,8 @@ var Lease = class {
    * if we were already taken over between acquire() and this call.
    */
   async upgradeToken(minToken) {
-    if (!this.body || !this.etag)
-      throw new Error("lease not held; call acquire first");
-    if (this.body.fencingToken > minToken)
-      return;
+    if (!this.body || !this.etag) throw new Error("lease not held; call acquire first");
+    if (this.body.fencingToken > minToken) return;
     const newToken = minToken + 1;
     const body = this.makeBody(newToken);
     try {
@@ -971,8 +910,7 @@ var Lease = class {
    * failing to renew, so this is where a zombie learns the truth.
    */
   async renew() {
-    if (!this.body || !this.etag)
-      throw new Error("lease not held; call acquire first");
+    if (!this.body || !this.etag) throw new Error("lease not held; call acquire first");
     const body = this.makeBody(this.body.fencingToken);
     try {
       const { etag } = await this.store.put(this.key, this.encode(body), {
@@ -997,8 +935,7 @@ var Lease = class {
    * already fenced and there is nothing to release.
    */
   async release() {
-    if (!this.body || !this.etag)
-      return;
+    if (!this.body || !this.etag) return;
     const current = await this.store.head(this.key);
     if (current && current.etag === this.etag) {
       await this.store.delete(this.key);
@@ -1010,8 +947,7 @@ var Lease = class {
    * true if we still hold it; used on the request path under CPU throttling
    * (DESIGN bet E4.1.b: no background heartbeat needed). */
   async validate() {
-    if (!this.body || !this.etag)
-      return false;
+    if (!this.body || !this.etag) return false;
     const current = await this.store.head(this.key);
     if (!current || current.etag !== this.etag) {
       const token = this.body.fencingToken;
@@ -1023,7 +959,7 @@ var Lease = class {
   }
 };
 
-// packages/objectstore-fs/dist/manifest.js
+// packages/objectstore-fs/src/manifest.ts
 var MANIFEST_KEY = "manifest.json";
 function encodeManifest(m) {
   return new TextEncoder().encode(JSON.stringify(m, null, 2));
@@ -1032,7 +968,7 @@ function decodeManifest(bytes) {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
-// packages/objectstore-fs/dist/tar.js
+// packages/objectstore-fs/src/tar.ts
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, readdir, readFile, stat } from "node:fs/promises";
 import { join, posix } from "node:path";
@@ -1042,15 +978,12 @@ function parseOctal(buf, off, len) {
   return s ? parseInt(s, 8) : 0;
 }
 function isZeroBlock(b) {
-  for (let i = 0; i < BLOCK; i++)
-    if (b[i] !== 0)
-      return false;
+  for (let i = 0; i < BLOCK; i++) if (b[i] !== 0) return false;
   return true;
 }
 function sanitizeEntryName(raw) {
   const name = raw.replace(/^\/+/, "").replace(/^\.\//, "").replace(/\/+$/, "");
-  if (!name || name === ".")
-    return null;
+  if (!name || name === ".") return null;
   const parts = name.split("/");
   if (parts.some((p) => p === ".." || p === "")) {
     throw new Error(`tar entry with unsafe path: ${JSON.stringify(raw)}`);
@@ -1070,10 +1003,9 @@ async function extractTarStream(source2, destDir) {
     while (filled < n) {
       if (!chunk || off >= chunk.length) {
         const r = await it.next();
-        if (r.done)
-          return filled === 0 ? null : (() => {
-            throw new Error("truncated tar stream");
-          })();
+        if (r.done) return filled === 0 ? null : (() => {
+          throw new Error("truncated tar stream");
+        })();
         chunk = r.value;
         off = 0;
         continue;
@@ -1090,27 +1022,23 @@ async function extractTarStream(source2, destDir) {
     while (remaining > 0) {
       if (!chunk || off >= chunk.length) {
         const r = await it.next();
-        if (r.done)
-          throw new Error("truncated tar entry body");
+        if (r.done) throw new Error("truncated tar entry body");
         chunk = r.value;
         off = 0;
         continue;
       }
       const take = Math.min(remaining, chunk.length - off);
-      if (sink)
-        await sink(chunk.subarray(off, off + take));
+      if (sink) await sink(chunk.subarray(off, off + take));
       off += take;
       remaining -= take;
     }
     const pad = (BLOCK - n % BLOCK) % BLOCK;
-    if (pad > 0)
-      await read(pad);
+    if (pad > 0) await read(pad);
   }
   let pendingLongName = null;
   for (; ; ) {
     const header = await read(BLOCK);
-    if (header === null || isZeroBlock(header))
-      break;
+    if (header === null || isZeroBlock(header)) break;
     const rawName = Buffer.from(header.subarray(0, 100)).toString("utf8").replace(/\0.*$/, "");
     const prefix = Buffer.from(header.subarray(345, 500)).toString("utf8").replace(/\0.*$/, "");
     const size = parseOctal(header, 124, 12);
@@ -1177,8 +1105,7 @@ function tarHeader(name, size, type, mtimeSec) {
   h.write("ustar", 257, "ascii");
   h.write("00", 263, "ascii");
   let sum = 0;
-  for (let i = 0; i < BLOCK; i++)
-    sum += h[i];
+  for (let i = 0; i < BLOCK; i++) sum += h[i];
   Buffer.from(sum.toString(8).padStart(6, "0") + "\0 ", "ascii").copy(h, 148);
   return h;
 }
@@ -1186,7 +1113,9 @@ async function* createTarStream(rootDir) {
   const mtimeSec = Math.floor(Date.now() / 1e3);
   async function* walk(rel) {
     const abs = rel ? join(rootDir, rel) : rootDir;
-    const entries = (await readdir(abs, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    const entries = (await readdir(abs, { withFileTypes: true })).sort(
+      (a, b) => a.name.localeCompare(b.name)
+    );
     for (const e of entries) {
       const childRel = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) {
@@ -1212,8 +1141,7 @@ async function* createTarStream(rootDir) {
           throw new Error(`file ${childRel} changed size during snapshot (${st.size} -> ${written})`);
         }
         const pad = (BLOCK - st.size % BLOCK) % BLOCK;
-        if (pad > 0)
-          yield Buffer.alloc(pad, 0);
+        if (pad > 0) yield Buffer.alloc(pad, 0);
       }
     }
   }
@@ -1226,12 +1154,10 @@ async function largestFile(rootDir) {
     for (const e of await readdir(dir, { withFileTypes: true })) {
       const p = join(dir, e.name);
       if (e.isDirectory()) {
-        if (e.name !== "pg_wal")
-          await walk(p);
+        if (e.name !== "pg_wal") await walk(p);
       } else if (e.isFile()) {
         const st = await stat(p);
-        if (!best || st.size > best.size)
-          best = { path: p, size: st.size };
+        if (!best || st.size > best.size) best = { path: p, size: st.size };
       }
     }
   }
@@ -1239,10 +1165,10 @@ async function largestFile(rootDir) {
   return best;
 }
 
-// packages/objectstore-fs/dist/archive.js
+// packages/objectstore-fs/src/archive.ts
 import { PGlite } from "@electric-sql/pglite";
 
-// packages/objectstore-fs/dist/restore.js
+// packages/objectstore-fs/src/restore.ts
 import { createGunzip, crc32 } from "node:zlib";
 import { Readable as Readable2 } from "node:stream";
 import * as nodeStream from "node:stream";
@@ -1264,16 +1190,14 @@ function walFileName(tli, lsn, segBytes) {
 }
 async function restoreSnapshotInto(store, dir, snapshotKey) {
   const src = await store.getStream(snapshotKey);
-  if (!src)
-    throw new Error(`manifest references missing snapshot ${snapshotKey}`);
+  if (!src) throw new Error(`manifest references missing snapshot ${snapshotKey}`);
   const tarStream = snapshotKey.endsWith(".gz") ? compose2(Readable2.from(src.stream), createGunzip()) : Readable2.from(src.stream);
   await extractTarStream(tarStream, dir);
   return src.size;
 }
 async function applyWalSegments(store, dir, m) {
   const segments = m.walSegments;
-  if (segments.length === 0)
-    return;
+  if (segments.length === 0) return;
   if (!m.walFlushLsn || !m.walSegmentBytes) {
     throw new Error("manifest has WAL segments but no walFlushLsn/walSegmentBytes");
   }
@@ -1286,19 +1210,20 @@ async function applyWalSegments(store, dir, m) {
     }
     expect = parseLsn(seg.endLsn);
   }
-  const bodies = await Promise.all(segments.map(async (seg) => {
-    const obj = await store.get(seg.key);
-    if (!obj)
-      throw new Error(`manifest references missing WAL segment ${seg.key}`);
-    const want = Number(parseLsn(seg.endLsn) - parseLsn(seg.startLsn));
-    if (obj.bytes.byteLength !== want) {
-      throw new Error(`WAL segment ${seg.key}: size ${obj.bytes.byteLength} != ${want}`);
-    }
-    if (crc32(obj.bytes) >>> 0 !== seg.crc32) {
-      throw new Error(`WAL segment ${seg.key}: CRC mismatch`);
-    }
-    return obj.bytes;
-  }));
+  const bodies = await Promise.all(
+    segments.map(async (seg) => {
+      const obj = await store.get(seg.key);
+      if (!obj) throw new Error(`manifest references missing WAL segment ${seg.key}`);
+      const want = Number(parseLsn(seg.endLsn) - parseLsn(seg.startLsn));
+      if (obj.bytes.byteLength !== want) {
+        throw new Error(`WAL segment ${seg.key}: size ${obj.bytes.byteLength} != ${want}`);
+      }
+      if (crc32(obj.bytes) >>> 0 !== seg.crc32) {
+        throw new Error(`WAL segment ${seg.key}: CRC mismatch`);
+      }
+      return obj.bytes;
+    })
+  );
   const touched = /* @__PURE__ */ new Set();
   for (let i = 0; i < segments.length; i++) {
     const body = bodies[i];
@@ -1326,15 +1251,14 @@ async function applyWalSegments(store, dir, m) {
     const fh = await open(path, "r+");
     try {
       const st = await fh.stat();
-      if (st.size < segBytes)
-        await fh.truncate(segBytes);
+      if (st.size < segBytes) await fh.truncate(segBytes);
     } finally {
       await fh.close();
     }
   }
 }
 
-// packages/objectstore-fs/dist/archive.js
+// packages/objectstore-fs/src/archive.ts
 import { createGzip, gzipSync } from "node:zlib";
 import { Readable as Readable3 } from "node:stream";
 import * as nodeStream2 from "node:stream";
@@ -1374,14 +1298,11 @@ function isoWeekKey(d) {
 function gfsKeep(sorted, gfs) {
   const keep = /* @__PURE__ */ new Set();
   const pick = (keyOf, limit) => {
-    if (!limit || limit <= 0)
-      return;
+    if (!limit || limit <= 0) return;
     const newestPerBucket = /* @__PURE__ */ new Map();
-    for (const b of sorted)
-      newestPerBucket.set(keyOf(new Date(b.committedAt)), b);
+    for (const b of sorted) newestPerBucket.set(keyOf(new Date(b.committedAt)), b);
     const bucketKeys = [...newestPerBucket.keys()].sort();
-    for (const bk of bucketKeys.slice(-limit))
-      keep.add(newestPerBucket.get(bk).key);
+    for (const bk of bucketKeys.slice(-limit)) keep.add(newestPerBucket.get(bk).key);
   };
   pick(utcDayKey, gfs.daily);
   pick(isoWeekKey, gfs.weekly);
@@ -1389,24 +1310,21 @@ function gfsKeep(sorted, gfs) {
   return keep;
 }
 function retain(backups, policy, nowMs) {
-  if (backups.length === 0)
-    return [];
-  const sorted = [...backups].sort((a, b) => Date.parse(a.committedAt) - Date.parse(b.committedAt) || a.commitSeq - b.commitSeq);
+  if (backups.length === 0) return [];
+  const sorted = [...backups].sort(
+    (a, b) => Date.parse(a.committedAt) - Date.parse(b.committedAt) || a.commitSeq - b.commitSeq
+  );
   const keep = /* @__PURE__ */ new Set();
   keep.add(sorted[sorted.length - 1].key);
   if (policy.keepLast && policy.keepLast > 0) {
-    for (const b of sorted.slice(-policy.keepLast))
-      keep.add(b.key);
+    for (const b of sorted.slice(-policy.keepLast)) keep.add(b.key);
   }
   if (policy.maxAgeDays && policy.maxAgeDays > 0) {
     const cutoff = nowMs - policy.maxAgeDays * DAY_MS;
-    for (const b of sorted)
-      if (Date.parse(b.committedAt) >= cutoff)
-        keep.add(b.key);
+    for (const b of sorted) if (Date.parse(b.committedAt) >= cutoff) keep.add(b.key);
   }
   if (policy.gfs) {
-    for (const k of gfsKeep(sorted, policy.gfs))
-      keep.add(k);
+    for (const k of gfsKeep(sorted, policy.gfs)) keep.add(k);
   }
   return sorted.filter((b) => keep.has(b.key));
 }
@@ -1525,14 +1443,12 @@ var ColdArchiver = class {
           });
           return;
         } catch (e) {
-          if (e instanceof PreconditionFailedError)
-            continue;
+          if (e instanceof PreconditionFailedError) continue;
           throw e;
         }
       }
       const idx = decodeBackupIndex(cur.bytes);
-      if (idx.backups.some((b) => b.key === entry.key))
-        return;
+      if (idx.backups.some((b) => b.key === entry.key)) return;
       idx.backups.push(entry);
       idx.backups.sort((a, b) => a.commitSeq - b.commitSeq);
       try {
@@ -1542,8 +1458,7 @@ var ColdArchiver = class {
         });
         return;
       } catch (e) {
-        if (e instanceof PreconditionFailedError)
-          continue;
+        if (e instanceof PreconditionFailedError) continue;
         throw e;
       }
     }
@@ -1565,12 +1480,10 @@ var ColdArchiver = class {
     const cur = await this.secondary.get(INDEX_KEY);
     if (cur) {
       const existing = decodeBackupIndex(cur.bytes).backups.find((b) => b.key === key);
-      if (existing)
-        return existing;
+      if (existing) return existing;
     }
     const head = await this.secondary.head(key);
-    if (!head)
-      return null;
+    if (!head) return null;
     const entry = {
       key,
       commitSeq: m.commitSeq,
@@ -1597,14 +1510,11 @@ var ColdArchiver = class {
    */
   async restoreFromBackup(seq, into) {
     const cur = await this.secondary.get(INDEX_KEY);
-    if (!cur)
-      throw new Error("no backup index at secondary (nothing to restore)");
+    if (!cur) throw new Error("no backup index at secondary (nothing to restore)");
     const idx = decodeBackupIndex(cur.bytes);
-    if (idx.backups.length === 0)
-      throw new Error("backup index is empty");
+    if (idx.backups.length === 0) throw new Error("backup index is empty");
     const entry = seq === void 0 ? idx.backups[idx.backups.length - 1] : idx.backups.find((b) => b.commitSeq === seq);
-    if (!entry)
-      throw new Error(`no backup with commitSeq ${seq}`);
+    if (!entry) throw new Error(`no backup with commitSeq ${seq}`);
     const dir = into ?? await mkdtemp(join3(this.scratchBase, "zpg-restore-"));
     await mkdir2(dir, { recursive: true, mode: 448 });
     const bytes = await restoreSnapshotInto(this.secondary, dir, entry.key);
@@ -1646,8 +1556,7 @@ var ColdArchiver = class {
     const blocked = [];
     let bytesFreed = 0;
     for (const b of idx.backups) {
-      if (keepKeys.has(b.key))
-        continue;
+      if (keepKeys.has(b.key)) continue;
       if (respectMin && minDays) {
         const ageDays = (nowMs - Date.parse(b.createdAt)) / DAY_MS;
         if (ageDays < minDays) {
@@ -1656,8 +1565,7 @@ var ColdArchiver = class {
           continue;
         }
       }
-      if (!dryRun)
-        await this.secondary.delete(b.key);
+      if (!dryRun) await this.secondary.delete(b.key);
       deleted.push(b);
       bytesFreed += b.sizeBytes;
     }
@@ -1688,8 +1596,7 @@ var ColdArchiver = class {
   async chooseCodec(dir) {
     try {
       const big = await largestFile(dir);
-      if (!big || big.size < 1024 * 1024)
-        return "gzip";
+      if (!big || big.size < 1024 * 1024) return "gzip";
       const { open: open3 } = await import("node:fs/promises");
       const sample = Buffer.alloc(Math.min(big.size, 4 * 1024 * 1024));
       const f = await open3(big.path, "r");
@@ -1706,7 +1613,7 @@ var ColdArchiver = class {
   }
 };
 
-// packages/objectstore-fs/dist/zeropg.js
+// packages/objectstore-fs/src/zeropg.ts
 import { createGunzip as createGunzip2, createGzip as createGzip2, gzipSync as gzipSync2, crc32 as crc322 } from "node:zlib";
 import { Readable as Readable4 } from "node:stream";
 import * as nodeStream3 from "node:stream";
@@ -1788,7 +1695,9 @@ var ZeroPG = class _ZeroPG {
     this.commitIntervalMs = opts.commitIntervalMs ?? (capPerSec ? Math.ceil(1e3 / capPerSec) : 0);
     this.now = opts.now ?? Date.now;
     this.scratchBase = opts.scratchDir ?? join4(tmpdir2(), "zeropg");
-    this.fullPageWrites = opts.fullPageWrites ?? !/^(off|false|0)$/i.test(process.env.ZEROPG_FULL_PAGE_WRITES ?? "");
+    this.fullPageWrites = opts.fullPageWrites ?? !/^(off|false|0)$/i.test(
+      process.env.ZEROPG_FULL_PAGE_WRITES ?? ""
+    );
     this.walCompression = opts.walCompression ?? process.env.ZEROPG_WAL_COMPRESSION;
     if (opts.backup) {
       this.backup = opts.backup;
@@ -1847,6 +1756,7 @@ var ZeroPG = class _ZeroPG {
     const existing = await this.store.get(MANIFEST_KEY);
     this.bootTimings.manifestGetMs = performance.now() - tMan;
     const tokenFloor = existing ? decodeManifest(existing.bytes).fencingToken : 0;
+    opts.onPhase?.("leasing");
     if (!this.noLease) {
       this.lease = new Lease(this.store, {
         holder,
@@ -1861,18 +1771,20 @@ var ZeroPG = class _ZeroPG {
           await this.lease.acquire();
           break;
         } catch (e) {
-          if (!(e instanceof LockedError) || performance.now() >= deadline)
-            throw e;
+          if (!(e instanceof LockedError) || performance.now() >= deadline) throw e;
           await new Promise((r) => setTimeout(r, 2e3));
         }
       }
       this.bootTimings.leaseMs = performance.now() - tLease;
     }
+    opts.onPhase?.("restoring");
     if (existing) {
       const fresh = await this.store.get(MANIFEST_KEY) ?? existing;
       const m = decodeManifest(fresh.bytes);
       if (m.movedTo) {
-        throw new Error(`this database was migrated out to ${m.movedTo}; refusing to boot stale data`);
+        throw new Error(
+          `this database was migrated out to ${m.movedTo}; refusing to boot stale data`
+        );
       }
       await this.adoptManifest(m, fresh.etag);
       if (this.lease?.held && !this.lease.tookOver) {
@@ -1886,7 +1798,10 @@ var ZeroPG = class _ZeroPG {
       this.generation = randomGeneration();
       const tPg = performance.now();
       if (opts.seedSnapshot) {
-        await extractTarStream(compose6(Readable4.from([Buffer.from(opts.seedSnapshot)]), createGunzip2()), this.dataDir);
+        await extractTarStream(
+          compose6(Readable4.from([Buffer.from(opts.seedSnapshot)]), createGunzip2()),
+          this.dataDir
+        );
       }
       this.pg = await PGlite2.create({ dataDir: this.dataDir, extensions: this.extensions });
       await this.pg.waitReady;
@@ -1895,6 +1810,7 @@ var ZeroPG = class _ZeroPG {
       await this.commitInitial();
     }
     this.bootTimings.totalMs = performance.now() - bootStart;
+    opts.onPhase?.("ready");
     if (this.durability === "interval") {
       this.flushTimer = setInterval(() => {
         void this.flush().catch(() => {
@@ -1922,7 +1838,10 @@ var ZeroPG = class _ZeroPG {
     this.lastShippedLsn = resumeAt ? parseLsn(resumeAt) : 0n;
     this.walSegBytes = m.walSegmentBytes ?? 0;
     this.walTli = m.walTimeline ?? 1;
-    this.walBytesSinceSnapshot = m.walSegments.reduce((n, s) => n + Number(parseLsn(s.endLsn) - parseLsn(s.startLsn)), 0);
+    this.walBytesSinceSnapshot = m.walSegments.reduce(
+      (n, s) => n + Number(parseLsn(s.endLsn) - parseLsn(s.startLsn)),
+      0
+    );
     this.bootTimings.restoreMs = performance.now() - tRestore;
     const tPg = performance.now();
     this.pg = await PGlite2.create({ dataDir: this.dataDir, extensions: this.extensions });
@@ -1932,7 +1851,9 @@ var ZeroPG = class _ZeroPG {
     this.forceCompactNext = true;
     if (this.incrementalCapable) {
       try {
-        const r = await this.pg.query("SELECT pg_current_wal_flush_lsn()::text lsn");
+        const r = await this.pg.query(
+          "SELECT pg_current_wal_flush_lsn()::text lsn"
+        );
         this.lifeBaseLsn = parseLsn(r.rows[0].lsn);
       } catch {
         this.lifeBaseLsn = 0n;
@@ -1955,8 +1876,7 @@ var ZeroPG = class _ZeroPG {
       const off = Number(page - start);
       const pageaddr = buf.readBigUInt64LE(off + 8);
       const magic = buf.readUInt16LE(off);
-      if (pageaddr !== page || magic === 0)
-        return page;
+      if (pageaddr !== page || magic === 0) return page;
       page += PAGE;
     }
     return null;
@@ -1977,15 +1897,16 @@ var ZeroPG = class _ZeroPG {
       buf = await this.readWalRange(start, end);
       for (let attempt = 0; ; attempt++) {
         const badPage = this.validateWalRange(buf, start);
-        if (badPage === null)
-          break;
+        if (badPage === null) break;
         if (attempt >= 20) {
-          console.error(JSON.stringify({
-            event: "zeropg-wal-writeback-stall",
-            badPageLsn: formatLsn(badPage),
-            range: `${formatLsn(start)}..${formatLsn(end)}`,
-            action: "compacting"
-          }));
+          console.error(
+            JSON.stringify({
+              event: "zeropg-wal-writeback-stall",
+              badPageLsn: formatLsn(badPage),
+              range: `${formatLsn(start)}..${formatLsn(end)}`,
+              action: "compacting"
+            })
+          );
           return null;
         }
         await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
@@ -2033,11 +1954,9 @@ var ZeroPG = class _ZeroPG {
         this.manifestEtag = etag;
         return;
       } catch (e) {
-        if (!(e instanceof PreconditionFailedError))
-          throw e;
+        if (!(e instanceof PreconditionFailedError)) throw e;
         const cur = await this.store.get(MANIFEST_KEY);
-        if (!cur)
-          throw e;
+        if (!cur) throw e;
         await this.adoptManifest(decodeManifest(cur.bytes), cur.etag);
       }
     }
@@ -2052,8 +1971,7 @@ var ZeroPG = class _ZeroPG {
   async chooseCodec() {
     try {
       const big = await largestFile(this.dataDir);
-      if (!big || big.size < 1024 * 1024)
-        return "gzip";
+      if (!big || big.size < 1024 * 1024) return "gzip";
       const fh = await import("node:fs/promises");
       const sample = Buffer.alloc(Math.min(big.size, 4 * 1024 * 1024));
       const f = await fh.open(big.path, "r");
@@ -2075,7 +1993,9 @@ var ZeroPG = class _ZeroPG {
    * must agree with the server's. */
   async ensureWalConfig() {
     try {
-      const cur = await this.pg.query("SELECT name, setting FROM pg_settings WHERE name = 'max_wal_size'");
+      const cur = await this.pg.query(
+        "SELECT name, setting FROM pg_settings WHERE name = 'max_wal_size'"
+      );
       await this.pg.exec("SET synchronous_commit = on");
       if (cur.rows[0]?.setting !== "64") {
         for (const [k, v] of WAL_GUCS) {
@@ -2093,8 +2013,12 @@ var ZeroPG = class _ZeroPG {
         }
       }
       await this.pg.query("SELECT pg_reload_conf()");
-      const live = await this.pg.query("SELECT setting FROM pg_settings WHERE name = 'full_page_writes'");
-      const liveWalc = walcApplied ? (await this.pg.query("SELECT setting FROM pg_settings WHERE name = 'wal_compression'")).rows[0]?.setting : void 0;
+      const live = await this.pg.query(
+        "SELECT setting FROM pg_settings WHERE name = 'full_page_writes'"
+      );
+      const liveWalc = walcApplied ? (await this.pg.query(
+        "SELECT setting FROM pg_settings WHERE name = 'wal_compression'"
+      )).rows[0]?.setting : void 0;
       const fpwMismatch = live.rows[0]?.setting !== fpw;
       const walcMismatch = walcApplied && liveWalc !== this.walCompression;
       if (fpwMismatch || walcMismatch) {
@@ -2105,13 +2029,14 @@ var ZeroPG = class _ZeroPG {
     } catch {
     }
     try {
-      const probe = await this.pg.query(`SELECT pg_current_wal_flush_lsn()::text lsn,
+      const probe = await this.pg.query(
+        `SELECT pg_current_wal_flush_lsn()::text lsn,
                 pg_walfile_name(pg_current_wal_flush_lsn())::text fname,
-                current_setting('wal_segment_size') segsz`);
+                current_setting('wal_segment_size') segsz`
+      );
       const { lsn, fname, segsz } = probe.rows[0];
       const m = /^(\d+)\s*(MB|kB|GB)$/.exec(segsz);
-      if (!m)
-        throw new Error(`unparseable wal_segment_size: ${segsz}`);
+      if (!m) throw new Error(`unparseable wal_segment_size: ${segsz}`);
       const mult = { kB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 }[m[2]];
       this.walSegBytes = Number(m[1]) * mult;
       this.walTli = parseInt(fname.slice(0, 8), 16);
@@ -2135,7 +2060,9 @@ var ZeroPG = class _ZeroPG {
       await this.pg.exec("CHECKPOINT");
       await this.pg.exec("CHECKPOINT");
       if (this.incrementalCapable) {
-        const r = await this.pg.query("SELECT pg_current_wal_flush_lsn()::text lsn");
+        const r = await this.pg.query(
+          "SELECT pg_current_wal_flush_lsn()::text lsn"
+        );
         flushLsn = r.rows[0]?.lsn ?? null;
       }
     } catch {
@@ -2202,11 +2129,9 @@ var ZeroPG = class _ZeroPG {
     } catch (e) {
       if (e instanceof PreconditionFailedError) {
         const cur = await this.store.get(MANIFEST_KEY);
-        if (!cur)
-          throw e;
+        if (!cur) throw e;
         await this.adoptManifest(decodeManifest(cur.bytes), cur.etag);
-      } else
-        throw e;
+      } else throw e;
     }
   }
   /**
@@ -2215,16 +2140,12 @@ var ZeroPG = class _ZeroPG {
    * (a newer writer advanced the manifest) -> FencedError, never a blind retry.
    */
   async commit() {
-    if (this.closed)
-      throw new Error("database is closed");
-    if (!this.dirty)
-      return null;
-    if (this.commitInFlight)
-      return this.commitInFlight;
+    if (this.closed) throw new Error("database is closed");
+    if (!this.dirty) return null;
+    if (this.commitInFlight) return this.commitInFlight;
     this.commitInFlight = (async () => {
       const wait = this.commitIntervalMs - (this.now() - this.lastCasAt);
-      if (wait > 0)
-        await new Promise((r) => setTimeout(r, wait));
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
       try {
         return await this.doCommit();
       } finally {
@@ -2237,7 +2158,9 @@ var ZeroPG = class _ZeroPG {
   async doCommit() {
     if (this.incrementalCapable && this.lifeBaseLsn > 0n) {
       try {
-        const r = await this.pg.query("SELECT pg_current_wal_flush_lsn()::text lsn");
+        const r = await this.pg.query(
+          "SELECT pg_current_wal_flush_lsn()::text lsn"
+        );
         if (parseLsn(r.rows[0].lsn) <= this.lifeBaseLsn) {
           this.dirty = false;
           return null;
@@ -2248,8 +2171,7 @@ var ZeroPG = class _ZeroPG {
     if (this.incrementalCapable && this.manifest.version === 2) {
       if (this.forceCompactNext) {
         const r = await this.commitRebaseline();
-        if (r)
-          return r;
+        if (r) return r;
       } else if (
         // Steady state: append this commit's WAL delta, until the tail grows
         // past the compaction thresholds.
@@ -2260,8 +2182,7 @@ var ZeroPG = class _ZeroPG {
           this.dirty = false;
           return null;
         }
-        if (r)
-          return r;
+        if (r) return r;
       }
     }
     return this.commitSnapshot();
@@ -2287,23 +2208,19 @@ var ZeroPG = class _ZeroPG {
    */
   async commitRebaseline() {
     const snapFlush = this.manifest.walFlushLsn;
-    if (!snapFlush)
-      return null;
+    if (!snapFlush) return null;
     const token = this.lease?.held ? this.lease.fencingToken : this.manifest.fencingToken;
     const nextSeq = this.manifest.commitSeq + 1;
     const start = parseLsn(snapFlush);
     const t0 = performance.now();
     const r = await this.pg.query("SELECT pg_current_wal_flush_lsn()::text lsn");
     const end = parseLsn(r.rows[0].lsn);
-    if (end <= start)
-      return null;
-    if (end - start > BigInt(COMPACT_AT_WAL_BYTES))
-      return null;
+    if (end <= start) return null;
+    if (end - start > BigInt(COMPACT_AT_WAL_BYTES)) return null;
     const dumpMs = performance.now() - t0;
     const tUp = performance.now();
     const buf = await this.readShippableWal(start, end);
-    if (!buf)
-      return null;
+    if (!buf) return null;
     const key = this.segmentKeyFor(nextSeq, token);
     await this.store.put(key, buf, { contentType: "application/octet-stream" });
     const entry = {
@@ -2329,9 +2246,8 @@ var ZeroPG = class _ZeroPG {
     this.forceCompactNext = false;
     this.lastShippedLsn = end;
     this.walBytesSinceSnapshot = Number(end - start);
-    for (const seg of oldSegments)
-      void this.store.delete(seg.key).catch(() => {
-      });
+    for (const seg of oldSegments) void this.store.delete(seg.key).catch(() => {
+    });
     return {
       commitSeq: nextSeq,
       generation: this.generation,
@@ -2359,23 +2275,23 @@ var ZeroPG = class _ZeroPG {
     const r = await this.pg.query("SELECT pg_current_wal_flush_lsn()::text lsn");
     const end = parseLsn(r.rows[0].lsn);
     const start = this.lastShippedLsn;
-    if (end === start)
-      return "empty";
+    if (end === start) return "empty";
     if (end < start) {
-      console.error(JSON.stringify({
-        event: "zeropg-wal-continuity-violation",
-        clusterFlushLsn: formatLsn(end),
-        resumeLsn: formatLsn(start),
-        action: "compacting"
-      }));
+      console.error(
+        JSON.stringify({
+          event: "zeropg-wal-continuity-violation",
+          clusterFlushLsn: formatLsn(end),
+          resumeLsn: formatLsn(start),
+          action: "compacting"
+        })
+      );
       this.forceCompactNext = true;
       return null;
     }
     const dumpMs = performance.now() - t0;
     const tUp = performance.now();
     const buf = await this.readShippableWal(start, end);
-    if (!buf)
-      return null;
+    if (!buf) return null;
     const key = this.segmentKeyFor(nextSeq, token);
     await this.store.put(key, buf, { contentType: "application/octet-stream" });
     const entry = {
@@ -2440,8 +2356,7 @@ var ZeroPG = class _ZeroPG {
     this.manifest = m;
     this.dirty = false;
     this.forceCompactNext = false;
-    if (cp.flushLsn)
-      this.lastShippedLsn = parseLsn(cp.flushLsn);
+    if (cp.flushLsn) this.lastShippedLsn = parseLsn(cp.flushLsn);
     this.walBytesSinceSnapshot = 0;
     if (oldBackup && oldBackup !== m.previousSnapshot) {
       void this.store.delete(oldBackup).catch(() => {
@@ -2477,20 +2392,20 @@ var ZeroPG = class _ZeroPG {
    * awaited commit).
    */
   async runBackup() {
-    if (!this.archiver || !this.backup)
-      return;
+    if (!this.archiver || !this.backup) return;
     const archiver = this.archiver;
     const policy = this.backup.retention;
     const run = async () => {
       try {
         const entry = await archiver.backupOnce();
-        if (entry && policy)
-          await archiver.applyRetention(policy);
+        if (entry && policy) await archiver.applyRetention(policy);
       } catch (e) {
-        console.log(JSON.stringify({
-          event: "zeropg-backup-error",
-          error: e instanceof Error ? e.message : String(e)
-        }));
+        console.log(
+          JSON.stringify({
+            event: "zeropg-backup-error",
+            error: e instanceof Error ? e.message : String(e)
+          })
+        );
       }
     };
     if (this.backup.blocking) {
@@ -2529,13 +2444,10 @@ var ZeroPG = class _ZeroPG {
    * persisted state is a clean snapshot rather than one giant WAL segment.
    */
   async compact() {
-    if (this.closed)
-      throw new Error("database is closed");
-    while (this.commitInFlight)
-      await this.commitInFlight.catch(() => {
-      });
-    if (!this.dirty && this.manifest.walSegments.length === 0)
-      return null;
+    if (this.closed) throw new Error("database is closed");
+    while (this.commitInFlight) await this.commitInFlight.catch(() => {
+    });
+    if (!this.dirty && this.manifest.walSegments.length === 0) return null;
     this.commitInFlight = this.commitSnapshot().finally(() => {
       this.lastCasAt = this.now();
       this.commitInFlight = null;
@@ -2566,11 +2478,9 @@ var ZeroPG = class _ZeroPG {
   }
   /** @returns the CommitInfo when this write triggered a durable commit. */
   async afterWrite(isWrite) {
-    if (!isWrite)
-      return null;
+    if (!isWrite) return null;
     this.dirty = true;
-    if (this.durability === "strict")
-      return this.commit();
+    if (this.durability === "strict") return this.commit();
     return null;
   }
   /**
@@ -2579,8 +2489,7 @@ var ZeroPG = class _ZeroPG {
    * keeps writership indefinitely. Throws FencedError if taken over.
    */
   async validateLease() {
-    if (!this.lease)
-      return true;
+    if (!this.lease) return true;
     const ok = await this.lease.validate();
     if (!ok || this.lease.expiresInMs(this.now()) < this.leaseTtlMs / 2) {
       await this.lease.renew();
@@ -2588,22 +2497,18 @@ var ZeroPG = class _ZeroPG {
     return true;
   }
   async close() {
-    if (this.closed)
-      return;
+    if (this.closed) return;
     this.closed = true;
-    if (this.flushTimer)
-      clearInterval(this.flushTimer);
+    if (this.flushTimer) clearInterval(this.flushTimer);
     try {
       if (this.dirty) {
         await (this.commitInFlight ?? this.doCommit());
       }
-      if (this.backupInFlight)
-        await this.backupInFlight.catch(() => {
-        });
+      if (this.backupInFlight) await this.backupInFlight.catch(() => {
+      });
     } finally {
-      if (this.lease)
-        await this.lease.release().catch(() => {
-        });
+      if (this.lease) await this.lease.release().catch(() => {
+      });
       await this.pg.close();
       await this.cleanupScratch().catch(() => {
       });
@@ -2613,13 +2518,11 @@ var ZeroPG = class _ZeroPG {
    * shutdown use this to observe the backup that a non-blocking commit kicked
    * off. No-op when no backup target is configured. */
   async drainBackups() {
-    if (this.backupInFlight)
-      await this.backupInFlight.catch(() => {
-      });
+    if (this.backupInFlight) await this.backupInFlight.catch(() => {
+    });
   }
   async cleanupScratch() {
-    if (this.dataDir)
-      await rm2(this.dataDir, { recursive: true, force: true });
+    if (this.dataDir) await rm2(this.dataDir, { recursive: true, force: true });
   }
   // ---- Helpers ----
   /** Build a reusable empty-datadir snapshot (gzipped) to seed fresh DBs fast.
@@ -2637,7 +2540,7 @@ var ZeroPG = class _ZeroPG {
   }
 };
 
-// packages/objectstore-fs/dist/replica.js
+// packages/objectstore-fs/src/replica.ts
 import { PGlite as PGlite3 } from "@electric-sql/pglite";
 
 // scripts/nightly-reset/reset.ts
@@ -2653,7 +2556,6 @@ var DEMOS = [
   { name: "privatebin", service: "privatebin-zeropg", prefix: "cloudrun-privatebin", mode: "drop-schemas", smokeUrl: "https://privatebin-scale-to-zero.0rs.org/" },
   { name: "nocodb", service: "nocodb-zeropg", prefix: "cloudrun-nocodb", mode: "drop-schemas", smokeUrl: "https://nocodb-scale-to-zero.0rs.org/", smokeTimeoutMs: 12 * 6e4 },
   { name: "rallly", service: "rallly-zeropg", prefix: "cloudrun-rallly", mode: "drop-schemas", extensions: ["citext", "pgcrypto"], smokeUrl: "https://rallly-scale-to-zero.0rs.org/", smokeTimeoutMs: 12 * 6e4 },
-  { name: "documenso", service: "documenso-zeropg", prefix: "cloudrun-documenso", mode: "drop-schemas", extensions: ["pgcrypto", "pg_trgm"], smokeUrl: "https://documenso-scale-to-zero.0rs.org/", smokeTimeoutMs: 12 * 6e4 },
   { name: "airtable", service: "airtable-zeropg", prefix: "cloudrun-airtable", mode: "drop-schemas", smokeUrl: "https://airtable-scale-to-zero.0rs.org/" },
   { name: "httpbin", service: "httpbin-zeropg", prefix: "cloudrun-httpbin", mode: "drop-schemas", smokeUrl: "https://httpbin-ui-scale-to-zero.0rs.org/" },
   { name: "znostr", service: "znostr-zeropg", prefix: "cloudrun-znostr", mode: "drop-schemas", smokeUrl: "https://znostr-zeropg-71428757273.europe-west1.run.app/" }
